@@ -1,0 +1,1007 @@
+//! Self-contained HTML report.
+//!
+//! One `<!doctype html>` document, inline CSS, inline SVG, no requests. The
+//! renderer is intentionally dumb: every number comes from [`Report`], nothing
+//! is recomputed here (see `docs/PLAN.md` §6 and
+//! `docs/research-metrics-and-viz.md` §4).
+//!
+//! Layout is verdict → distribution → outliers, one column, SVG bars, with a
+//! visually hidden table carrying the same numbers for screen readers.
+//!
+//! Two constraints shape the code:
+//!
+//! - Every value that originates in the scan (root, paths, language names) is
+//!   escaped with [`escape_html`] before it reaches the document.
+//! - The output is deterministic: no timestamps, no random ids, no iteration
+//!   over hash maps.
+//!
+//! The theme toggle lives in inline event-handler attributes rather than a
+//! `<script>` element so the document contains no script tag at all; this keeps
+//! "a path must never be able to inject a script" true by construction and
+//! keeps the escaping test unambiguous.
+
+use std::fmt::Write as _;
+
+use crate::metrics::{Histogram, Report, HEALTH_CALIBRATION};
+
+/// Render the whole report as one self-contained HTML document.
+pub fn render(report: &Report) -> String {
+    let mut out = String::with_capacity(24_576);
+
+    out.push_str("<!doctype html>\n<html lang=\"en\">\n<head>\n");
+    out.push_str("<meta charset=\"utf-8\">\n");
+    out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    let _ = writeln!(
+        out,
+        "<title>CCN report — {}</title>",
+        escape_html(&report.root)
+    );
+    out.push_str("<style>\n");
+    out.push_str(CSS);
+    out.push_str("\n</style>\n</head>\n");
+    let _ = writeln!(out, "<body onload=\"{THEME_INIT}\">");
+    out.push_str("<div class=\"wrap\">\n");
+    out.push_str("<a class=\"skip\" href=\"#main\">Skip to content</a>\n");
+
+    // --- verdict -----------------------------------------------------------
+    out.push_str("<header class=\"verdict\">\n<div class=\"verdict-top\">\n");
+    match &report.health {
+        Some(h) => {
+            let _ = writeln!(
+                out,
+                "<p class=\"score\">Health <strong>{:.1}</strong> / 100</p>",
+                h.score
+            );
+            let _ = writeln!(
+                out,
+                "<span class=\"grade grade-{}\">grade {}</span>",
+                h.grade.to_ascii_lowercase(),
+                escape_html(&h.grade.to_string())
+            );
+        }
+        None => out.push_str("<p class=\"score none\">No parsed functions</p>\n"),
+    }
+    let _ = writeln!(
+        out,
+        "<button type=\"button\" id=\"tt\" class=\"theme-toggle\" aria-pressed=\"false\" \
+         onclick=\"{THEME_TOGGLE}\">theme</button>"
+    );
+    out.push_str("</div>\n");
+
+    if let Some(h) = &report.health {
+        let _ = write!(
+            out,
+            "<p class=\"derivation\"><strong>{:.2}</strong> of lines above the McCabe limit \
+             (size-weighted, log-scaled) · {} functions · {} lines",
+            h.debt,
+            int(h.functions as u64),
+            int(h.lines as u64)
+        );
+        if report.health_experimental {
+            out.push_str(
+                "<span class=\"tag\" title=\"Grade bands are provisional and have not been \
+                 calibrated against real repositories yet (M5). Treat the letter as a summary, \
+                 not a release gate.\">experimental</span>",
+            );
+        }
+        out.push_str("</p>\n");
+    }
+
+    let _ = writeln!(
+        out,
+        "<p class=\"meta\"><code>{}</code> · {} files · {} measured · {} LOC · bin spec v{}</p>",
+        escape_html(&report.root),
+        int(report.files_analyzed as u64),
+        int(report.files_measured as u64),
+        int(report.loc_total as u64),
+        report.bin_spec_version
+    );
+    out.push_str("</header>\n<main id=\"main\">\n");
+
+    // --- CCN per function (primary) ---------------------------------------
+    out.push_str("<section class=\"panel\" aria-labelledby=\"ccn-h\">\n");
+    out.push_str("<h2 id=\"ccn-h\">CCN per function</h2>\n");
+    out.push_str(
+        "<p class=\"sub\">Cyclomatic complexity of every measured function. \
+         Bar height is a linear count of functions.</p>\n",
+    );
+    if report.ccn.is_empty() {
+        out.push_str("<p class=\"empty\">no functions parsed</p>\n");
+    } else {
+        out.push_str(&ccn_chart(&report.ccn));
+        out.push_str(&ccn_table(&report.ccn));
+    }
+    let _ = writeln!(
+        out,
+        "<p class=\"caption\">functions measured: {} · heuristic files excluded: {}</p>",
+        int(report.stats.functions_total as u64),
+        int(report.stats.files_heuristic as u64)
+    );
+    out.push_str("</section>\n");
+
+    // --- LOC per file (dual encoding) -------------------------------------
+    out.push_str("<section class=\"panel\" aria-labelledby=\"loc-h\">\n");
+    out.push_str("<h2 id=\"loc-h\">LOC per file</h2>\n");
+    if report.loc.is_empty() {
+        out.push_str("<p class=\"empty\">no files</p>\n");
+        out.push_str("<p class=\"caption\">no files were analyzed</p>\n");
+    } else {
+        out.push_str(
+            "<p class=\"sub\">Two encodings per bin: how many files land there, \
+             and how much of the code they contain.</p>\n",
+        );
+        out.push_str(
+            "<ul class=\"legend\">\n\
+             <li><span class=\"swatch files\" aria-hidden=\"true\"></span>% of files (outer bar)</li>\n\
+             <li><span class=\"swatch lines\" aria-hidden=\"true\"></span>% of lines (inner bar)</li>\n\
+             </ul>\n",
+        );
+        out.push_str(&loc_chart(&report.loc));
+        out.push_str(&loc_table(&report.loc));
+        let _ = writeln!(
+            out,
+            "<p class=\"caption\">top 10% of files hold {:.1}% of lines</p>",
+            report.stats.loc_share_top10pct
+        );
+    }
+    out.push_str("</section>\n");
+
+    // --- worst files -------------------------------------------------------
+    out.push_str("<section class=\"panel\" aria-labelledby=\"top-h\">\n");
+    out.push_str("<h2 id=\"top-h\">Worst 20 files</h2>\n");
+    out.push_str(
+        "<p class=\"sub\">Ranked by risk, the same size-weighted formula the health \
+         score uses.</p>\n",
+    );
+    if report.top.is_empty() {
+        out.push_str("<p class=\"empty\">no files with measured functions</p>\n");
+    } else {
+        out.push_str(&top_table(report));
+    }
+    out.push_str("</section>\n");
+
+    // --- hotspots (git only) ----------------------------------------------
+    // The whole panel is absent without history: a table of zeroes would read
+    // as "nothing is hot" when the truth is "we did not look".
+    if report.git_available && !report.hotspots.is_empty() {
+        out.push_str("<section class=\"panel\" aria-labelledby=\"hot-h\">\n");
+        out.push_str("<h2 id=\"hot-h\">Hotspots</h2>\n");
+        out.push_str(
+            "<p class=\"sub\">Complex code that changed often in the last 365 days. \
+             Score = percentile rank of commits × percentile rank of risk; a file \
+             with no commit in the window scores 0.</p>\n",
+        );
+        out.push_str(&hotspot_table(report));
+        let _ = writeln!(
+            out,
+            "<p class=\"caption\">top 10% by hotspot hold {:.1}% of measured lines</p>",
+            report.hotspot_debt_share
+        );
+        out.push_str("</section>\n");
+    }
+
+    out.push_str("</main>\n<footer>\n");
+    let _ = writeln!(
+        out,
+        "<p>bin spec v{} · {}.</p>",
+        report.bin_spec_version,
+        escape_html(HEALTH_CALIBRATION)
+    );
+    let _ = writeln!(
+        out,
+        "<p>tiers: exact {} files · heuristic {} files · no CCN {} files. \
+         Heuristic file-level counts never enter the function histogram.</p>",
+        int(report.stats.files_exact as u64),
+        int(report.stats.files_heuristic as u64),
+        int(report.stats.files_without_ccn as u64)
+    );
+    let excluded_generated = report.stats.files_excluded_generated;
+    let excluded_vendored = report.stats.files_excluded_vendored;
+    if excluded_generated + excluded_vendored > 0 {
+        // Says what the numbers above are *not* made of. Printed only when
+        // something was dropped, so a clean repo's footer stays clean.
+        let _ = writeln!(
+            out,
+            "<p>excluded: {} generated, {} vendored files.</p>",
+            int(excluded_generated as u64),
+            int(excluded_vendored as u64)
+        );
+    }
+    if report.git_available {
+        let _ = writeln!(
+            out,
+            "<p>git: {} commits in the last 365 days.</p>",
+            int(u64::from(report.commits_scanned))
+        );
+    }
+    let _ = writeln!(
+        out,
+        "<p>generated by ccn {}</p>",
+        escape_html(env!("CARGO_PKG_VERSION"))
+    );
+    out.push_str("</footer>\n</div>\n</body>\n</html>\n");
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+/// Escape `& < > " '` for both element text and quoted attribute values.
+fn escape_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Thousands-separated integer. Grouping is fixed (not locale-aware) so two
+/// runs on one machine produce the same bytes.
+fn int(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn pct(share: f64) -> String {
+    format!("{share:.1}%")
+}
+
+/// Minimum-visible-width for a bar; zero stays zero, never divide by zero.
+fn bar_width(share: f64, denom: f64, available: f64, present: bool) -> f64 {
+    if !present {
+        return 0.0;
+    }
+    let width = (share / denom) * available;
+    if width < 2.0 {
+        2.0
+    } else {
+        width
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Charts
+// ---------------------------------------------------------------------------
+
+/// Vertical columns: x is the fixed CCN bins, y is a linear count of functions.
+fn ccn_chart(hist: &Histogram) -> String {
+    const W: f64 = 560.0;
+    const H: f64 = 300.0;
+    const LEFT: f64 = 48.0;
+    const RIGHT: f64 = 16.0;
+    const TOP: f64 = 44.0;
+    const BOTTOM: f64 = 52.0;
+
+    let max_count = hist.bins.iter().map(|b| b.count).max().unwrap_or(0);
+    let denom = max_count.max(1) as f64;
+    let plot_w = W - LEFT - RIGHT;
+    let plot_h = H - TOP - BOTTOM;
+    let baseline = TOP + plot_h;
+    let n = hist.bins.len().max(1) as f64;
+    let col_w = plot_w / n;
+    let bar_w = (col_w - 20.0).max(6.0);
+
+    let mut s = String::with_capacity(4096);
+    let aria = format!(
+        "CCN per function histogram: {} functions across {} fixed bins, linear y axis.",
+        int(hist.total as u64),
+        hist.bins.len()
+    );
+    let _ = writeln!(
+        s,
+        "<svg class=\"chart-svg\" viewBox=\"0 0 {W:.0} {H:.0}\" role=\"img\" aria-label=\"{}\">",
+        escape_html(&aria)
+    );
+    let _ = writeln!(
+        s,
+        "<text class=\"tick\" x=\"{LEFT:.1}\" y=\"16\">functions (linear scale)</text>"
+    );
+
+    // Linear gridlines; at most three, labeled with counts.
+    let levels: Vec<usize> = if max_count == 0 {
+        vec![0]
+    } else if max_count <= 2 {
+        vec![0, max_count]
+    } else {
+        vec![0, max_count / 2, max_count]
+    };
+    for level in levels {
+        let y = baseline - (level as f64 / denom) * plot_h;
+        let _ = writeln!(
+            s,
+            "<line class=\"grid\" x1=\"{LEFT:.1}\" y1=\"{y:.1}\" x2=\"{:.1}\" y2=\"{y:.1}\"/>",
+            W - RIGHT
+        );
+        let _ = writeln!(
+            s,
+            "<text class=\"tick\" x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\">{}</text>",
+            LEFT - 6.0,
+            y + 3.5,
+            int(level as u64)
+        );
+    }
+
+    for (i, bin) in hist.bins.iter().enumerate() {
+        let cx = LEFT + col_w * (i as f64 + 0.5);
+        let bh = if bin.count == 0 {
+            0.0
+        } else {
+            ((bin.count as f64 / denom) * plot_h).max(2.0)
+        };
+        let y = baseline - bh;
+        let x = cx - bar_w / 2.0;
+        let share = pct(bin.share_count);
+        let tip = format!(
+            "{}: {} functions · {} of measured",
+            bin.label,
+            int(bin.count as u64),
+            share
+        );
+        let _ = writeln!(
+            s,
+            "<g class=\"mark\" tabindex=\"0\"><title>{}</title>",
+            escape_html(&tip)
+        );
+        if bin.count > 0 {
+            let _ = writeln!(
+                s,
+                "<rect class=\"bar s{}\" x=\"{x:.1}\" y=\"{y:.1}\" width=\"{bar_w:.1}\" \
+                 height=\"{bh:.1}\" rx=\"2\"/>",
+                i.min(5)
+            );
+        }
+        let value_y = if bin.count == 0 {
+            baseline - 8.0
+        } else {
+            y - 8.0
+        };
+        let _ = writeln!(
+            s,
+            "<text class=\"val\" x=\"{cx:.1}\" y=\"{value_y:.1}\" text-anchor=\"middle\">\
+             {} · {}</text>",
+            int(bin.count as u64),
+            share
+        );
+        if bin.hi.is_none() {
+            let _ = writeln!(
+                s,
+                "<text class=\"tick\" x=\"{cx:.1}\" y=\"{:.1}\" text-anchor=\"middle\">max {}</text>",
+                value_y - 14.0,
+                int(u64::from(bin.max))
+            );
+        }
+        let _ = writeln!(
+            s,
+            "<text class=\"axis\" x=\"{cx:.1}\" y=\"{:.1}\" text-anchor=\"middle\">{}</text></g>",
+            baseline + 19.0,
+            escape_html(&bin.label)
+        );
+    }
+
+    // The line sits on the category boundary between 5–10 and 11–20.
+    if hist.bins.len() >= 4 {
+        let bx = LEFT + col_w * 3.0;
+        let _ = writeln!(
+            s,
+            "<line class=\"limit\" x1=\"{bx:.1}\" y1=\"{:.1}\" x2=\"{bx:.1}\" y2=\"{baseline:.1}\"/>",
+            TOP - 16.0
+        );
+        let _ = writeln!(
+            s,
+            "<text class=\"limit-label\" x=\"{:.1}\" y=\"{:.1}\">McCabe limit (10)</text>",
+            bx + 6.0,
+            TOP - 18.0
+        );
+    }
+
+    s.push_str("</svg>\n");
+    s
+}
+
+/// Horizontal rows: label, then a thick outer bar for `% of files` and a
+/// lighter inner bar for `% of lines`, then the raw numbers as text.
+fn loc_chart(hist: &Histogram) -> String {
+    const W: f64 = 660.0;
+    const ROW: f64 = 26.0;
+    const TOP: f64 = 28.0;
+    const LABEL_X: f64 = 88.0;
+    const X0: f64 = 100.0;
+    const X1: f64 = 470.0;
+    const VALUE_X: f64 = 478.0;
+
+    let n = hist.bins.len();
+    let height = TOP + ROW * n as f64 + 26.0;
+    let plot_w = X1 - X0;
+    let denom = hist
+        .bins
+        .iter()
+        .map(|b| b.share_count.max(b.share_weight))
+        .fold(0.0_f64, f64::max)
+        .max(0.000_001);
+
+    let mut s = String::with_capacity(8192);
+    let aria = format!(
+        "LOC per file histogram: {} files, {} lines, {} bins. Each row encodes \
+         share of files and share of lines.",
+        int(hist.total as u64),
+        int(hist.total_weight),
+        n
+    );
+    let _ = writeln!(
+        s,
+        "<svg class=\"chart-svg\" viewBox=\"0 0 {W:.0} {height:.0}\" role=\"img\" aria-label=\"{}\">",
+        escape_html(&aria)
+    );
+
+    for frac in [0.0_f64, 0.5, 1.0] {
+        let x = X0 + frac * plot_w;
+        let _ = writeln!(
+            s,
+            "<line class=\"grid\" x1=\"{x:.1}\" y1=\"{:.1}\" x2=\"{x:.1}\" y2=\"{:.1}\"/>",
+            TOP - 6.0,
+            TOP + ROW * n as f64
+        );
+        let _ = writeln!(
+            s,
+            "<text class=\"tick\" x=\"{x:.1}\" y=\"{:.1}\" text-anchor=\"middle\">{:.1}%</text>",
+            TOP - 10.0,
+            frac * denom
+        );
+    }
+
+    for (i, bin) in hist.bins.iter().enumerate() {
+        let cy = TOP + ROW * (i as f64 + 0.5);
+        let files_w = bar_width(bin.share_count, denom, plot_w, bin.count > 0);
+        let lines_w = bar_width(bin.share_weight, denom, plot_w, bin.weight > 0);
+        let tip = format!(
+            "{} lines: {} files, {} of files, {} of lines",
+            bin.label,
+            int(bin.count as u64),
+            pct(bin.share_count),
+            pct(bin.share_weight)
+        );
+        let _ = writeln!(
+            s,
+            "<g class=\"mark\" tabindex=\"0\"><title>{}</title>",
+            escape_html(&tip)
+        );
+        if bin.count > 0 {
+            let _ = writeln!(
+                s,
+                "<rect class=\"files\" x=\"{X0:.1}\" y=\"{:.1}\" width=\"{files_w:.1}\" \
+                 height=\"14\" rx=\"2\"/>",
+                cy - 7.0
+            );
+        }
+        if bin.weight > 0 {
+            let _ = writeln!(
+                s,
+                "<rect class=\"lines\" x=\"{X0:.1}\" y=\"{:.1}\" width=\"{lines_w:.1}\" \
+                 height=\"7\" rx=\"2\"/>",
+                cy - 3.5
+            );
+        }
+
+        let mut values = format!(
+            "{} · {} · {}",
+            int(bin.count as u64),
+            pct(bin.share_count),
+            pct(bin.share_weight)
+        );
+        if bin.hi.is_none() {
+            let _ = write!(values, " · max {}", int(u64::from(bin.max)));
+        }
+        let _ = writeln!(
+            s,
+            "<text class=\"axis\" x=\"{LABEL_X:.1}\" y=\"{:.1}\" text-anchor=\"end\">{}</text>",
+            cy + 3.5,
+            escape_html(&bin.label)
+        );
+        let _ = writeln!(
+            s,
+            "<text class=\"val\" x=\"{VALUE_X:.1}\" y=\"{:.1}\">{}</text></g>",
+            cy + 3.5,
+            escape_html(&values)
+        );
+    }
+
+    s.push_str("</svg>\n");
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Accessible equivalents (same numbers, no color, no SVG)
+// ---------------------------------------------------------------------------
+
+fn ccn_table(hist: &Histogram) -> String {
+    let mut s = String::from(
+        "<div class=\"sr-only\"><table><caption>CCN per function, exact numbers</caption>\
+         <thead><tr><th scope=\"col\">CCN</th><th scope=\"col\">Functions</th>\
+         <th scope=\"col\">Share</th></tr></thead><tbody>",
+    );
+    for bin in &hist.bins {
+        let _ = writeln!(
+            s,
+            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td></tr>",
+            escape_html(&bin.label),
+            int(bin.count as u64),
+            pct(bin.share_count)
+        );
+    }
+    s.push_str("</tbody></table></div>\n");
+    s
+}
+
+fn loc_table(hist: &Histogram) -> String {
+    let mut s = String::from(
+        "<div class=\"sr-only\"><table><caption>LOC per file, exact numbers</caption>\
+         <thead><tr><th scope=\"col\">LOC</th><th scope=\"col\">Files</th>\
+         <th scope=\"col\">% of files</th><th scope=\"col\">Lines</th>\
+         <th scope=\"col\">% of lines</th><th scope=\"col\">Max</th></tr></thead><tbody>",
+    );
+    for bin in &hist.bins {
+        let _ = writeln!(
+            s,
+            "<tr><th scope=\"row\">{}</th><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+             <td>{}</td></tr>",
+            escape_html(&bin.label),
+            int(bin.count as u64),
+            pct(bin.share_count),
+            int(bin.weight),
+            pct(bin.share_weight),
+            int(u64::from(bin.max))
+        );
+    }
+    s.push_str("</tbody></table></div>\n");
+    s
+}
+
+fn top_table(report: &Report) -> String {
+    let mut s = String::from("<div class=\"table-wrap\"><table>\n");
+    s.push_str("<caption class=\"sr-only\">Worst 20 files by risk</caption>\n");
+    s.push_str(
+        "<thead><tr><th scope=\"col\">path</th><th scope=\"col\">lang</th>\
+         <th scope=\"col\" class=\"num\">LOC</th><th scope=\"col\" class=\"num\">max CCN</th>\
+         <th scope=\"col\" class=\"num\">&gt;10</th>\
+         <th scope=\"col\" class=\"num\">risk</th></tr></thead>\n<tbody>\n",
+    );
+    for row in &report.top {
+        let _ = writeln!(
+            s,
+            "<tr><td><code>{}</code></td><td>{}</td><td class=\"num\">{}</td>\
+             <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{:.2}</td></tr>",
+            escape_html(&row.path),
+            escape_html(&row.lang),
+            int(u64::from(row.loc)),
+            int(u64::from(row.ccn_max)),
+            int(row.over_10 as u64),
+            row.risk
+        );
+    }
+    s.push_str("</tbody>\n</table></div>\n");
+    s
+}
+
+/// Hotspot ranking. Every field comes from [`Report::hotspots`]; the renderer
+/// only formats and escapes.
+fn hotspot_table(report: &Report) -> String {
+    let mut s = String::from("<div class=\"table-wrap\"><table>\n");
+    s.push_str("<caption class=\"sr-only\">Hotspots: change frequency times risk</caption>\n");
+    s.push_str(
+        "<thead><tr><th scope=\"col\">path</th><th scope=\"col\" class=\"num\">commits</th>\
+         <th scope=\"col\" class=\"num\">lines changed</th><th scope=\"col\" class=\"num\">max CCN</th>\
+         <th scope=\"col\" class=\"num\">risk</th><th scope=\"col\" class=\"num\">hotspot</th>\
+         </tr></thead>\n<tbody>\n",
+    );
+    for row in &report.hotspots {
+        let _ = writeln!(
+            s,
+            "<tr><td><code>{}</code></td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
+             <td class=\"num\">{}</td><td class=\"num\">{:.2}</td><td class=\"num\">{:.2}</td></tr>",
+            escape_html(&row.path),
+            int(u64::from(row.commits)),
+            int(u64::from(row.lines_changed)),
+            int(u64::from(row.ccn_max)),
+            row.risk,
+            row.hotspot
+        );
+    }
+    s.push_str("</tbody>\n</table></div>\n");
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Theme toggle (inline handlers, no <script> element)
+// ---------------------------------------------------------------------------
+
+const THEME_INIT: &str = "try{var r=document.documentElement,t=null;\
+try{t=localStorage.getItem('ccn-theme')}catch(e){}\
+if(t==='dark'||t==='light'){r.setAttribute('data-theme',t)}\
+var b=document.getElementById('tt');if(b){var d=r.getAttribute('data-theme');\
+if(!d){d=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}\
+b.textContent='theme: '+d;b.setAttribute('aria-pressed',d==='dark'?'true':'false')}}catch(e){}";
+
+const THEME_TOGGLE: &str = "try{var r=document.documentElement,d=r.getAttribute('data-theme');\
+if(!d){d=window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}\
+var n=d==='dark'?'light':'dark';r.setAttribute('data-theme',n);\
+try{localStorage.setItem('ccn-theme',n)}catch(e){}\
+this.textContent='theme: '+n;this.setAttribute('aria-pressed',n==='dark'?'true':'false')}catch(e){}";
+
+// ---------------------------------------------------------------------------
+// CSS
+// ---------------------------------------------------------------------------
+
+const CSS: &str = r##":root{
+  color-scheme: light;
+  --bg:#faf9f7; --panel:#ffffff; --fg:#1c1e21; --muted:#5b6167; --rule:#d9dcdf;
+  --accent:#1f5c99; --focus:#0b57a4; --chip:#e9f0f8; --chip-fg:#173f66; --grid:#e3e6e9;
+  --s0:#16456f; --s1:#26679a; --s2:#3f86bb; --s3:#6ea6cf; --s4:#9dc3e0; --s5:#c9dff0;
+  --bar-files:#2a6699; --bar-lines:#8fb9d9;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --bg:#121517; --panel:#181c1f; --fg:#e7eaec; --muted:#a2aab2; --rule:#2f353b;
+    --accent:#8ab8e0; --focus:#8ec5ff; --chip:#1e2b36; --chip-fg:#cfe3f2; --grid:#262c31;
+    --s0:#2b5f8a; --s1:#3f7cad; --s2:#5b9bca; --s3:#7db4da; --s4:#a3cbe6; --s5:#cbe2f2;
+    --bar-files:#5b9bca; --bar-lines:#a8cbe4;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --bg:#121517; --panel:#181c1f; --fg:#e7eaec; --muted:#a2aab2; --rule:#2f353b;
+  --accent:#8ab8e0; --focus:#8ec5ff; --chip:#1e2b36; --chip-fg:#cfe3f2; --grid:#262c31;
+  --s0:#2b5f8a; --s1:#3f7cad; --s2:#5b9bca; --s3:#7db4da; --s4:#a3cbe6; --s5:#cbe2f2;
+  --bar-files:#5b9bca; --bar-lines:#a8cbe4;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  transition:background-color .12s ease,color .12s ease;
+}
+.wrap{max-width:960px;margin:0 auto;padding:24px 16px 40px}
+.skip{position:absolute;left:-999px;top:0;background:var(--panel);color:var(--fg);padding:.5rem .75rem;z-index:10}
+.skip:focus{left:8px;top:8px}
+.verdict{background:var(--panel);border:1px solid var(--rule);border-radius:12px;padding:18px 20px}
+.verdict-top{display:flex;flex-wrap:wrap;align-items:center;gap:12px}
+.score{margin:0;color:var(--muted);font-size:1rem}
+.score strong{font-size:2.6rem;line-height:1;color:var(--fg);font-variant-numeric:tabular-nums}
+.score.none{font-size:1.5rem;font-weight:600;color:var(--fg)}
+.grade{font-weight:600;font-size:.9rem;padding:.25rem .55rem;border-radius:999px;background:var(--chip);color:var(--chip-fg);border:1px solid var(--rule)}
+.theme-toggle{margin-left:auto;font:inherit;font-size:.8rem;padding:.35rem .6rem;border-radius:8px;border:1px solid var(--rule);background:transparent;color:var(--muted);cursor:pointer}
+.theme-toggle:hover{color:var(--fg)}
+.theme-toggle:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.derivation{margin:.6rem 0 0;color:var(--muted);font-size:.9rem}
+.derivation strong{color:var(--fg);font-variant-numeric:tabular-nums}
+.tag{margin-left:.5rem;display:inline-block;font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;padding:.1rem .4rem;border:1px dashed var(--rule);border-radius:999px;color:var(--muted);cursor:help}
+.meta{margin:.5rem 0 0;font-size:.8rem;color:var(--muted)}
+.meta code,td code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.panel{background:var(--panel);border:1px solid var(--rule);border-radius:12px;padding:18px 20px;margin-top:16px}
+.panel h2{margin:0 0 .25rem;font-size:1.05rem}
+.sub{margin:0 0 .75rem;color:var(--muted);font-size:.85rem}
+.caption{margin:.75rem 0 0;color:var(--muted);font-size:.8rem}
+.empty{margin:.5rem 0 0;padding:1.5rem;text-align:center;color:var(--muted);border:1px dashed var(--rule);border-radius:8px;font-size:.9rem}
+.chart-svg{display:block;width:100%;height:auto;max-width:760px}
+.chart-svg text{font-family:inherit}
+.tick{fill:var(--muted);font-size:10px;font-variant-numeric:tabular-nums}
+.axis{fill:var(--fg);font-size:11px}
+.val{fill:var(--fg);font-size:10.5px;font-variant-numeric:tabular-nums}
+.grid{stroke:var(--grid);stroke-width:1}
+.limit{stroke:var(--accent);stroke-width:1.5;stroke-dasharray:4 3;fill:none}
+.limit-label{fill:var(--accent);font-size:11px;font-weight:600}
+g.mark{cursor:default;outline:none}
+g.mark .bar{stroke:var(--panel);stroke-width:1}
+g.mark:focus .bar,g.mark:focus-visible .bar{stroke:var(--focus);stroke-width:2.5}
+g.mark:focus .files,g.mark:focus-visible .files,
+g.mark:focus .lines,g.mark:focus-visible .lines{stroke:var(--focus);stroke-width:1.5}
+g.mark:focus{outline:none}
+.s0{fill:var(--s0)}.s1{fill:var(--s1)}.s2{fill:var(--s2)}
+.s3{fill:var(--s3)}.s4{fill:var(--s4)}.s5{fill:var(--s5)}
+.files{fill:var(--bar-files)}
+.lines{fill:var(--bar-lines)}
+.legend{display:flex;flex-wrap:wrap;gap:.9rem;margin:.25rem 0 .5rem;padding:0;list-style:none;font-size:.8rem;color:var(--muted)}
+.legend li{display:flex;align-items:center;gap:.4rem}
+.swatch{position:relative;flex:none;width:22px;height:12px;border-radius:2px;background:var(--bar-files)}
+.swatch.lines::after{content:"";position:absolute;left:0;right:0;top:3px;height:6px;background:var(--bar-lines);border-radius:2px}
+.table-wrap{overflow-x:auto;border:1px solid var(--rule);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:.85rem}
+th,td{padding:.45rem .6rem;border-bottom:1px solid var(--rule);text-align:left;white-space:nowrap}
+th{font-weight:600;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;background:var(--bg)}
+tr:last-child td{border-bottom:0}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+td code{font-size:.82rem;white-space:normal;overflow-wrap:anywhere}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+footer{margin-top:18px;font-size:.78rem;color:var(--muted);line-height:1.6}
+footer p{margin:.2rem 0}
+footer code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+@media (max-width:560px){
+  .wrap{padding:16px 12px 32px}
+  .verdict{padding:14px}
+  .panel{padding:14px}
+  .score strong{font-size:2.1rem}
+  .axis{font-size:13px}
+  .tick{font-size:12px}
+  .limit-label{font-size:13px}
+}
+@media (prefers-reduced-motion: reduce){
+  *{transition:none !important;animation:none !important}
+}
+"##;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::{
+        histogram, Health, HotspotRow, RankedFile, RepoStats, CCN_BINS, LOC_BINS,
+    };
+
+    fn stats() -> RepoStats {
+        RepoStats {
+            loc_median: 84,
+            loc_p90: 312,
+            loc_p99: 1_940,
+            loc_max: 12_408,
+            ccn_median: 2,
+            ccn_p90: 7,
+            ccn_p99: 19,
+            ccn_max: 74,
+            functions_total: 12,
+            loc_share_top10pct: 61.0,
+            files_exact: 11,
+            files_heuristic: 2,
+            files_without_ccn: 1,
+            files_excluded_generated: 0,
+            files_excluded_vendored: 0,
+        }
+    }
+
+    fn row(path: &str, risk: f64) -> RankedFile {
+        RankedFile {
+            path: path.to_string(),
+            lang: "TypeScript".to_string(),
+            loc: 1_930,
+            ccn_max: 74,
+            ccn_sum: 210,
+            over_10: 3,
+            functions: 40,
+            risk,
+        }
+    }
+
+    fn sample() -> Report {
+        let loc_values: [u32; 13] = [
+            0, 12, 60, 120, 210, 320, 520, 760, 1_200, 2_400, 6_000, 12_000, 40_000,
+        ];
+        let loc = histogram(&loc_values, Some(&loc_values), &LOC_BINS);
+        let ccn_values: [u32; 12] = [1, 1, 1, 2, 2, 3, 5, 8, 11, 14, 22, 51];
+        let ccn = histogram(&ccn_values, None, &CCN_BINS);
+        Report {
+            root: "C:/repo".to_string(),
+            files_analyzed: loc_values.len(),
+            files_measured: loc_values.len(),
+            loc_total: 50_000,
+            loc,
+            ccn: ccn.clone(),
+            ccn_file: ccn,
+            health: Some(Health {
+                score: 72.0,
+                grade: 'C',
+                debt: 0.18,
+                functions: 12,
+                lines: 50_000,
+                over_10: 3,
+                over_20: 2,
+                over_50: 1,
+                pct_over_10: 25.0,
+            }),
+            stats: stats(),
+            top: vec![row("src/parser/grammar.ts", 0.62)],
+            git_available: false,
+            commits_scanned: 0,
+            hotspot_debt_share: 0.0,
+            hotspots: Vec::new(),
+            churn: std::collections::HashMap::new(),
+            bin_spec_version: 1,
+            health_experimental: true,
+        }
+    }
+
+    fn hot(path: &str, commits: u32, changed: u32, loc: u32, hotspot: f64) -> HotspotRow {
+        HotspotRow {
+            path: path.to_string(),
+            loc,
+            ccn_max: 74,
+            risk: 0.62,
+            commits,
+            lines_changed: changed,
+            hotspot,
+        }
+    }
+
+    #[test]
+    fn renders_a_complete_document() {
+        let html = render(&sample());
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("</html>"));
+    }
+
+    #[test]
+    fn makes_no_external_references() {
+        let html = render(&sample());
+        for needle in ["http://", "https://", "<script src", "@import", "<script"] {
+            assert!(!html.contains(needle), "output contains {needle}");
+        }
+    }
+
+    #[test]
+    fn escapes_paths_from_the_scan() {
+        let mut r = sample();
+        r.root = "C:/repo/<script>alert(1)</script>".to_string();
+        r.top = vec![row("src/<b>&\"drop.sql", 0.62)];
+        let html = render(&r);
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("</script>"));
+        assert!(html.contains("C:/repo/&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("src/&lt;b&gt;&amp;&quot;drop.sql"));
+    }
+
+    #[test]
+    fn prints_the_computed_numbers() {
+        let html = render(&sample());
+        assert!(html.contains("Health <strong>72.0</strong> / 100"));
+        assert!(html.contains("grade C"));
+        assert!(html.contains("0.18"));
+        assert!(html.contains("11–20"));
+        assert!(html.contains("≥10,000"));
+        assert!(html.contains("McCabe limit (10)"));
+        assert!(html.contains("0.62"));
+        assert!(html.contains("top 10% of files hold 61.0% of lines"));
+    }
+
+    #[test]
+    fn missing_health_does_not_invent_a_perfect_score() {
+        let mut r = sample();
+        r.health = None;
+        r.ccn = histogram(&[], None, &CCN_BINS);
+        r.ccn_file = r.ccn.clone();
+        let html = render(&r);
+        assert!(html.contains("No parsed functions"));
+        assert!(html.contains("no functions parsed"));
+        assert!(!html.contains("100 / 100"));
+    }
+
+    #[test]
+    fn empty_loc_gets_an_empty_state() {
+        let mut r = sample();
+        r.loc = histogram(&[], Some(&[]), &LOC_BINS);
+        let html = render(&r);
+        assert!(html.contains("no files"));
+        assert!(!html.contains("NaN"));
+    }
+
+    #[test]
+    fn is_deterministic() {
+        let r = sample();
+        assert_eq!(render(&r), render(&r));
+    }
+
+    #[test]
+    fn exclusions_appear_in_the_footer_and_measured_files_in_the_header() {
+        let mut r = sample();
+        r.files_analyzed = 1_595;
+        r.files_measured = 1_243;
+        r.stats.files_excluded_generated = 12;
+        r.stats.files_excluded_vendored = 340;
+
+        let html = render(&r);
+        assert!(
+            html.contains("1,595 files · 1,243 measured"),
+            "header must separate found from measured"
+        );
+        assert!(
+            html.contains("excluded: 12 generated, 340 vendored files"),
+            "footer must name the exclusion"
+        );
+        assert!(html.len() < 120_000, "rendered {} bytes", html.len());
+    }
+
+    #[test]
+    fn a_clean_repository_prints_no_exclusion_line() {
+        let html = render(&sample());
+        // "heuristic files excluded: 2" is a different sentence in the CCN
+        // caption; the footer line is the one with the counts.
+        assert!(!html.contains(" vendored files"), "no exclusions, no line");
+        assert!(!html.contains("excluded: 0 generated"));
+    }
+
+    #[test]
+    fn a_full_table_stays_under_the_size_budget() {
+        let mut r = sample();
+        r.top = (0..20)
+            .map(|i| {
+                row(
+                    &format!("packages/app-{i}/src/very/long/path/component-with-a-name-{i}.tsx"),
+                    0.02 * f64::from(i),
+                )
+            })
+            .collect();
+        let html = render(&r);
+        assert!(html.len() < 120_000, "rendered {} bytes", html.len());
+    }
+
+    #[test]
+    fn hotspots_render_only_with_history() {
+        let plain = render(&sample());
+        assert!(!plain.contains("id=\"hot-h\""), "no panel without git");
+        assert!(
+            !plain.contains("commits in the last 365 days"),
+            "no footer note without git"
+        );
+
+        let mut r = sample();
+        r.git_available = true;
+        r.commits_scanned = 1_234;
+        r.hotspot_debt_share = 41.2;
+        r.hotspots = vec![hot("src/app.rs", 48, 12_340, 900, 0.87)];
+        let html = render(&r);
+
+        assert!(html.contains("<h2 id=\"hot-h\">Hotspots</h2>"), "{html}");
+        assert!(html.contains("src/app.rs"));
+        assert!(html.contains("12,340"), "lines changed, grouped");
+        assert!(html.contains("0.87"), "hotspot score");
+        assert!(html.contains("top 10% by hotspot hold 41.2% of measured lines"));
+        assert!(html.contains("git: 1,234 commits in the last 365 days"));
+    }
+
+    #[test]
+    fn hotspot_paths_are_escaped() {
+        let mut r = sample();
+        r.git_available = true;
+        r.hotspots = vec![hot("src/<b>&\"drop.sql", 3, 10, 20, 0.4)];
+        let html = render(&r);
+
+        assert!(!html.contains("<b>&"), "raw markup leaked into the table");
+        assert!(html.contains("src/&lt;b&gt;&amp;&quot;drop.sql"));
+    }
+
+    #[test]
+    fn a_full_hotspot_table_stays_under_the_size_budget() {
+        let mut r = sample();
+        r.git_available = true;
+        r.hotspots = (0..20)
+            .map(|i| {
+                hot(
+                    &format!("packages/app-{i}/src/very/long/path/component-with-a-name-{i}.tsx"),
+                    40 + i,
+                    12_340,
+                    900,
+                    0.9,
+                )
+            })
+            .collect();
+        let html = render(&r);
+        assert!(html.len() < 120_000, "rendered {} bytes", html.len());
+    }
+}

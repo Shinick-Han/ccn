@@ -1,0 +1,31 @@
+[package]
+name = "ccn"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Repository code-health scanner: per-file LOC, per-function CCN, distribution histograms"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ignore = "0.4.30"
+ratatui = "0.29.0"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokei = "15"
+tree-sitter = "0.27"
+tree-sitter-c = "0.24.2"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23.5"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

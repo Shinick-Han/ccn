@@ -1,0 +1,419 @@
+[
+  {
+    "file": "javascript/basics.js",
+    "lang": "javascript",
+    "functions": [
+      { "name": "identity", "ccn": 1, "params": 1 },
+      { "name": "pick", "ccn": 2, "params": 1 },
+      { "name": "grade", "ccn": 3, "params": 1 }
+    ]
+  },
+  {
+    "file": "javascript/predicates.js",
+    "lang": "javascript",
+    "functions": [
+      { "name": "canPublish", "ccn": 2, "params": 2 },
+      { "name": "shouldRetry", "ccn": 2, "params": 2 },
+      { "name": "mixed", "ccn": 4, "params": 3 },
+      { "name": "label", "ccn": 2, "params": 1 },
+      { "name": "discount", "ccn": 2, "params": 2 }
+    ]
+  },
+  {
+    "file": "javascript/switch.js",
+    "lang": "javascript",
+    "functions": [
+      { "name": "route", "ccn": 3, "params": 1 },
+      { "name": "parse", "ccn": 2, "params": 1 },
+      { "name": "safeDivide", "ccn": 2, "params": 2 }
+    ]
+  },
+  {
+    "file": "javascript/nested.js",
+    "lang": "javascript",
+    "functions": [
+      { "name": "makeValidator", "ccn": 1, "params": 1 },
+      { "name": "check", "ccn": 2, "params": 1 },
+      { "name": "pipeline", "ccn": 1, "params": 1 },
+      { "name": null, "ccn": 1 },
+      { "name": null, "ccn": 1 },
+      { "name": null, "ccn": 2 }
+    ]
+  },
+  {
+    "file": "javascript/loops.js",
+    "lang": "javascript",
+    "functions": [
+      { "name": "sum", "ccn": 2, "params": 1 },
+      { "name": "countdown", "ccn": 2, "params": 1 },
+      { "name": "register", "ccn": 1, "params": 1 },
+      { "name": null, "ccn": 1 }
+    ]
+  },
+  {
+    "file": "tsx/render.tsx",
+    "lang": "tsx",
+    "functions": [
+      { "name": "Title", "ccn": 1 },
+      { "name": "Banner", "ccn": 2 },
+      { "name": "Badge", "ccn": 2 }
+    ]
+  },
+  {
+    "file": "tsx/list.tsx",
+    "lang": "tsx",
+    "functions": [
+      { "name": "List", "ccn": 1 },
+      { "name": null, "ccn": 2 },
+      { "name": "Empty", "ccn": 2 }
+    ]
+  },
+  {
+    "file": "tsx/api.tsx",
+    "lang": "tsx",
+    "functions": [
+      { "name": "loadNames", "ccn": 2 },
+      { "name": null, "ccn": 1 },
+      { "name": "useLabel", "ccn": 2 }
+    ]
+  },
+  {
+    "file": "tsx/nested.tsx",
+    "lang": "tsx",
+    "functions": [
+      { "name": "Panel", "ccn": 2 },
+      { "name": "Body", "ccn": 2 },
+      { "name": "Toolbar", "ccn": 1 },
+      { "name": null, "ccn": 2 }
+    ]
+  },
+  {
+    "file": "tsx/guards.tsx",
+    "lang": "tsx",
+    "functions": [
+      { "name": "firstMatch", "ccn": 4 },
+      { "name": "toggle", "ccn": 2 }
+    ]
+  },
+  {
+    "file": "python/basics.py",
+    "lang": "python",
+    "functions": [
+      { "name": "identity", "ccn": 1, "params": 1 },
+      { "name": "pick", "ccn": 2, "params": 1 },
+      { "name": "grade", "ccn": 3, "params": 1 }
+    ]
+  },
+  {
+    "file": "python/predicates.py",
+    "lang": "python",
+    "functions": [
+      { "name": "can_publish", "ccn": 2, "params": 2 },
+      { "name": "should_retry", "ccn": 2, "params": 2 },
+      { "name": "mixed", "ccn": 4, "params": 3 },
+      { "name": "label", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "python/loops.py",
+    "lang": "python",
+    "functions": [
+      { "name": "total", "ccn": 2, "params": 1 },
+      { "name": "parse_number", "ccn": 2, "params": 1 },
+      { "name": "positive_squares", "ccn": 3, "params": 1 },
+      { "name": "countdown", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "python/nested.py",
+    "lang": "python",
+    "functions": [
+      { "name": "make_validator", "ccn": 1, "params": 1 },
+      { "name": "check", "ccn": 2, "params": 1 },
+      { "name": "pipeline", "ccn": 1, "params": 1 },
+      { "name": null, "ccn": 1 },
+      { "name": null, "ccn": 1 },
+      { "name": "apply", "ccn": 3, "params": 2 }
+    ]
+  },
+  {
+    "file": "python/matching.py",
+    "lang": "python",
+    "functions": [
+      { "name": "describe", "ccn": 4, "params": 1 }
+    ]
+  },
+  {
+    "file": "rust/basics.rs",
+    "lang": "rust",
+    "functions": [
+      { "name": "identity", "ccn": 1, "params": 1 },
+      { "name": "pick", "ccn": 2, "params": 1 },
+      { "name": "grade", "ccn": 3, "params": 1 }
+    ]
+  },
+  {
+    "file": "rust/predicates.rs",
+    "lang": "rust",
+    "functions": [
+      { "name": "can_publish", "ccn": 2, "params": 2 },
+      { "name": "should_retry", "ccn": 2, "params": 2 },
+      { "name": "mixed", "ccn": 3, "params": 3 },
+      { "name": "clamped", "ccn": 3, "params": 3 }
+    ]
+  },
+  {
+    "file": "rust/switches.rs",
+    "lang": "rust",
+    "functions": [
+      { "name": "route", "ccn": 4, "params": 1 },
+      { "name": "sum", "ccn": 2, "params": 1 },
+      { "name": "find", "ccn": 4, "params": 2 }
+    ]
+  },
+  {
+    "file": "rust/nested.rs",
+    "lang": "rust",
+    "functions": [
+      { "name": "make_adder", "ccn": 1, "params": 1 },
+      { "name": null, "ccn": 2 },
+      { "name": "apply_all", "ccn": 1, "params": 2 },
+      { "name": null, "ccn": 1 },
+      { "name": "count_matches", "ccn": 1, "params": 2 },
+      { "name": null, "ccn": 1 }
+    ]
+  },
+  {
+    "file": "rust/guards.rs",
+    "lang": "rust",
+    "functions": [
+      { "name": "parse_all", "ccn": 2, "params": 1 },
+      { "name": "countdown", "ccn": 2, "params": 1 },
+      { "name": "unwrap_or_default", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "go/basics.go",
+    "lang": "go",
+    "functions": [
+      { "name": "Identity", "ccn": 1, "params": 1 },
+      { "name": "Pick", "ccn": 2, "params": 1 },
+      { "name": "Grade", "ccn": 3, "params": 1 }
+    ]
+  },
+  {
+    "file": "go/predicates.go",
+    "lang": "go",
+    "functions": [
+      { "name": "CanPublish", "ccn": 2, "params": 2 },
+      { "name": "ShouldRetry", "ccn": 2, "params": 2 },
+      { "name": "Mixed", "ccn": 3, "params": 3 },
+      { "name": "Clamped", "ccn": 3, "params": 3 }
+    ]
+  },
+  {
+    "file": "go/switches.go",
+    "lang": "go",
+    "functions": [
+      { "name": "Route", "ccn": 3, "params": 1 },
+      { "name": "Kind", "ccn": 3, "params": 1 },
+      { "name": "Sum", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "go/select.go",
+    "lang": "go",
+    "functions": [
+      { "name": "Receive", "ccn": 3, "params": 1 },
+      { "name": "Drain", "ccn": 4, "params": 2 },
+      { "name": "Spawn", "ccn": 1, "params": 2 },
+      { "name": null, "ccn": 2 }
+    ]
+  },
+  {
+    "file": "go/guards.go",
+    "lang": "go",
+    "functions": [
+      { "name": "Validate", "ccn": 2, "params": 1 },
+      { "name": null, "ccn": 2 },
+      { "name": "Count", "ccn": 4, "params": 1 }
+    ]
+  },
+  {
+    "file": "java/basics.java",
+    "lang": "java",
+    "functions": [
+      { "name": "identity", "ccn": 1, "params": 1 },
+      { "name": "pick", "ccn": 2, "params": 1 },
+      { "name": "grade", "ccn": 3, "params": 1 }
+    ]
+  },
+  {
+    "file": "java/predicates.java",
+    "lang": "java",
+    "functions": [
+      { "name": "canPublish", "ccn": 2, "params": 2 },
+      { "name": "shouldRetry", "ccn": 2, "params": 2 },
+      { "name": "mixed", "ccn": 3, "params": 3 },
+      { "name": "label", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "java/loops.java",
+    "lang": "java",
+    "functions": [
+      { "name": "sum", "ccn": 2, "params": 1 },
+      { "name": "countdown", "ccn": 2, "params": 1 },
+      { "name": "total", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "java/switches.java",
+    "lang": "java",
+    "functions": [
+      { "name": "route", "ccn": 4, "params": 1 },
+      { "name": "safeDivide", "ccn": 2, "params": 2 },
+      { "name": "clamp", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "java/lambdas.java",
+    "lang": "java",
+    "functions": [
+      { "name": "absolute", "ccn": 1, "params": 0 },
+      { "name": null, "ccn": 2 },
+      { "name": "countAbove", "ccn": 3, "params": 2 },
+      { "name": null, "ccn": 1 }
+    ]
+  },
+  {
+    "file": "c/basics.c",
+    "lang": "c",
+    "functions": [
+      { "name": "identity", "ccn": 1, "params": 1 },
+      { "name": "pick", "ccn": 2, "params": 1 },
+      { "name": "grade", "ccn": 3, "params": 1 }
+    ]
+  },
+  {
+    "file": "c/predicates.c",
+    "lang": "c",
+    "functions": [
+      { "name": "can_publish", "ccn": 2, "params": 2 },
+      { "name": "should_retry", "ccn": 2, "params": 2 },
+      { "name": "mixed", "ccn": 3, "params": 3 },
+      { "name": "label", "ccn": 2, "params": 1 },
+      { "name": "in_range", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "c/loops.c",
+    "lang": "c",
+    "functions": [
+      { "name": "sum", "ccn": 2, "params": 2 },
+      { "name": "countdown", "ccn": 2, "params": 1 },
+      { "name": "total", "ccn": 2, "params": 2 }
+    ]
+  },
+  {
+    "file": "c/switches.c",
+    "lang": "c",
+    "functions": [
+      { "name": "route", "ccn": 3, "params": 1 },
+      { "name": "first_positive", "ccn": 3, "params": 2 }
+    ]
+  },
+  {
+    "file": "cpp/basics.cpp",
+    "lang": "cpp",
+    "functions": [
+      { "name": "identity", "ccn": 1, "params": 1 },
+      { "name": "pick", "ccn": 2, "params": 1 },
+      { "name": "grade", "ccn": 3, "params": 1 }
+    ]
+  },
+  {
+    "file": "cpp/predicates.cpp",
+    "lang": "cpp",
+    "functions": [
+      { "name": "can_publish", "ccn": 2, "params": 2 },
+      { "name": "should_retry", "ccn": 2, "params": 2 },
+      { "name": "mixed", "ccn": 3, "params": 3 },
+      { "name": "label", "ccn": 2, "params": 1 },
+      { "name": "in_range", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "cpp/loops.cpp",
+    "lang": "cpp",
+    "functions": [
+      { "name": "sum", "ccn": 2, "params": 1 },
+      { "name": "countdown", "ccn": 2, "params": 1 },
+      { "name": "total", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "cpp/switches.cpp",
+    "lang": "cpp",
+    "functions": [
+      { "name": "route", "ccn": 3, "params": 1 },
+      { "name": "safe_divide", "ccn": 2, "params": 2 }
+    ]
+  },
+  {
+    "file": "cpp/lambdas.cpp",
+    "lang": "cpp",
+    "functions": [
+      { "name": "absolute", "ccn": 1, "params": 0 },
+      { "name": null, "ccn": 2 },
+      { "name": "count_above", "ccn": 3, "params": 2 },
+      { "name": null, "ccn": 1 }
+    ]
+  },
+  {
+    "file": "csharp/Basics.cs",
+    "lang": "csharp",
+    "functions": [
+      { "name": "Identity", "ccn": 1, "params": 1 },
+      { "name": "Pick", "ccn": 2, "params": 1 },
+      { "name": "Grade", "ccn": 3, "params": 1 }
+    ]
+  },
+  {
+    "file": "csharp/Predicates.cs",
+    "lang": "csharp",
+    "functions": [
+      { "name": "CanPublish", "ccn": 2, "params": 2 },
+      { "name": "ShouldRetry", "ccn": 2, "params": 2 },
+      { "name": "Mixed", "ccn": 3, "params": 3 },
+      { "name": "Label", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "csharp/Loops.cs",
+    "lang": "csharp",
+    "functions": [
+      { "name": "Sum", "ccn": 2, "params": 1 },
+      { "name": "Countdown", "ccn": 2, "params": 1 },
+      { "name": "Total", "ccn": 2, "params": 1 }
+    ]
+  },
+  {
+    "file": "csharp/Switches.cs",
+    "lang": "csharp",
+    "functions": [
+      { "name": "Route", "ccn": 3, "params": 1 },
+      { "name": "SafeDivide", "ccn": 2, "params": 2 }
+    ]
+  },
+  {
+    "file": "csharp/Lambdas.cs",
+    "lang": "csharp",
+    "functions": [
+      { "name": "Absolute", "ccn": 1, "params": 0 },
+      { "name": null, "ccn": 2 },
+      { "name": "CountAbove", "ccn": 3, "params": 2 },
+      { "name": null, "ccn": 1 }
+    ]
+  }
+]
