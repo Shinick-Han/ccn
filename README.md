@@ -6,6 +6,21 @@ histograms, trend and hotspot ranking. One static binary, ten languages.
 Linux builds target **glibc 2.28** (AlmaLinux/RHEL 8), and there is **no Python
 dependency** at build or run time — see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
+## Install
+
+```console
+# npm (downloads the platform binary, no install script)
+$ npx @shinick/ccn . --view
+$ npm i -g @shinick/ccn
+
+# or a release binary
+$ curl -LO https://github.com/Shinick-Han/ccn/releases/latest/download/ccn-linux-x64
+```
+
+npm packages: `@shinick/ccn` plus `@shinick/ccn-linux-x64`,
+`@shinick/ccn-darwin-arm64`, `@shinick/ccn-win32-x64`. Intel Macs and ARM
+Linux/Windows have no prebuilt package; build from source.
+
 ```console
 $ ccn .                       # terminal summary + ccn-report.html
 $ ccn . --tui                 # interactive dashboard (browse all files)
