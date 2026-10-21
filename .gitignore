@@ -2,3 +2,4 @@
 *-report.html
 
 .ccn/
+*.sarif

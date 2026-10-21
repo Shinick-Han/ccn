@@ -146,6 +146,38 @@ Since origin/main  1 new >10 · 0 worsened   (66 files compared, 0 skipped)
   first, so a typo cannot turn the whole repository into "new".
 - P4: `--baseline 123456` uses `p4 print @=123456` for the old contents.
 
+## GitHub Actions
+
+The repository ships a composite action and a PR workflow. Minimal usage in
+another repository:
+
+```yaml
+permissions:
+  contents: read
+  security-events: write
+
+steps:
+  - uses: actions/checkout@v4
+    with: { fetch-depth: 0 }
+
+  - uses: Shinick-Han/ccn@main
+    with:
+      baseline: origin/${{ github.base_ref }}
+      sarif: ccn.sarif
+
+  - uses: github/codeql-action/upload-sarif@v3
+    if: always()
+    with: { sarif_file: ccn.sarif }
+```
+
+- the action builds the binary from source (`cargo build --release --locked`)
+  and always passes `--no-report`.
+- `fail-on-new: "true"` makes the step fail when the PR adds or worsens a
+  function above CCN 10. SARIF still uploads because of `if: always()`.
+- with `--baseline`, SARIF contains only the delta; without it, it contains
+  every function at or above `--sarif-min-ccn` (default 10).
+- results appear in the repository's **Security → Code scanning** tab.
+
 ## Perforce
 
 The scan itself is VCS-agnostic; git and Perforce differ only in the history

@@ -67,6 +67,17 @@ pub struct Cli {
     #[arg(long, value_name = "REV")]
     pub baseline: Option<String>,
 
+    /// Write SARIF 2.1.0 for GitHub code scanning (`-` for stdout).
+    ///
+    /// With `--baseline` only the delta is emitted, so a PR sees the functions
+    /// it introduced rather than the repository's backlog.
+    #[arg(long, value_name = "PATH")]
+    pub sarif: Option<String>,
+
+    /// Minimum CCN emitted in a full (non-baseline) SARIF scan.
+    #[arg(long, value_name = "N", default_value_t = 10)]
+    pub sarif_min_ccn: u32,
+
     /// Exit with code 1 when `--baseline` finds added or worsened functions.
     #[arg(long, requires = "baseline")]
     pub fail_on_new: bool,

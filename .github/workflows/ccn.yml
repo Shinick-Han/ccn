@@ -1,0 +1,44 @@
+name: ccn
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  scan:
+    name: complexity gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # The baseline is a git revision, so the full history is required.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run ccn
+        id: ccn
+        uses: ./
+        with:
+          path: .
+          baseline: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+          fail-on-new: "true"
+          sarif: ccn.sarif
+          extra-args: "--no-report"
+
+      - name: Upload SARIF
+        if: always() && hashFiles('ccn.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ccn.sarif

@@ -45,6 +45,23 @@ fn main() {
         }
     }
 
+    // SARIF is written before any machine-readable early return so that
+    // `--json --sarif out.sarif` still produces the file.
+    if let Some(target) = &cli.sarif {
+        let json = ccn::sarif::render(&result, &report, cli.sarif_min_ccn);
+        if target == "-" {
+            println!("{json}");
+        } else {
+            match std::fs::write(target, json.as_bytes()) {
+                Ok(()) => eprintln!("ccn: wrote SARIF to {target}"),
+                Err(e) => {
+                    eprintln!("ccn: could not write SARIF to {target}: {e}");
+                    exit_code = 2;
+                }
+            }
+        }
+    }
+
     if cli.report_json {
         match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),

@@ -1,0 +1,103 @@
+name: ccn code health
+description: Scan a repository for per-function cyclomatic complexity and emit SARIF for code scanning.
+author: ccn contributors
+
+branding:
+  icon: activity
+  color: purple
+
+inputs:
+  path:
+    description: Directory to scan.
+    required: false
+    default: "."
+  baseline:
+    description: Git revision to compare against. Empty means a full scan.
+    required: false
+    default: ""
+  fail-on-new:
+    description: Pass --fail-on-new when a baseline is given.
+    required: false
+    default: "true"
+  sarif:
+    description: SARIF output path. Empty means no SARIF is written.
+    required: false
+    default: "ccn.sarif"
+  sarif-min-ccn:
+    description: CCN threshold used for full-mode SARIF results.
+    required: false
+    default: "10"
+  extra-args:
+    description: Extra arguments appended verbatim to the ccn command line.
+    required: false
+    default: ""
+
+outputs:
+  sarif:
+    description: Path of the SARIF file that was requested (empty when disabled).
+    value: ${{ steps.scan.outputs.sarif }}
+  exit-code:
+    description: Exit code of the ccn run (1 when the gate found new complexity).
+    value: ${{ steps.scan.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build ccn
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: cargo build --release --locked
+
+    - name: Scan
+      id: scan
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        CCN_BIN: ${{ github.action_path }}/target/release/ccn
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_FAIL_ON_NEW: ${{ inputs['fail-on-new'] }}
+        INPUT_SARIF: ${{ inputs.sarif }}
+        INPUT_SARIF_MIN_CCN: ${{ inputs['sarif-min-ccn'] }}
+        INPUT_EXTRA_ARGS: ${{ inputs['extra-args'] }}
+      run: |
+        set -euo pipefail
+
+        args=("$INPUT_PATH")
+
+        if [[ -n "$INPUT_BASELINE" ]]; then
+          args+=(--baseline "$INPUT_BASELINE")
+          if [[ "$INPUT_FAIL_ON_NEW" == "true" ]]; then
+            args+=(--fail-on-new)
+          fi
+        fi
+
+        if [[ -n "$INPUT_SARIF" ]]; then
+          args+=(--sarif "$INPUT_SARIF" --sarif-min-ccn "$INPUT_SARIF_MIN_CCN")
+        fi
+
+        # CI never writes the interactive HTML report.
+        args+=(--no-report)
+
+        if [[ -n "$INPUT_EXTRA_ARGS" ]]; then
+          # Split on whitespace without glob expansion or eval.
+          read -r -a extra <<< "$INPUT_EXTRA_ARGS"
+          for token in "${extra[@]}"; do
+            # --no-report is always emitted below, and clap rejects a repeat.
+            if [[ "$token" == "--no-report" ]]; then
+              continue
+            fi
+            args+=("$token")
+          done
+        fi
+
+        echo "sarif=$INPUT_SARIF" >> "$GITHUB_OUTPUT"
+        echo "command: $CCN_BIN ${args[*]}"
+
+        set +e
+        "$CCN_BIN" "${args[@]}"
+        status=$?
+        set -e
+
+        echo "exit-code=$status" >> "$GITHUB_OUTPUT"
+        exit "$status"

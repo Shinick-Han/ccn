@@ -924,3 +924,46 @@ Since HEAD~1  1 new >10 · 0 worsened   (66 files compared, 0 skipped)
 
 - GitHub Action + SARIF (PR 코멘트/코드스캔 탭)
 - 파일 리네임 추적(`git diff -M`)
+
+---
+
+## 24. SARIF + GitHub Action (2026-10-21, 0.6.0)
+
+### SARIF
+
+`src/sarif.rs`가 SARIF 2.1.0을 만든다. serde_json `Value`로 조립하므로 경로/함수명 이스케이프는 자동이다.
+
+- 규칙 3개: `ccn/complex-function`, `ccn/added-complex-function`, `ccn/worsened-complex-function`
+- 레벨: CCN 11-20 `note`, 21-50 `warning`, 50 초과 `error`
+- `--baseline`이 있으면 **델타만** 결과로 낸다(PR에서 저장소 전체 백로그를 쏟지 않음). 없으면 `--sarif-min-ccn` 이상 전부.
+- `artifactLocation.uri`는 저장소 상대 경로만 사용한다. 절대 경로(`C:/...`)가 새지 않는 것을 테스트로 고정.
+- 결과는 `(path, line, rule)`로 정렬해 결정적이다.
+
+실측(CCN 저장소):
+```
+전체:  17 results, rules 3, driver ccn 0.6.0
+델타(a87540e): 1 result  ccn/added-complex-function warning src/p4.rs:510
+```
+
+### Action
+
+`action.yml` (composite) + `.github/workflows/ccn.yml`.
+
+- 입력: `path`, `baseline`, `fail-on-new`, `sarif`, `sarif-min-ccn`, `extra-args`
+- 액션은 `cargo build --release --locked`로 바이너리를 만들고, 항상 `--no-report`를 붙인다.
+- `fail-on-new: true`면 새/악화 함수에서 step이 실패하고, 워크플로는 `if: always()`로 SARIF를 업로드한다.
+- 워크플로 권한: `contents: read`, `security-events: write`, `pull-requests: write`. checkout은 `fetch-depth: 0`(베이스라인 때문).
+
+### 검증
+
+```
+286 lib + 2 integration tests, 0 failed
+clippy -D warnings, fmt clean
+YAML 2개 파싱 확인 (action.yml, ccn.yml)
+```
+
+### 한계
+
+- 액션이 매 실행마다 소스를 빌드한다(캐시가 있어도 수 분). 릴리스 바이너리를 내려받는 방식이 다음 개선.
+- 코드 스캐닝 업로드는 공개 저장소 또는 GHAS가 켜진 private 저장소에서만 동작한다.
+- SARIF 전체 모드는 노이즈가 될 수 있어 PR에서는 델타 모드를 권장.
