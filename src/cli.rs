@@ -60,6 +60,18 @@ pub struct Cli {
     #[arg(long)]
     pub hotspots: bool,
 
+    /// Record this scan in `<repo>/.ccn/history.json` and show the delta from
+    /// the previous one.
+    #[arg(long, conflicts_with = "since")]
+    pub trend: bool,
+
+    /// Only analyse files changed since this git revision (e.g. HEAD~1).
+    ///
+    /// Useful in CI and code review: the report then describes the change, not
+    /// the whole repository.
+    #[arg(long, value_name = "REV", conflicts_with = "trend")]
+    pub since: Option<String>,
+
     /// Write the self-contained HTML report to this path.
     #[arg(
         long,
@@ -109,6 +121,7 @@ impl Cli {
             no_ccn: self.no_ccn,
             include_generated: self.include_generated,
             no_cache: self.no_cache,
+            since: self.since.clone(),
         }
     }
 

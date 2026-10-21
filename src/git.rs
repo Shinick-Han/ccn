@@ -16,12 +16,13 @@
 //!   caller ([`crate::metrics::build`]) rebases them onto the scan root with
 //!   [`prefix_relative_to`], so a scan of `repo/crates/core` still lines up.
 //!
-//! Commands (both with a 20 s wall-clock deadline, see [`TIMEOUT`]):
+//! Commands (each with a 20 s wall-clock deadline, see [`TIMEOUT`]):
 //!
 //! ```text
 //! git -C <dir> rev-parse --show-toplevel
 //! git -c core.quotepath=false -C <top> log --since=365.days --no-merges \
-//!     --no-renames --numstat --format=%x01
+//!     --no-renames --numstat --format=%x01%an
+//! git -c core.quotepath=false -C <top> diff --name-only --diff-filter=ACMR <rev> --
 //! ```
 //!
 //! `--no-renames` is deliberate: rename detection would print `old => new`
@@ -32,11 +33,18 @@
 //! `core.quotepath=false` keeps non-ASCII paths as UTF-8 instead of octal
 //! escapes, so a path matches the one the LOC pass reported.
 //!
+//! `%x01%an` starts each commit record with `\x01` and appends the author name
+//! (raw UTF-8, no quoting) on the same line. The name is attached to every path
+//! in that commit's numstat block, so the single `git log` pass yields both
+//! churn and ownership — [`History::authors`] is never a second command.
+//!
 //! Work is bounded twice: `--since=365.days` limits the window, and parsing
 //! stops after [`MAX_NUMSTAT_LINES`] numstat lines (~a 200k-file-change year),
-//! so a pathological monorepo cannot turn this into an unbounded parse.
+//! so a pathological monorepo cannot turn this into an unbounded parse. The
+//! per-path author map is additionally capped at
+//! [`MAX_AUTHORS_PER_PATH`] entries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -61,6 +69,13 @@ pub struct History {
     pub commits: u32,
     /// Churn per work-tree-relative, `/`-separated path.
     pub churn: HashMap<String, Churn>,
+    /// Commits per path per author, for the "who owns this hotspot" column.
+    ///
+    /// Keys match [`History::churn`] exactly, and each path's counts sum to at
+    /// most that path's `commits` (fewer only when the path has more than
+    /// [`MAX_AUTHORS_PER_PATH`] distinct authors and the tail was trimmed).
+    /// The collapsed unknown identity is [`UNKNOWN_AUTHOR`].
+    pub authors: HashMap<String, HashMap<String, u32>>,
 }
 
 /// Wall-clock budget for a single git command. Past this the child is killed
@@ -71,6 +86,21 @@ pub const TIMEOUT: Duration = Duration::from_secs(20);
 /// can be hundreds of thousands of file changes; the hotspot ranking only needs
 /// the shape of the distribution, so the tail is dropped deterministically.
 pub const MAX_NUMSTAT_LINES: usize = 200_000;
+
+/// Distinct authors kept per path. Kept authors are the highest-count ones
+/// (ties broken by name, ascending) so the map's shape — and therefore
+/// `top_author` and the author count — is stable across runs.
+///
+/// The cap exists for monorepos with generated files touched by thousands of
+/// bots/AI identities: `paths × authors` would otherwise grow unbounded. It is
+/// applied when parsing finishes, because counts must be complete before
+/// "highest" means anything; the intermediate map is bounded by the number of
+/// distinct author names in the window, which git itself already materialised.
+pub const MAX_AUTHORS_PER_PATH: usize = 20;
+
+/// Author recorded when `%an` is empty (a commit made with an empty ident, or a
+/// truncated capture). Never drop the path: churn and authorship stay aligned.
+pub const UNKNOWN_AUTHOR: &str = "(unknown)";
 
 /// Upper bound on captured stdout. Past this the reader keeps draining the pipe
 /// (so git cannot block on a full buffer) but stops growing the buffer.
@@ -100,11 +130,12 @@ pub fn collect_history(repo: &Path) -> Option<History> {
             "--no-merges",
             "--no-renames",
             "--numstat",
-            "--format=%x01",
+            // One record separator + the author name; parsed below.
+            "--format=%x01%an",
         ]);
     let out = run(cmd)?;
 
-    let (commits, churn) = parse_numstat(&out);
+    let (commits, churn, authors) = parse_log(&out);
     if commits == 0 {
         // An empty log means an unborn branch, or a repository whose last
         // commit is older than the window. Either way there is nothing to rank.
@@ -115,7 +146,53 @@ pub fn collect_history(repo: &Path) -> Option<History> {
         work_tree,
         commits,
         churn,
+        authors,
     })
+}
+
+/// Work-tree-relative paths that differ between `rev` and the working tree.
+///
+/// `git diff --name-only <rev>` compares the commit to the working tree, so it
+/// covers committed, staged and unstaged edits in one command. Untracked files
+/// are **not** included: git has no revision to diff them against, and a
+/// brand-new file has by definition not churned within the window.
+///
+/// `--diff-filter=ACMR` keeps added, copied, modified and renamed paths and
+/// drops deletions (`D`): a file that no longer exists has no lines to measure,
+/// so reporting it would only add a path the LOC pass can never join. A rename
+/// contributes only its new name, which is the half that exists on disk.
+///
+/// Keys are work-tree relative and `/`-separated — exactly the keys in
+/// [`History::churn`] — so a caller can intersect the two sets directly.
+///
+/// Returns `None` when `rev` is empty or looks like an option, `repo` is not a
+/// work tree, git is missing, the revision is unknown, the command fails, or it
+/// exceeds [`TIMEOUT`]. A successful diff with no changes is `Some(empty)`,
+/// which is meaningfully different from "could not ask".
+pub fn changed_since(repo: &Path, rev: &str) -> Option<HashSet<String>> {
+    if rev.is_empty() || rev.starts_with('-') {
+        return None;
+    }
+    let work_tree = work_tree(repo)?;
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg("core.quotepath=false")
+        .arg("-C")
+        .arg(&work_tree)
+        .args(["diff", "--name-only", "--diff-filter=ACMR", rev, "--"]);
+    let out = run(cmd)?;
+
+    let text = String::from_utf8_lossy(&out);
+    let mut changed = HashSet::new();
+    for raw in text.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        changed.insert(line.replace('\\', "/"));
+    }
+    Some(changed)
 }
 
 /// Work-tree root for `dir`, or `None` when git cannot answer.
@@ -169,21 +246,40 @@ fn normalize(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Parse `git log --format=%x01 --numstat` output.
+/// Parse `git log --format=%x01%an --numstat` output.
 ///
-/// Every `\x01` starts a new commit record; the numstat table follows it. Only
-/// lines with exactly three tab-separated fields are changes — a blank line
-/// separates the format from the table and is ignored.
-fn parse_numstat(bytes: &[u8]) -> (u32, HashMap<String, Churn>) {
+/// Every `\x01` starts a new commit record: the rest of that line is the author
+/// name, and the numstat table follows it. Only lines with exactly three
+/// tab-separated fields are changes — a blank line separates the format from the
+/// table and is ignored.
+///
+/// `splitn(3, '\t')` is what makes non-ASCII safe: a path may contain a tab
+/// (quoted by git) or any UTF-8 sequence, but the first two fields never do, so
+/// the third is taken verbatim rather than re-split or ASCII-decoded.
+///
+/// Both counters advance once per numstat line, so churn (`commits`,
+/// `lines_changed`) and attribution (`authors[path][author]`) can never drift:
+/// a path's author counts sum to the same number as its commit count in one
+/// commit, and each commit contributes to exactly one author bucket per path.
+fn parse_log(bytes: &[u8]) -> (u32, HashMap<String, Churn>, Authors) {
     let text = String::from_utf8_lossy(bytes);
     let mut commits = 0u32;
     let mut parsed = 0usize;
     let mut churn: HashMap<String, Churn> = HashMap::new();
+    let mut authors: Authors = HashMap::new();
+    // A numstat line before any record has no author to credit.
+    let mut author = UNKNOWN_AUTHOR.to_string();
 
     for raw in text.split('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if line.starts_with('\u{1}') {
+        if let Some(rest) = line.strip_prefix('\u{1}') {
             commits = commits.saturating_add(1);
+            let name = rest.trim();
+            author = if name.is_empty() {
+                UNKNOWN_AUTHOR.to_string()
+            } else {
+                name.to_string()
+            };
             continue;
         }
         if line.is_empty() {
@@ -205,14 +301,43 @@ fn parse_numstat(bytes: &[u8]) -> (u32, HashMap<String, Churn>) {
         }
         parsed += 1;
 
+        let key = path.replace('\\', "/");
         // `-` marks a binary file: it changes, but its line count is meaningless.
         let lines = count(added).saturating_add(count(deleted));
-        let entry = churn.entry(path.replace('\\', "/")).or_default();
+        let entry = churn.entry(key.clone()).or_default();
         entry.commits = entry.commits.saturating_add(1);
         entry.lines_changed = entry.lines_changed.saturating_add(lines);
+
+        let per_author = authors.entry(key).or_default();
+        let count = per_author.entry(author.clone()).or_insert(0);
+        *count = count.saturating_add(1);
     }
 
-    (commits, churn)
+    trim_authors(&mut authors);
+    (commits, churn, authors)
+}
+
+/// Commits per path per author.
+type Authors = HashMap<String, HashMap<String, u32>>;
+
+/// Keep only the [`MAX_AUTHORS_PER_PATH`] most frequent authors of each path.
+///
+/// Highest count first, ties broken by name ascending, so the surviving set is
+/// deterministic rather than dependent on hash iteration order. Paths at or
+/// under the cap are untouched (the common case, and the only one a normal
+/// repository ever hits).
+fn trim_authors(authors: &mut Authors) {
+    for per_author in authors.values_mut() {
+        if per_author.len() <= MAX_AUTHORS_PER_PATH {
+            continue;
+        }
+        let mut ranked: Vec<(String, u32)> =
+            per_author.iter().map(|(n, c)| (n.clone(), *c)).collect();
+        ranked.sort_by(|(an, ac), (bn, bc)| bc.cmp(ac).then_with(|| an.cmp(bn)));
+        ranked.truncate(MAX_AUTHORS_PER_PATH);
+        per_author.clear();
+        per_author.extend(ranked);
+    }
 }
 
 fn count(field: &str) -> u32 {
@@ -352,10 +477,19 @@ mod tests {
         git(dir, &["commit", "-q", "-m", message]);
     }
 
+    /// Commit as `author`, without touching the repository config, so one test
+    /// repository can carry several identities. `-c` before the subcommand is
+    /// how git takes a one-shot config value.
+    fn commit_as(dir: &Path, message: &str, author: &str) {
+        git(dir, &["add", "-A"]);
+        let name = format!("user.name={author}");
+        git(dir, &["-c", name.as_str(), "commit", "-q", "-m", message]);
+    }
+
     #[test]
     fn parses_commit_records_ties_and_binary_entries() {
-        let out = "\u{1}\n2\t1\tsrc/a.rs\n-\t-\tassets/logo.png\n\n\u{1}\n0\t3\tsrc\\b.rs\n";
-        let (commits, churn) = parse_numstat(out.as_bytes());
+        let out = "\u{1}Ann\n2\t1\tsrc/a.rs\n-\t-\tassets/logo.png\n\n\u{1}Zoë\n0\t3\tsrc\\b.rs\n";
+        let (commits, churn, authors) = parse_log(out.as_bytes());
 
         assert_eq!(commits, 2);
         assert_eq!(churn.len(), 3);
@@ -381,6 +515,168 @@ mod tests {
                 commits: 1,
                 lines_changed: 3
             })
+        );
+
+        // Attribution rides the same records, keyed exactly like churn.
+        assert_eq!(authors.get("src/a.rs").unwrap().get("Ann"), Some(&1));
+        assert_eq!(authors.get("src/b.rs").unwrap().get("Zoë"), Some(&1));
+    }
+
+    #[test]
+    fn an_empty_author_name_falls_back_to_unknown() {
+        let out = "\u{1}\n1\t0\ta.rs\n";
+        let (commits, churn, authors) = parse_log(out.as_bytes());
+        assert_eq!(commits, 1);
+        assert_eq!(churn.get("a.rs").unwrap().commits, 1);
+        assert_eq!(
+            authors.get("a.rs").unwrap().get(UNKNOWN_AUTHOR),
+            Some(&1),
+            "a record without %an still attributes the work"
+        );
+    }
+
+    #[test]
+    fn the_author_map_keeps_only_the_top_twenty_per_path() {
+        // Twenty-five authors on one path: author i gets i + 1 commits, so the
+        // cap must drop the five *least* frequent, not the first five seen.
+        let mut out = String::new();
+        for i in 0..25u32 {
+            for _ in 0..=i {
+                out.push('\u{1}');
+                out.push_str(&format!("author-{i:02}"));
+                out.push('\n');
+                out.push_str("1\t0\tsrc/hot.rs\n");
+            }
+        }
+
+        let (commits, churn, authors) = parse_log(out.as_bytes());
+        assert_eq!(commits, 325);
+        let per_author = authors.get("src/hot.rs").expect("path is kept");
+        assert_eq!(per_author.len(), MAX_AUTHORS_PER_PATH);
+        assert_eq!(per_author.get("author-24"), Some(&25));
+        assert_eq!(per_author.get("author-05"), Some(&6));
+        assert_eq!(per_author.get("author-04"), None, "the tail is dropped");
+        assert_eq!(per_author.get("author-00"), None);
+        // The kept counts are 6..=25; the dropped tail (1..=5) is the price of
+        // the cap, and `History::authors` documents it as "at most" the commits.
+        assert_eq!(per_author.values().sum::<u32>(), 310);
+        assert_eq!(churn.get("src/hot.rs").unwrap().commits, 325);
+    }
+
+    #[test]
+    fn attributes_each_path_to_the_committing_author() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("authors");
+        init_repo(tmp.path());
+
+        write(tmp.path(), "a.rs", "1\n");
+        write(tmp.path(), "b.rs", "1\n");
+        commit_as(tmp.path(), "ann adds a and b", "Ann");
+
+        write(tmp.path(), "a.rs", "1\n2\n");
+        commit_as(tmp.path(), "bob edits a", "Bob");
+
+        write(tmp.path(), "a.rs", "1\n2\n3\n");
+        commit_as(tmp.path(), "ann edits a again", "Ann");
+
+        // Non-ASCII identity: `%an` is emitted as raw UTF-8.
+        write(tmp.path(), "c.rs", "1\n");
+        commit_as(tmp.path(), "zoë adds c", "Zoë Ünïcode");
+
+        // One commit each on c.rs, so `top_author` has to break a tie.
+        write(tmp.path(), "c.rs", "1\n2\n");
+        commit_as(tmp.path(), "bob edits c", "Bob");
+
+        let history = collect_history(tmp.path()).expect("git history");
+        assert_eq!(history.commits, 5);
+
+        let a = history.authors.get("a.rs").expect("a.rs is attributed");
+        assert_eq!(a.get("Ann"), Some(&2));
+        assert_eq!(a.get("Bob"), Some(&1));
+        assert_eq!(a.len(), 2);
+        assert_eq!(
+            a.values().sum::<u32>(),
+            history.churn.get("a.rs").unwrap().commits,
+            "authorship does not add extra commits"
+        );
+        assert_eq!(history.churn.get("a.rs").unwrap().commits, 3);
+
+        assert_eq!(
+            history.authors.get("b.rs").unwrap().get("Ann"),
+            Some(&1),
+            "b.rs was only touched by Ann"
+        );
+        let c = history.authors.get("c.rs").expect("c.rs is attributed");
+        assert_eq!(c.get("Zoë Ünïcode"), Some(&1));
+        assert_eq!(c.get("Bob"), Some(&1));
+
+        // Exactly the rule the report uses: most commits, ties by name.
+        let top_author = |path: &str| {
+            history.authors.get(path).and_then(|per_author| {
+                per_author
+                    .iter()
+                    .max_by(|(an, ac), (bn, bc)| ac.cmp(bc).then_with(|| bn.cmp(an)))
+                    .map(|(name, _)| name.clone())
+            })
+        };
+        assert_eq!(top_author("a.rs").as_deref(), Some("Ann"));
+        assert_eq!(top_author("b.rs").as_deref(), Some("Ann"));
+        assert_eq!(top_author("c.rs").as_deref(), Some("Bob"), "tie goes to B");
+        assert_eq!(top_author("nope.rs"), None);
+    }
+
+    #[test]
+    fn changed_since_lists_modified_paths_and_excludes_deletions() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("changed");
+        init_repo(tmp.path());
+
+        write(tmp.path(), "a.rs", "1\n");
+        write(tmp.path(), "b.rs", "1\n");
+        commit(tmp.path(), "first");
+
+        write(tmp.path(), "a.rs", "1\n2\n");
+        commit(tmp.path(), "second");
+
+        // An unstaged edit on top of HEAD; b.rs still matches HEAD~1.
+        write(tmp.path(), "a.rs", "1\n2\n3\n");
+        let changed = changed_since(tmp.path(), "HEAD~1").expect("diff against HEAD~1");
+        assert_eq!(changed, HashSet::from(["a.rs".to_string()]));
+
+        // Deleting b.rs must not surface it: a deleted file has no LOC.
+        fs::remove_file(tmp.path().join("b.rs")).expect("delete b.rs");
+        let changed = changed_since(tmp.path(), "HEAD~1").expect("diff against HEAD~1");
+        assert_eq!(changed, HashSet::from(["a.rs".to_string()]));
+        assert!(
+            !changed.contains("b.rs"),
+            "--diff-filter=ACMR drops deletions"
+        );
+
+        // A revision that does not exist is "could not ask", not "nothing changed".
+        assert!(changed_since(tmp.path(), "no-such-rev-9f3a").is_none());
+    }
+
+    #[test]
+    fn changed_since_accepts_working_tree_relative_keys_from_a_subdirectory() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("changed-sub");
+        init_repo(tmp.path());
+        write(tmp.path(), "core/a.rs", "1\n");
+        commit(tmp.path(), "first");
+        write(tmp.path(), "core/a.rs", "1\n2\n");
+
+        let core = tmp.path().join("core");
+        let changed = changed_since(&core, "HEAD").expect("diff from a subdirectory");
+        assert_eq!(
+            changed,
+            HashSet::from(["core/a.rs".to_string()]),
+            "keys are work-tree relative, same as History::churn"
         );
     }
 
@@ -452,6 +748,8 @@ mod tests {
         let tmp = TempDir::new("plain");
         assert!(collect(tmp.path()).is_none());
         assert!(work_tree(tmp.path()).is_none());
+        // Diffing there cannot mean anything: None, not an empty set.
+        assert!(changed_since(tmp.path(), "HEAD").is_none());
     }
 
     #[test]
@@ -461,6 +759,15 @@ mod tests {
         assert!(!gone.exists());
         assert!(collect(&gone).is_none());
         assert!(work_tree(&gone).is_none());
+        assert!(changed_since(&gone, "HEAD").is_none());
+    }
+
+    #[test]
+    fn changed_since_rejects_revisions_that_look_like_options() {
+        let tmp = TempDir::new("rev-option");
+        // Rejected before git is even spawned: no way to smuggle a flag in.
+        assert!(changed_since(tmp.path(), "--output=/tmp/x").is_none());
+        assert!(changed_since(tmp.path(), "").is_none());
     }
 
     #[test]

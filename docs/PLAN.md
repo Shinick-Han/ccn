@@ -732,5 +732,58 @@ project-b 1,145 파일: 파일 수·LOC·comment·blank·함수 수·파일별 C
 - `--lang`은 여전히 스캔 후 필터이며 캐시를 우회한다.
 - mtime 기반이라 `git checkout` 후 첫 실행은 콜드다.
 
+---
+
+## 20. 트렌드 · diff 모드 · 소유권 (2026-10-21)
+
+### 구현
+
+| 기능 | 파일 | 동작 |
+|---|---|---|
+| 트렌드 | `src/history.rs` | `<repo>/.ccn/history.json`에 스냅샷 추가(최대 200), 이전 값과 델타 출력 |
+| diff 모드 | `src/git.rs`, `src/loc.rs` | `git diff --name-only --diff-filter=ACMR <rev>`로 후보 필터 |
+| 소유권 | `src/git.rs`, `src/metrics.rs` | 같은 `git log` 패스에서 path×author 커밋 수 집계, 상위 20명 |
+
+스냅샷은 8개 필드(`at_unix, health, grade, loc, functions, pct_over_10, ccn_max, files_measured`)만 저장한다. 커밋 가능한 크기이고 diff가 한 줄로 읽힌다.
+
+`--trend`와 `--since`는 **동시에 쓸 수 없다**: diff 결과를 전체 저장소 트렌드로 기록하면 다음 비교가 오염된다.
+
+### 실측
+
+```
+project-b --since HEAD~1
+  1 files · 6,635 lines
+  Health 74.8 / 100  grade E
+  20 functions > 10 (5.4%) · 1 > 50
+```
+
+변경된 `app.rs` 한 파일만 측정했기 때문에 전체 저장소(89.0 C)와 다른 값이 나온다. **이 숫자는 변경분에 대한 것이고 전체 건강도와 비교하면 안 된다.**
+
+```
+project-b --hotspots
+  0.98  office_backend_bridge.py 206 CCN · 73 commits · 4,101 lines changed · Shinick-Han (+2)
+  0.97  private_pty/tui_app.py   137 CCN · 70 commits · 8,843 lines changed · Test (+1)
+```
+
+```
+ccn . --trend  (2회 연속)
+  Trend  health 97.0 → 97.0 (0.0) · >10 1.8% → 1.8% (0.0pp)
+```
+
+### 한계
+
+- 첫 실행은 트렌드가 없다(비교 대상이 없음).
+- `--since`는 untracked 파일을 포함하지 않는다(git에 revision이 없음).
+- 트렌드는 **도구/밴드 버전을 저장하지 않는다.** `CACHE_VERSION`이나 등급 경계가 바뀌면 과거 스냅샷과 비교하면 안 되는데, 지금은 그걸 감지할 방법이 없다. 다음 개선 후보.
+- `--since`는 캐시를 우회한다(부분 스캔이 전체 캐시를 덮어쓰면 안 되므로).
+- 작성자 상한 20명/파일, 365일 창.
+
+### 검증
+
+```
+231 lib + 2 integration tests, 0 failed
+clippy -D warnings, fmt clean
+```
+
 
 

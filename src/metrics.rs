@@ -311,6 +311,11 @@ pub struct HotspotRow {
     pub lines_changed: u32,
     /// 0..=1. A file with no commit in the window is always exactly 0.
     pub hotspot: f64,
+    /// Author with the most commits to this path in the window. Empty when git
+    /// history was not collected.
+    pub top_author: String,
+    /// Number of distinct authors that touched the path in the window.
+    pub authors: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -375,6 +380,9 @@ pub struct Report {
     /// every number a consumer needs.
     #[serde(skip)]
     pub churn: HashMap<String, Churn>,
+    /// Comparison with the previous recorded snapshot. `None` without
+    /// `--trend`, or on the first recorded run.
+    pub trend: Option<crate::history::Trend>,
     pub bin_spec_version: u32,
     /// Grade bands are not calibrated yet; the report must say so.
     pub health_experimental: bool,
@@ -588,9 +596,13 @@ pub fn build_with(result: &ScanResult, enable_git: bool) -> Report {
     };
     let mut commits_scanned = 0u32;
     let mut churn: HashMap<String, Churn> = HashMap::new();
+    // Rebase work-tree keys onto the scan root once; churn and authors share it.
+    let prefix = history
+        .as_ref()
+        .map(|h| git::prefix_relative_to(root_path, &h.work_tree))
+        .unwrap_or_default();
     if let Some(history) = &history {
         commits_scanned = history.commits;
-        let prefix = git::prefix_relative_to(root_path, &history.work_tree);
         for file in &measured {
             let key = format!("{prefix}{}", file.path);
             if let Some(found) = history.churn.get(&key) {
@@ -608,6 +620,19 @@ pub fn build_with(result: &ScanResult, enable_git: bool) -> Report {
                 return None;
             }
             let change = churn.get(&f.path).copied().unwrap_or_default();
+            // Author attribution is keyed like churn (work-tree relative), so
+            // it needs the same prefix rebase.
+            let author_key = format!("{prefix}{}", f.path);
+            let (top_author, authors) = history
+                .as_ref()
+                .and_then(|h| h.authors.get(&author_key))
+                .filter(|map| !map.is_empty())
+                .map(|map| {
+                    let mut entries: Vec<(&String, &u32)> = map.iter().collect();
+                    entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                    (entries[0].0.clone(), map.len())
+                })
+                .unwrap_or_default();
             Some(HotspotRow {
                 path: f.path.clone(),
                 loc: f.loc as u32,
@@ -616,6 +641,8 @@ pub fn build_with(result: &ScanResult, enable_git: bool) -> Report {
                 commits: change.commits,
                 lines_changed: change.lines_changed,
                 hotspot: 0.0,
+                top_author,
+                authors,
             })
         })
         .collect();
@@ -646,6 +673,7 @@ pub fn build_with(result: &ScanResult, enable_git: bool) -> Report {
         hotspot_debt_share,
         hotspots,
         churn,
+        trend: None,
         bin_spec_version: BIN_SPEC_VERSION,
         health_experimental: HEALTH_EXPERIMENTAL,
     }
@@ -939,6 +967,8 @@ mod tests {
             commits,
             lines_changed: changed,
             hotspot: 0.0,
+            top_author: String::new(),
+            authors: 0,
         }
     }
 

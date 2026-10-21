@@ -14,7 +14,17 @@ fn main() {
         }
     };
 
-    let report = ccn::metrics::build_with(&result, cli.hotspots);
+    let mut report = ccn::metrics::build_with(&result, cli.hotspots);
+
+    // Record the snapshot only after the report exists: the trend compares
+    // reports, not scans. A failed write must not fail the command.
+    if cli.trend {
+        let snapshot = ccn::history::Snapshot::from_report(&report);
+        match ccn::history::record(&result.root, snapshot) {
+            Ok(trend) => report.trend = trend,
+            Err(e) => eprintln!("ccn: could not write history: {e}"),
+        }
+    }
 
     if cli.report_json {
         match serde_json::to_string_pretty(&report) {

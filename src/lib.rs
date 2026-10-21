@@ -8,6 +8,7 @@ pub mod ccn;
 pub mod cli;
 pub mod generated;
 pub mod git;
+pub mod history;
 pub mod loc;
 pub mod metrics;
 pub mod model;

@@ -98,6 +98,12 @@ pub fn render(report: &Report) -> String {
     );
     out.push_str("</header>\n<main id=\"main\">\n");
 
+    // --- trend (history only) ---------------------------------------------
+    // A gloss on the verdict, so it sits between the header and the charts.
+    if let Some(trend) = &report.trend {
+        out.push_str(&trend_section(trend));
+    }
+
     // --- CCN per function (primary) ---------------------------------------
     out.push_str("<section class=\"panel\" aria-labelledby=\"ccn-h\">\n");
     out.push_str("<h2 id=\"ccn-h\">CCN per function</h2>\n");
@@ -260,6 +266,92 @@ fn int(n: u64) -> String {
 
 fn pct(share: f64) -> String {
     format!("{share:.1}%")
+}
+
+/// One-decimal delta with an explicit sign; zero stays unsigned so "no change"
+/// cannot be read as an improvement or a regression.
+fn signed(delta: f64) -> String {
+    let rounded = (delta * 10.0).round() / 10.0;
+    if rounded == 0.0 {
+        "0.0".to_string()
+    } else {
+        format!("{rounded:+.1}")
+    }
+}
+
+/// Direction of a one-decimal delta. The sign is always printed too, so the
+/// colour is a second signal, never the only one.
+fn delta_class(delta: f64, higher_is_better: bool) -> &'static str {
+    let rounded = (delta * 10.0).round() / 10.0;
+    if rounded == 0.0 {
+        ""
+    } else if (rounded > 0.0) == higher_is_better {
+        " good"
+    } else {
+        " bad"
+    }
+}
+
+/// "89.0 → 87.2 −1.8" style comparison with the previous snapshot.
+///
+/// The snapshot times are deliberately not rendered: the report has to be
+/// byte-identical for identical inputs.
+fn trend_section(trend: &crate::history::Trend) -> String {
+    let mut s = String::from(
+        "<section class=\"trend\" aria-labelledby=\"trend-h\">\n\
+         <h2 id=\"trend-h\">Trend</h2>\n<p class=\"trend-row\">\n",
+    );
+
+    match (
+        trend.previous.health,
+        trend.current.health,
+        trend.health_delta(),
+    ) {
+        (Some(prev), Some(cur), Some(delta)) => {
+            let _ = writeln!(
+                s,
+                "<span class=\"trend-item\"><span class=\"trend-label\">health</span> \
+                 <span class=\"trend-num\">{prev:.1}</span> \
+                 <span class=\"trend-arrow\">→</span> \
+                 <span class=\"trend-num\">{cur:.1}</span> \
+                 <span class=\"delta{}\">{}</span></span>",
+                delta_class(delta, true),
+                signed(delta)
+            );
+        }
+        _ => s.push_str(
+            "<span class=\"trend-item\"><span class=\"trend-label\">health</span> n/a</span>\n",
+        ),
+    }
+
+    let pct_delta = trend.pct_over_10_delta();
+    let _ = writeln!(
+        s,
+        "<span class=\"trend-item\"><span class=\"trend-label\">%func &gt;10</span> \
+         <span class=\"trend-num\">{:.1}%</span> \
+         <span class=\"trend-arrow\">→</span> \
+         <span class=\"trend-num\">{:.1}%</span> \
+         <span class=\"delta{}\">{}pp</span></span>",
+        trend.previous.pct_over_10,
+        trend.current.pct_over_10,
+        delta_class(pct_delta, false),
+        signed(pct_delta)
+    );
+
+    if let (Some(prev), Some(cur)) = (trend.previous.grade, trend.current.grade) {
+        if prev != cur {
+            let _ = writeln!(
+                s,
+                "<span class=\"trend-item trend-grade\">grade {} \
+                 <span class=\"trend-arrow\">→</span> {}</span>",
+                escape_html(&prev.to_string()),
+                escape_html(&cur.to_string())
+            );
+        }
+    }
+
+    s.push_str("</p>\n</section>\n");
+    s
 }
 
 /// Minimum-visible-width for a bar; zero stays zero, never divide by zero.
@@ -601,20 +693,40 @@ fn top_table(report: &Report) -> String {
 /// Hotspot ranking. Every field comes from [`Report::hotspots`]; the renderer
 /// only formats and escapes.
 fn hotspot_table(report: &Report) -> String {
+    // Ownership is a git-history detail: without a named author on any row the
+    // column would be a stack of empty cells, so it is omitted entirely.
+    let with_owner = report.hotspots.iter().any(|r| !r.top_author.is_empty());
+
     let mut s = String::from("<div class=\"table-wrap\"><table>\n");
     s.push_str("<caption class=\"sr-only\">Hotspots: change frequency times risk</caption>\n");
+    s.push_str("<thead><tr><th scope=\"col\">path</th>");
+    if with_owner {
+        s.push_str("<th scope=\"col\">owner</th>");
+    }
     s.push_str(
-        "<thead><tr><th scope=\"col\">path</th><th scope=\"col\" class=\"num\">commits</th>\
+        "<th scope=\"col\" class=\"num\">commits</th>\
          <th scope=\"col\" class=\"num\">lines changed</th><th scope=\"col\" class=\"num\">max CCN</th>\
          <th scope=\"col\" class=\"num\">risk</th><th scope=\"col\" class=\"num\">hotspot</th>\
          </tr></thead>\n<tbody>\n",
     );
     for row in &report.hotspots {
+        let _ = write!(s, "<tr><td><code>{}</code></td>", escape_html(&row.path));
+        if with_owner {
+            let owner = if row.top_author.is_empty() {
+                String::new()
+            } else {
+                let mut owner = escape_html(&row.top_author);
+                if row.authors > 1 {
+                    let _ = write!(owner, " +{}", row.authors - 1);
+                }
+                owner
+            };
+            let _ = write!(s, "<td>{owner}</td>");
+        }
         let _ = writeln!(
             s,
-            "<tr><td><code>{}</code></td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
+            "<td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{:.2}</td><td class=\"num\">{:.2}</td></tr>",
-            escape_html(&row.path),
             int(u64::from(row.commits)),
             int(u64::from(row.lines_changed)),
             int(u64::from(row.ccn_max)),
@@ -651,6 +763,7 @@ const CSS: &str = r##":root{
   color-scheme: light;
   --bg:#faf9f7; --panel:#ffffff; --fg:#1c1e21; --muted:#5b6167; --rule:#d9dcdf;
   --accent:#1f5c99; --focus:#0b57a4; --chip:#e9f0f8; --chip-fg:#173f66; --grid:#e3e6e9;
+  --good:#1c6b3f; --bad:#a8321f;
   --s0:#16456f; --s1:#26679a; --s2:#3f86bb; --s3:#6ea6cf; --s4:#9dc3e0; --s5:#c9dff0;
   --bar-files:#2a6699; --bar-lines:#8fb9d9;
 }
@@ -659,6 +772,7 @@ const CSS: &str = r##":root{
     color-scheme: dark;
     --bg:#121517; --panel:#181c1f; --fg:#e7eaec; --muted:#a2aab2; --rule:#2f353b;
     --accent:#8ab8e0; --focus:#8ec5ff; --chip:#1e2b36; --chip-fg:#cfe3f2; --grid:#262c31;
+    --good:#7fc79b; --bad:#ef9a8b;
     --s0:#2b5f8a; --s1:#3f7cad; --s2:#5b9bca; --s3:#7db4da; --s4:#a3cbe6; --s5:#cbe2f2;
     --bar-files:#5b9bca; --bar-lines:#a8cbe4;
   }
@@ -667,6 +781,7 @@ const CSS: &str = r##":root{
   color-scheme: dark;
   --bg:#121517; --panel:#181c1f; --fg:#e7eaec; --muted:#a2aab2; --rule:#2f353b;
   --accent:#8ab8e0; --focus:#8ec5ff; --chip:#1e2b36; --chip-fg:#cfe3f2; --grid:#262c31;
+  --good:#7fc79b; --bad:#ef9a8b;
   --s0:#2b5f8a; --s1:#3f7cad; --s2:#5b9bca; --s3:#7db4da; --s4:#a3cbe6; --s5:#cbe2f2;
   --bar-files:#5b9bca; --bar-lines:#a8cbe4;
 }
@@ -694,6 +809,17 @@ body{
 .tag{margin-left:.5rem;display:inline-block;font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;padding:.1rem .4rem;border:1px dashed var(--rule);border-radius:999px;color:var(--muted);cursor:help}
 .meta{margin:.5rem 0 0;font-size:.8rem;color:var(--muted)}
 .meta code,td code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.trend{background:var(--panel);border:1px solid var(--rule);border-radius:12px;padding:12px 20px;margin-top:16px}
+.trend h2{margin:0;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.trend-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:.35rem 1.6rem;margin:.35rem 0 0;font-size:.9rem}
+.trend-item{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:.35rem;font-variant-numeric:tabular-nums}
+.trend-label{color:var(--muted)}
+.trend-num{font-weight:600}
+.trend-arrow{color:var(--muted)}
+.trend-grade{color:var(--muted)}
+.delta{font-weight:600}
+.delta.good{color:var(--good)}
+.delta.bad{color:var(--bad)}
 .panel{background:var(--panel);border:1px solid var(--rule);border-radius:12px;padding:18px 20px;margin-top:16px}
 .panel h2{margin:0 0 .25rem;font-size:1.05rem}
 .sub{margin:0 0 .75rem;color:var(--muted);font-size:.85rem}
@@ -823,6 +949,7 @@ mod tests {
             hotspot_debt_share: 0.0,
             hotspots: Vec::new(),
             churn: std::collections::HashMap::new(),
+            trend: None,
             bin_spec_version: 1,
             health_experimental: true,
         }
@@ -837,6 +964,8 @@ mod tests {
             commits,
             lines_changed: changed,
             hotspot,
+            top_author: String::new(),
+            authors: 0,
         }
     }
 
@@ -949,6 +1078,154 @@ mod tests {
             .collect();
         let html = render(&r);
         assert!(html.len() < 120_000, "rendered {} bytes", html.len());
+    }
+
+    fn snap(
+        health: Option<f64>,
+        grade: Option<char>,
+        pct_over_10: f64,
+    ) -> crate::history::Snapshot {
+        crate::history::Snapshot {
+            at_unix: 0,
+            health,
+            grade,
+            loc: 0,
+            functions: 0,
+            pct_over_10,
+            ccn_max: 0,
+            files_measured: 0,
+        }
+    }
+
+    fn snapshot_trend() -> crate::history::Trend {
+        crate::history::Trend {
+            previous: snap(Some(89.0), Some('C'), 5.3),
+            current: snap(Some(87.2), Some('D'), 5.8),
+        }
+    }
+
+    #[test]
+    fn trend_panel_appears_only_with_a_trend() {
+        let plain = render(&sample());
+        assert!(!plain.contains("class=\"trend\""), "{plain}");
+        assert!(!plain.contains("Trend"), "{plain}");
+
+        let mut r = sample();
+        r.trend = Some(snapshot_trend());
+        let html = render(&r);
+
+        assert!(html.contains("<section class=\"trend\""), "{html}");
+        // Both comparisons, and the deltas keep their signs.
+        assert!(html.contains("health"), "{html}");
+        assert!(html.contains("89.0"), "{html}");
+        assert!(html.contains("87.2"), "{html}");
+        assert!(html.contains("class=\"delta bad\">-1.8</span>"), "{html}");
+        assert!(html.contains("%func &gt;10"), "{html}");
+        assert!(html.contains("5.3%"), "{html}");
+        assert!(html.contains("5.8%"), "{html}");
+        assert!(html.contains("class=\"delta bad\">+0.5pp</span>"), "{html}");
+        // Grade moved, so the letters are shown.
+        assert!(html.contains("class=\"trend-item trend-grade\""), "{html}");
+        assert!(html.contains("grade C"), "{html}");
+        assert!(html.contains(" D</span>"), "{html}");
+
+        // Between the verdict header and the first chart panel.
+        let trend_at = html.find("class=\"trend\"").unwrap();
+        let ccn_at = html.find("id=\"ccn-h\"").unwrap();
+        assert!(trend_at < ccn_at, "trend must precede the CCN chart");
+    }
+
+    #[test]
+    fn trend_colours_follow_the_direction_of_travel() {
+        let mut r = sample();
+        r.trend = Some(crate::history::Trend {
+            previous: snap(Some(80.0), Some('D'), 6.0),
+            current: snap(Some(82.5), Some('D'), 5.2),
+        });
+        let html = render(&r);
+
+        assert!(html.contains("class=\"delta good\">+2.5</span>"), "{html}");
+        // Fewer functions above 10 is an improvement, so a minus sign is good.
+        assert!(
+            html.contains("class=\"delta good\">-0.8pp</span>"),
+            "{html}"
+        );
+        // Unchanged grade is not printed (the CSS class may still exist).
+        assert!(!html.contains("trend-item trend-grade"), "{html}");
+
+        // No change is unsigned and carries no good/bad tone.
+        let mut flat = sample();
+        flat.trend = Some(crate::history::Trend {
+            previous: snap(Some(80.0), Some('C'), 5.0),
+            current: snap(Some(80.0), Some('C'), 5.0),
+        });
+        let html = render(&flat);
+        assert!(html.contains("class=\"delta\">0.0</span>"), "{html}");
+        assert!(html.contains("class=\"delta\">0.0pp</span>"), "{html}");
+        assert!(!html.contains("delta bad"), "{html}");
+        assert!(!html.contains("delta good"), "{html}");
+    }
+
+    #[test]
+    fn trend_without_health_says_not_available() {
+        let mut r = sample();
+        r.trend = Some(crate::history::Trend {
+            previous: snap(None, None, 5.3),
+            current: snap(Some(87.2), Some('C'), 5.8),
+        });
+        let html = render(&r);
+        assert!(html.contains("trend-label\">health</span> n/a"), "{html}");
+    }
+
+    #[test]
+    fn owner_column_appears_only_when_an_author_is_known() {
+        let mut r = sample();
+        r.git_available = true;
+        r.hotspots = vec![hot("src/app.rs", 48, 12_340, 900, 0.87)];
+        let plain = render(&r);
+        assert!(!plain.contains("<th scope=\"col\">owner</th>"), "{plain}");
+
+        let mut with = r.clone();
+        with.hotspots[0].top_author = "alice".into();
+        with.hotspots[0].authors = 1;
+        let one = render(&with);
+        assert!(one.contains("<th scope=\"col\">owner</th>"), "{one}");
+        assert!(one.contains("<td>alice</td>"), "{one}");
+
+        with.hotspots[0].authors = 3;
+        let many = render(&with);
+        assert!(many.contains("<td>alice +2</td>"), "{many}");
+    }
+
+    #[test]
+    fn owner_names_are_escaped() {
+        let mut r = sample();
+        r.git_available = true;
+        r.hotspots = vec![hot("src/app.rs", 3, 10, 20, 0.4)];
+        r.hotspots[0].top_author = "a<b&\"c\"".into();
+        r.hotspots[0].authors = 2;
+        let html = render(&r);
+
+        assert!(
+            !html.contains("<b>&"),
+            "raw markup leaked into the owner cell"
+        );
+        assert!(
+            html.contains("<td>a&lt;b&amp;&quot;c&quot; +1</td>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_trend_panel_stays_deterministic_and_small() {
+        let mut r = sample();
+        r.trend = Some(snapshot_trend());
+        let a = render(&r);
+        let b = render(&r);
+        assert_eq!(a, b);
+        assert!(a.len() < 120_000, "rendered {} bytes", a.len());
+        // The snapshot's timestamp never reaches the document.
+        assert!(!a.contains("at_unix"));
     }
 
     #[test]

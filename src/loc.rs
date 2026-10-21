@@ -45,6 +45,8 @@ pub struct ScanOptions {
     pub include_generated: bool,
     /// Disable the persistent per-file cache (always parse every file).
     pub no_cache: bool,
+    /// Only analyse files changed since this git revision.
+    pub since: Option<String>,
 }
 
 impl Default for ScanOptions {
@@ -58,6 +60,7 @@ impl Default for ScanOptions {
             no_ccn: false,
             include_generated: false,
             no_cache: false,
+            since: None,
         }
     }
 }
@@ -85,6 +88,8 @@ const DEFAULT_EXCLUDES: &[&str] = &[
 pub enum ScanError {
     NotFound(PathBuf),
     NotADirectory(PathBuf),
+    /// `--since <rev>` could not be resolved (not a git repo, unknown rev).
+    InvalidSince(String),
 }
 
 impl std::fmt::Display for ScanError {
@@ -92,6 +97,10 @@ impl std::fmt::Display for ScanError {
         match self {
             ScanError::NotFound(p) => write!(f, "path does not exist: {}", p.display()),
             ScanError::NotADirectory(p) => write!(f, "not a directory: {}", p.display()),
+            ScanError::InvalidSince(rev) => write!(
+                f,
+                "cannot resolve --since {rev}: not a git work tree, or unknown revision"
+            ),
         }
     }
 }
@@ -137,8 +146,11 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
     // language filter or `--include-generated` changes which files are measured
     // or how they are classified, and letting those runs rewrite the shared
     // cache would poison the next full scan. All four bypass it.
-    let use_cache =
-        !opts.no_cache && !opts.no_ccn && opts.langs.is_empty() && !opts.include_generated;
+    let use_cache = !opts.no_cache
+        && !opts.no_ccn
+        && opts.langs.is_empty()
+        && !opts.include_generated
+        && opts.since.is_none();
     let load_started = std::time::Instant::now();
     let old = if use_cache {
         crate::cache::Cache::load(&root_display)
@@ -155,8 +167,21 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
     let classify_exclusions = !opts.include_generated;
 
     let walk_started = std::time::Instant::now();
-    let candidates = walk_source_files(&root, opts, &config);
+    let mut candidates = walk_source_files(&root, opts, &config);
     let walk_elapsed = walk_started.elapsed();
+
+    // Diff mode: keep only files this change touched. Deleted files are not in
+    // the set, which is correct — there is no LOC to measure for them.
+    if let Some(rev) = &opts.since {
+        let changed = crate::git::changed_since(&root, rev)
+            .ok_or_else(|| ScanError::InvalidSince(rev.clone()))?;
+        let prefix = crate::git::work_tree(&root)
+            .map(|top| crate::git::prefix_relative_to(&root, &top))
+            .unwrap_or_default();
+        candidates.retain(|(abs, _)| {
+            changed.contains(&format!("{prefix}{}", relative_display(&root, abs)))
+        });
+    }
 
     let resolve_started = std::time::Instant::now();
     let resolved: Vec<Option<(FileLoc, Option<crate::cache::Entry>)>> = candidates

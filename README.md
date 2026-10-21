@@ -1,7 +1,7 @@
 # ccn
 
-Repository code-health scanner. Per-file LOC today; per-function CCN and the
-distribution report are next.
+Repository code-health scanner: per-file LOC, per-function CCN, distribution
+histograms, trend and hotspot ranking. One static binary, ten languages.
 
 ```console
 $ ccn .                       # terminal summary + ccn-report.html
@@ -10,7 +10,9 @@ $ ccn . --view                # write to a temp file and open it
 $ ccn . --open                # ...or open the report in the repo
 $ ccn . --json                # machine-readable contract (no report)
 $ ccn . --ci                  # ASCII-only, with terminal histograms
-$ ccn . --hotspots            # + git churn ranking (runs git log, slower)
+$ ccn . --hotspots            # + git churn ranking and ownership (runs git log)
+$ ccn . --trend               # compare with the previous scan, and record this one
+$ ccn . --since HEAD~1        # only files changed since a revision
 $ ccn . --no-cache            # ignore the per-file cache
 $ ccn . --fail-over 2.0       # exit 1 if >2% of functions exceed CCN 10
 $ ccn . --lang rust,python    # restrict to languages
@@ -43,6 +45,7 @@ ccn 0.1.0
 | M5 | calibration + methodology docs | ✅ done |
 | M6 | TUI dashboard + instant view | ✅ done |
 | M7 | per-file cache | ✅ done |
+| M8 | trend, diff mode, ownership | ✅ done |
 
 `docs/PLAN.md` is the design document; `docs/research-metrics-and-viz.md` is
 the methodology research behind the metric choices.
@@ -86,6 +89,18 @@ Read both numbers; neither is "the" answer.
   with `--include-generated`.
 - The calibration corpus is one developer's machine, mostly TypeScript.
   Treat absolute grades as indicative outside that population.
+
+## Trend, diff mode, ownership
+
+- **`--trend`** appends a small snapshot to `<repo>/.ccn/history.json` (max 200)
+  and prints the delta from the previous run: health, grade, `%func >10`. The
+  file is plain JSON so it diffs cleanly in a commit. First run has no trend.
+- **`--since <rev>`** analyses only the files changed between `<rev>` and the
+  working tree (`git diff --name-only --diff-filter=ACMR`). The resulting health
+  describes **the change**, not the repository — do not compare it to a
+  full-repo score. Deleted files are skipped; untracked files are not included.
+- **`--hotspots`** now also reports the top author per hotspot (`alice +2`) from
+  the same single `git log` pass.
 
 ## Cache
 

@@ -99,6 +99,75 @@ fn bin_label(label: &str, ci: bool) -> String {
     }
 }
 
+/// Head-truncated label (names read left to right), with an ASCII ellipsis in
+/// `--ci` mode.
+fn truncate_head_with(value: &str, max: usize, ci: bool) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let marker = if ci { "..." } else { "…" };
+    let keep = max.saturating_sub(marker.chars().count());
+    let head: String = value.chars().take(keep).collect();
+    format!("{head}{marker}")
+}
+
+/// One-decimal delta with an explicit sign, except zero: "0.0" is not "+0.0"
+/// and not "-0.0", because a non-change should not look like a direction.
+fn signed(delta: f64) -> String {
+    let rounded = (delta * 10.0).round() / 10.0;
+    if rounded == 0.0 {
+        "0.0".to_string()
+    } else {
+        format!("{rounded:+.1}")
+    }
+}
+
+/// Comparison with the previous recorded snapshot.
+///
+/// Absent without `--trend` (or on the first recorded run): an empty string, not
+/// a line full of dashes, because "no history" and "no change" are different.
+/// The sign is always spelled out so the line survives being pasted anywhere
+/// colour would not.
+fn trend_block(report: &Report, sep: &str, ci: bool) -> String {
+    let Some(trend) = &report.trend else {
+        return String::new();
+    };
+    let arrow = if ci { "->" } else { "→" };
+    let mut out = String::from("  Trend  ");
+
+    match (
+        trend.previous.health,
+        trend.current.health,
+        trend.health_delta(),
+    ) {
+        (Some(prev), Some(cur), Some(delta)) => {
+            out.push_str(&format!(
+                "health {prev:.1} {arrow} {cur:.1} ({})",
+                signed(delta)
+            ));
+        }
+        // One side unmeasured: show the change, not an invented score.
+        _ => out.push_str("health n/a"),
+    }
+
+    // Only when the letter actually moved; a repeated grade is noise.
+    if let (Some(prev), Some(cur)) = (trend.previous.grade, trend.current.grade) {
+        if prev != cur {
+            out.push_str(&format!(" {sep} grade {prev} {arrow} {cur}"));
+        }
+    }
+
+    let delta = trend.pct_over_10_delta();
+    out.push_str(&format!(
+        " {sep} >10 {:.1}% {arrow} {:.1}% ({}pp)",
+        trend.previous.pct_over_10,
+        trend.current.pct_over_10,
+        signed(delta),
+    ));
+    out.push('\n');
+    out
+}
+
 fn health_block(report: &Report, sep: &str) -> String {
     let mut out = String::new();
     let Some(health) = &report.health else {
@@ -188,16 +257,47 @@ fn hotspots_block(report: &Report, sep: &str, ci: bool) -> String {
     out.push_str("  hotspots\n");
     for row in report.hotspots.iter().take(3) {
         let label = excerpt_with(&row.path, 24, ci);
-        out.push_str(&format!(
-            "    {:.2}  {:<24} {} CCN {sep} {} commits {sep} {} lines changed\n",
+        let mut line = format!(
+            "    {:.2}  {:<24} {} CCN {sep} {} commits {sep} {} lines changed",
             row.hotspot,
             label,
             thousands(row.ccn_max as usize),
             thousands(row.commits as usize),
             thousands(row.lines_changed as usize),
-        ));
+        );
+        let budget = 100usize.saturating_sub(line.chars().count());
+        line.push_str(&author_suffix(row, ci, budget));
+        out.push_str(&line);
+        out.push('\n');
     }
     out
+}
+
+/// ` · alice (+2)` after a hotspot row, or nothing when history did not name an
+/// author.
+///
+/// `budget` is the room left on a 100-column row. The author is capped at 24
+/// characters, but the row wins: a long path and a long name must not wrap a CI
+/// log, so the name is shortened further (or dropped) rather than overflow.
+fn author_suffix(row: &crate::metrics::HotspotRow, ci: bool, budget: usize) -> String {
+    if row.top_author.is_empty() {
+        return String::new();
+    }
+    let lead = if ci { " - " } else { " · " };
+    let tail = if row.authors > 1 {
+        format!(" (+{})", row.authors - 1)
+    } else {
+        String::new()
+    };
+    let room = budget
+        .saturating_sub(lead.chars().count())
+        .saturating_sub(tail.chars().count());
+    // Fewer than 4 columns (one glyph plus an ellipsis) reads as noise.
+    if room < 4 {
+        return String::new();
+    }
+    let name = truncate_head_with(&row.top_author, room.min(24), ci);
+    format!("{lead}{name}{tail}")
 }
 
 /// One histogram block, prefixed by a blank line.
@@ -278,6 +378,9 @@ pub fn render(result: &ScanResult, report: &Report, opts: &TerminalOptions) -> S
     out.push('\n');
 
     out.push_str(&health_block(report, sep));
+    // Directly under the score it compares: history is a gloss on health, not
+    // a separate section.
+    out.push_str(&trend_block(report, sep, opts.ci));
     out.push_str(&stats_block(report, sep));
 
     if opts.distributions {
@@ -656,6 +759,8 @@ mod tests {
                 commits: 48,
                 lines_changed: 12_340,
                 hotspot: 0.87,
+                top_author: String::new(),
+                authors: 0,
             },
             crate::metrics::HotspotRow {
                 path: "src/parser/grammar.rs".into(),
@@ -665,6 +770,8 @@ mod tests {
                 commits: 21,
                 lines_changed: 4_100,
                 hotspot: 0.55,
+                top_author: String::new(),
+                authors: 0,
             },
             crate::metrics::HotspotRow {
                 path: "a/very/long/path/that/needs/truncation/because/it/is/deep/file.rs".into(),
@@ -674,6 +781,8 @@ mod tests {
                 commits: 3,
                 lines_changed: 90,
                 hotspot: 0.21,
+                top_author: String::new(),
+                authors: 0,
             },
             crate::metrics::HotspotRow {
                 path: "fourth.rs".into(),
@@ -683,6 +792,8 @@ mod tests {
                 commits: 1,
                 lines_changed: 2,
                 hotspot: 0.05,
+                top_author: String::new(),
+                authors: 0,
             },
         ];
     }
@@ -767,6 +878,224 @@ mod tests {
                 "line longer than 100 chars: {line:?}"
             );
         }
+    }
+
+    /// A snapshot pair with the fields the trend line reads.
+    fn trend(prev: Option<f64>, cur: Option<f64>, pct: (f64, f64)) -> crate::history::Trend {
+        use crate::history::{Snapshot, Trend};
+        let snap = |health: Option<f64>, grade: Option<char>, pct_over_10: f64| Snapshot {
+            at_unix: 0,
+            health,
+            grade,
+            loc: 0,
+            functions: 0,
+            pct_over_10,
+            ccn_max: 0,
+            files_measured: 0,
+        };
+        Trend {
+            // Same letter on both sides unless a test builds its own pair.
+            previous: snap(prev, prev.map(|_| 'C'), pct.0),
+            current: snap(cur, cur.map(|_| 'C'), pct.1),
+        }
+    }
+
+    #[test]
+    fn trend_line_renders_arrows_and_signs_under_health() {
+        let result = sample_scan();
+        let mut report = build(&result);
+        report.trend = Some(crate::history::Trend {
+            previous: crate::history::Snapshot {
+                at_unix: 0,
+                health: Some(89.0),
+                grade: Some('C'),
+                loc: 1,
+                functions: 1,
+                pct_over_10: 5.3,
+                ccn_max: 1,
+                files_measured: 1,
+            },
+            current: crate::history::Snapshot {
+                at_unix: 0,
+                health: Some(87.2),
+                grade: Some('D'),
+                loc: 1,
+                functions: 1,
+                pct_over_10: 5.8,
+                ccn_max: 1,
+                files_measured: 1,
+            },
+        });
+        let out = render(&result, &report, &TerminalOptions::default());
+
+        assert!(
+            out.contains(
+                "  Trend  health 89.0 → 87.2 (-1.8) · grade C → D · \
+                 >10 5.3% → 5.8% (+0.5pp)\n"
+            ),
+            "{out}"
+        );
+
+        // Directly under the health block, above the LOC statistics.
+        let lines: Vec<&str> = out.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("  Trend"))
+            .expect("trend line");
+        assert!(lines[at - 1].contains("functions > 10"), "{out}");
+        assert!(lines[at + 1].starts_with("  LOC "), "{out}");
+    }
+
+    #[test]
+    fn trend_line_signs_a_positive_delta() {
+        let result = sample_scan();
+        let mut report = build(&result);
+        report.trend = Some(trend(Some(80.0), Some(82.5), (4.0, 4.4)));
+        let out = render(&result, &report, &TerminalOptions::default());
+        assert!(out.contains("health 80.0 → 82.5 (+2.5)"), "{out}");
+        assert!(out.contains(">10 4.0% → 4.4% (+0.4pp)"), "{out}");
+        // Same grade on both sides is omitted.
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("  Trend"))
+            .expect("trend");
+        assert!(!line.contains("grade"), "{line:?}");
+    }
+
+    #[test]
+    fn trend_line_prints_zero_without_a_sign() {
+        let result = sample_scan();
+        let mut report = build(&result);
+        report.trend = Some(trend(Some(80.0), Some(80.0), (5.0, 5.0)));
+        let out = render(&result, &report, &TerminalOptions::default());
+        assert!(out.contains("health 80.0 → 80.0 (0.0)"), "{out}");
+        assert!(out.contains(">10 5.0% → 5.0% (0.0pp)"), "{out}");
+        assert!(!out.contains("+0.0"), "{out}");
+    }
+
+    #[test]
+    fn trend_line_is_ascii_in_ci_mode() {
+        let result = sample_scan();
+        let mut report = build(&result);
+        report.trend = Some(trend(Some(89.0), Some(87.2), (5.3, 5.8)));
+        let opts = TerminalOptions {
+            top: 3,
+            ci: true,
+            distributions: true,
+        };
+        let out = render(&result, &report, &opts);
+
+        assert!(out.is_ascii(), "non-ASCII in CI output:\n{out}");
+        assert!(out.contains("health 89.0 -> 87.2 (-1.8)"), "{out}");
+        assert!(out.contains(">10 5.3% -> 5.8% (+0.5pp)"), "{out}");
+        for line in out.lines() {
+            assert!(
+                line.chars().count() <= 100,
+                "line longer than 100 chars: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trend_line_is_absent_without_a_trend() {
+        let result = sample_scan();
+        let out = render(&result, &build(&result), &TerminalOptions::default());
+        assert!(!out.contains("Trend"), "{out}");
+    }
+
+    #[test]
+    fn trend_line_says_not_available_when_health_is_missing() {
+        let result = sample_scan();
+        let mut report = build(&result);
+        report.trend = Some(trend(None, Some(87.2), (5.3, 5.8)));
+        let out = render(&result, &report, &TerminalOptions::default());
+        assert!(out.contains("Trend  health n/a · >10 5.3% → 5.8%"), "{out}");
+    }
+
+    #[test]
+    fn hotspot_author_appears_only_when_named() {
+        let result = sample_scan();
+        let mut report = build(&result);
+        with_git(&mut report);
+        let out = render(&result, &report, &TerminalOptions::default());
+        assert!(!out.contains(" · alice"), "{out}");
+
+        report.hotspots[0].top_author = "alice".into();
+        report.hotspots[0].authors = 1;
+        let one = render(&result, &report, &TerminalOptions::default());
+        assert!(
+            one.contains("12,340 lines changed · alice\n"),
+            "single author, no count:\n{one}"
+        );
+        assert!(!one.contains("(+"), "{one}");
+
+        report.hotspots[0].authors = 3;
+        let many = render(&result, &report, &TerminalOptions::default());
+        assert!(
+            many.contains("12,340 lines changed · alice (+2)\n"),
+            "{many}"
+        );
+
+        // CI spells the separator in ASCII.
+        let ci = render(
+            &result,
+            &report,
+            &TerminalOptions {
+                ci: true,
+                ..TerminalOptions::default()
+            },
+        );
+        assert!(ci.contains("12,340 lines changed - alice (+2)"), "{ci}");
+        assert!(ci.is_ascii(), "{ci}");
+    }
+
+    #[test]
+    fn long_author_names_are_truncated_and_stay_within_100_columns() {
+        let result = sample_scan();
+        let mut report = build(&result);
+        with_git(&mut report);
+        let name = "a-very-long-contributor-name-that-keeps-going";
+
+        // A short row has room for the whole 24-character allowance.
+        report.hotspots = vec![crate::metrics::HotspotRow {
+            path: "a.rs".into(),
+            loc: 10,
+            ccn_max: 2,
+            risk: 0.1,
+            commits: 1,
+            lines_changed: 1,
+            hotspot: 0.5,
+            top_author: name.into(),
+            authors: 1,
+        }];
+        let out = render(&result, &report, &TerminalOptions::default());
+        let line = out.lines().find(|l| l.contains("0.50")).expect("row");
+        let author = line.rsplit(" · ").next().unwrap();
+        assert_eq!(author, "a-very-long-contributor…", "{line:?}");
+        assert!(author.chars().count() <= 24, "{line:?}");
+
+        let ci = render(
+            &result,
+            &report,
+            &TerminalOptions {
+                ci: true,
+                ..TerminalOptions::default()
+            },
+        );
+        let line = ci.lines().find(|l| l.contains("0.50")).expect("row");
+        assert!(line.is_ascii(), "{line:?}");
+        let author = line.rsplit(" - ").next().unwrap();
+        assert_eq!(author, "a-very-long-contribut...", "{line:?}");
+        assert!(author.chars().count() <= 24, "{line:?}");
+
+        // A long path leaves less room: the row stays inside 100 columns.
+        let mut long = report.clone();
+        long.hotspots[0].path = "a/very/long/path/that/needs/truncation/file.rs".into();
+        long.hotspots[0].authors = 3;
+        let out = render(&result, &long, &TerminalOptions::default());
+        let line = out.lines().find(|l| l.contains("0.50")).expect("row");
+        assert!(line.contains(" (+2)"), "{line:?}");
+        assert!(line.chars().count() <= 100, "{line:?}");
     }
 
     #[test]
