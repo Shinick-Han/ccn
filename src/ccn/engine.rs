@@ -54,6 +54,9 @@ const ANONYMOUS: &str = "(anonymous)";
 /// Immediate-parent kinds that can carry an anonymous function's name.
 const NAMING_PARENTS: &[&str] = &[
     "variable_declarator",
+    "init_declarator",
+    "assignment",
+    "let_declaration",
     "pair",
     "property_definition",
     "assignment_expression",
@@ -65,8 +68,32 @@ const NAMING_PARENTS: &[&str] = &[
 /// The contract says "the parent's `name` field", but the JS/TS grammars do not
 /// give `pair` or `assignment_expression` a `name` field: object properties and
 /// assignments name their function through `key`/`left`. Trying those too keeps
-/// `{ handler: function () {} }` from degrading to `(anonymous)`.
-const NAMING_FIELDS: &[&str] = &["name", "left", "key"];
+/// `{ handler: function () {} }` from degrading to `(anonymous)`. C++
+/// `auto a = []` names the lambda through `init_declarator.declarator`, Python
+/// `n = lambda` through `assignment.left`, and Rust `let f = |..|` through
+/// `let_declaration.pattern`.
+const NAMING_FIELDS: &[&str] = &["name", "left", "key", "declarator", "pattern"];
+
+/// Function-expression kinds that are *lambdas* for identity purposes: an
+/// initializer of a named variable becomes `<enclosing>::lambda:<binding>`.
+/// Named declarations (`function f()`, `fn f()`, methods) never take this
+/// branch, so their identity stays `scope::name(params)`.
+const LAMBDA_KINDS: &[&str] = &[
+    "lambda_expression",
+    "closure_expression",
+    "lambda",
+    "arrow_function",
+];
+
+/// Leaf node kinds that can be the declared name inside a C/C++ declarator
+/// chain. Used only to cut the name out of a parameter's text.
+const DECLARED_NAME_KINDS: &[&str] = &[
+    "identifier",
+    "field_identifier",
+    "type_identifier",
+    "operator_name",
+    "destructor_name",
+];
 
 /// Preprocessor nodes whose `condition` can be decided statically.
 ///
@@ -457,7 +484,7 @@ fn function_name(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> String
 
     // C/C++: the name is the innermost `declarator`. A declarator that still
     // carries a `parameters` field is a lambda's abstract declarator, not a
-    // name, so lambdas stay `(anonymous)`.
+    // name, so lambdas stay `(anonymous)` unless a binding names them.
     if let Some(decl) = innermost_declarator(node, table.declarator_field) {
         if decl.child_by_field_name("parameters").is_none() {
             if let Some(text) = field_text(decl, source) {
@@ -466,19 +493,27 @@ fn function_name(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> String
         }
     }
 
-    if let Some(parent) = node.parent() {
-        if NAMING_PARENTS.contains(&parent.kind()) {
-            for field in NAMING_FIELDS {
-                if let Some(name) = parent.child_by_field_name(field) {
-                    if let Some(text) = field_text(name, source) {
-                        return text;
-                    }
-                }
+    bound_name(node, source).unwrap_or_else(|| ANONYMOUS.to_string())
+}
+
+/// Name supplied by the declaration that initializes this function expression:
+/// `auto a = [](..)`, `const cb = (..) =>`, `n = lambda`, `let f = |..|`.
+///
+/// This is context, not a line number, so reordering two bound lambdas does not
+/// change either identity.
+fn bound_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    let parent = node.parent()?;
+    if !NAMING_PARENTS.contains(&parent.kind()) {
+        return None;
+    }
+    for field in NAMING_FIELDS {
+        if let Some(name) = parent.child_by_field_name(field) {
+            if let Some(text) = field_text(name, source) {
+                return Some(text);
             }
         }
     }
-
-    ANONYMOUS.to_string()
+    None
 }
 
 /// Node kinds that introduce a named scope. Never contains a function node: a
@@ -516,20 +551,94 @@ fn scope_nodes(lang: Lang) -> &'static [&'static str] {
     }
 }
 
-/// Identity key for one measured function: `scope::name(params)`.
+/// Identity key for one measured function.
+///
+/// Grammar:
+///
+/// ```text
+/// named      := [scope "::"] name ["<" targs ">"] "(" ptypes ")" [" " qualifiers]
+/// lambda     := [enclosing "::"] "lambda:" binding "(" ptypes ")"
+/// anonymous  := "(anonymous)" "(" ptypes ")"
+/// ```
+///
+/// - `scope` is unchanged (`N::X::m`), and the reported `name` stays short.
+/// - `ptypes` are parameter *types*, never declaration text (see
+///   [`parameter_types`]), so renaming a parameter cannot change identity.
+/// - `qualifiers` are C++ trailing `const`/`volatile`/`&`/`&&`/`noexcept`
+///   (see [`qualifiers`]), so `f(int) const` and `f(int)` are distinct.
+/// - `targs` is C++/Rust template context (see [`template_args`]).
+/// - Lambdas bound to a named variable get `lambda:<binding>` nested under
+///   their enclosing function/lambda identity; unbound lambdas stay
+///   `(anonymous)(...)` and deliberately carry **no line number**.
 ///
 /// The scope is collected from the enclosing declarations so that overload
 /// reordering inside a class cannot look like a different function. The short
 /// `name` is deliberately left unqualified: the report still shows `m`, not
 /// `N::X::m`.
 fn function_identity(node: Node<'_>, walker: &Walker<'_>, name: &str) -> String {
-    let scope = scope_path(node, walker);
-    let params = normalized_params(node, walker.table, walker.source);
-    if scope.is_empty() {
-        format!("{name}{params}")
-    } else {
-        format!("{scope}::{name}{params}")
+    function_identity_depth(node, walker, name, 0)
+}
+
+/// [`function_identity`] with a recursion budget for nested bound lambdas.
+///
+/// Tree depth is attacker-controlled: a pathological chain of nested lambdas
+/// must return a bounded identity rather than overflow the stack. At the cap
+/// the enclosing part is dropped, which can only make an identity less
+/// specific, never panic.
+fn function_identity_depth(node: Node<'_>, walker: &Walker<'_>, name: &str, depth: u32) -> String {
+    let params = parameter_types(node, walker.table, walker.source);
+
+    if LAMBDA_KINDS.contains(&node.kind()) {
+        if name == ANONYMOUS {
+            // No stable binding: keep the compact anonymous identity. A line
+            // number would fabricate stability across reformatting.
+            return format!("{ANONYMOUS}{params}");
+        }
+        let enclosing = enclosing_identity(node, walker, depth);
+        if enclosing.is_empty() {
+            return format!("lambda:{name}{params}");
+        }
+        return format!("{enclosing}::lambda:{name}{params}");
     }
+
+    let scope = scope_path(node, walker);
+    let targs = template_args(node, walker.lang, walker.source);
+    let trailing = normalized_qualifiers(qualifiers(node, walker.source));
+    let mut out = String::new();
+    if !scope.is_empty() {
+        out.push_str(&scope);
+        out.push_str("::");
+    }
+    out.push_str(name);
+    out.push_str(&targs);
+    out.push_str(&params);
+    if !trailing.is_empty() {
+        out.push(' ');
+        out.push_str(&trailing);
+    }
+    out
+}
+
+/// Identity of the nearest enclosing function/lambda, if any.
+///
+/// This is the *context* a bound lambda is nested under. It never uses line
+/// numbers, so reordering siblings leaves both identities unchanged.
+fn enclosing_identity(node: Node<'_>, walker: &Walker<'_>, depth: u32) -> String {
+    if depth >= 16 {
+        return String::new();
+    }
+    let mut current = node.parent();
+    for _ in 0..32 {
+        let Some(parent) = current else {
+            return String::new();
+        };
+        if parent.is_named() && walker.table.function_nodes.contains(&parent.kind()) {
+            let name = function_name(parent, walker.table, walker.source);
+            return function_identity_depth(parent, walker, &name, depth + 1);
+        }
+        current = parent.parent();
+    }
+    String::new()
 }
 
 /// Outermost-first `::`-joined names of the enclosing declarations.
@@ -582,29 +691,590 @@ fn parameter_node<'tree>(node: Node<'tree>, table: &LanguageRules) -> Option<Nod
     declarator_params(node, table.declarator_field)
 }
 
-/// Normalized parameter list, parentheses included exactly once.
+/// Parameter list as normalized **types**, parentheses included once.
 ///
-/// The raw text is kept (parameter names included): stripping them would need
-/// a real declaration parser, and a name is stable enough for matching.
-fn normalized_params(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> String {
+/// Parameter names are not identity. For statically typed languages
+/// (C/C++/Java/C#/Rust/Go) each entry is derived from the declaration's type
+/// and declarator punctuation, with the declared name cut out. For
+/// dynamically typed C-like languages (Python/JS/TS-without-annotation) an
+/// untyped parameter becomes the positional marker `_`; an annotation, when
+/// present, is preferred. That choice is deliberate: a rename must not change
+/// identity, and two parameters of the same function are already ordered, so
+/// a positional marker fully preserves arity without inventing a type.
+///
+/// If an entry cannot be classified it falls back to the full normalized
+/// declaration text rather than guessing a type.
+fn parameter_types(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> String {
     let Some(params) = parameter_node(node, table) else {
         return "()".to_string();
     };
-    let Ok(raw) = params.utf8_text(source) else {
-        return "()".to_string();
+
+    // A single unparenthesized parameter is a bare `identifier` (Java
+    // `x -> ...`), `implicit_parameter` (C# `x => ...`) or a single Rust
+    // closure parameter. It is not a list.
+    if params.kind() == "identifier"
+        || params.kind() == "implicit_parameter"
+        || params.kind() == "self"
+    {
+        return format!("({})", parameter_placeholder(params, table, source));
+    }
+
+    let lang = language_of(table);
+    let mut entries: Vec<String> = Vec::new();
+    let mut cursor = params.walk();
+    // All children, not only named ones: C/C++ model `...` as an anonymous
+    // token and it must survive into the identity.
+    for child in params.children(&mut cursor) {
+        let kind = child.kind();
+        if matches!(kind, "(" | ")" | "," | "{" | "}") || kind.contains("comment") {
+            continue;
+        }
+        if kind == "..." {
+            entries.push("...".to_string());
+            continue;
+        }
+        if !child.is_named() {
+            // Other punctuation (annotations' `@`, Python's bare `*`, ...) is
+            // not a parameter entry.
+            continue;
+        }
+        entries.extend(parameter_entries(lang, child, source));
+    }
+    format!("({})", entries.join(","))
+}
+
+/// One declaration can yield several entries: Go groups names sharing a type
+/// (`y, z string` is two parameters of type `string`). Every other language
+/// yields exactly one.
+fn parameter_entries(lang: Option<Lang>, node: Node<'_>, source: &[u8]) -> Vec<String> {
+    if lang == Some(Lang::Go) {
+        return go_parameter_entries(node, source);
+    }
+    vec![parameter_entry(lang, node, source)]
+}
+
+/// The type (or placeholder) for one parameter declaration.
+fn parameter_entry(lang: Option<Lang>, node: Node<'_>, source: &[u8]) -> String {
+    match lang {
+        Some(Lang::C | Lang::Cpp) => cpp_parameter_text(node, source),
+        Some(Lang::Java) => java_parameter_text(node, source),
+        Some(Lang::CSharp) => csharp_parameter_text(node, source),
+        Some(Lang::Rust) => rust_parameter_text(node, source),
+        Some(Lang::Python) => python_parameter_text(node, source),
+        Some(Lang::JavaScript | Lang::TypeScript | Lang::Tsx) => js_parameter_text(node, source),
+        // Go is handled by `go_parameter_entries`; this arm also covers a
+        // future table without a dedicated extractor.
+        Some(Lang::Go) | None => fallback_parameter_text(node, source),
+    }
+}
+
+/// A bare, list-less parameter: untyped by construction in Java/C#/Go arrows
+/// and lambdas, so it gets the positional marker; JS/Python/Rust helpers also
+/// return the marker or an annotated form.
+fn parameter_placeholder(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> String {
+    match language_of(table) {
+        Some(Lang::Java | Lang::CSharp | Lang::Go) => "_".to_string(),
+        lang => parameter_entry(lang, node, source),
+    }
+}
+
+/// Map a rules table back to the language that owns it.
+///
+/// The JS/TS/TSX grammars share one table and one parameter model, so returning
+/// JavaScript for all three is intentional. `None` means "unknown table": the
+/// caller falls back to normalized declaration text.
+fn language_of(table: &LanguageRules) -> Option<Lang> {
+    Lang::ALL
+        .into_iter()
+        .find(|lang| std::ptr::eq(rules::rules(*lang), table))
+}
+
+/// Full normalized declaration text, used when no type can be derived.
+fn fallback_parameter_text(node: Node<'_>, source: &[u8]) -> String {
+    let Ok(raw) = node.utf8_text(source) else {
+        return String::new();
     };
+    squeeze_whitespace(&strip_comments(raw))
+}
+
+/// C/C++: declaration specifiers plus pointer/reference/array declarators, with
+/// the declared name and any default argument removed.
+///
+/// `int x` -> `int`, `const char* p` -> `const char*`, `T&& v` -> `T&&`,
+/// `int a[3]` -> `int[3]`. Structurally identical declarations therefore keep
+/// one identity across parameter renames and reformatting.
+fn cpp_parameter_text(node: Node<'_>, source: &[u8]) -> String {
+    if node.kind() == "variadic_parameter" {
+        return "...".to_string();
+    }
+    // K&R-style identifier-only parameter: the type is declared elsewhere, so
+    // there is nothing structural to keep. A positional marker stays stable
+    // across renames instead of leaking the name.
+    if node.kind() == "identifier" {
+        return "_".to_string();
+    }
+    let declarator = node.child_by_field_name("declarator");
+    let mut end = declarator.map_or(node.end_byte(), |decl| decl.end_byte());
+    // A default argument is not part of the signature.
+    if let Some(default) = node.child_by_field_name("default_value") {
+        end = end.min(default.start_byte());
+    }
+    let raw = text_between(source, node.start_byte(), end);
+    let name_span = declarator
+        .and_then(declared_name)
+        .map(|name| (name.start_byte(), name.end_byte()));
+    let without_name = match (raw, name_span) {
+        (Some(raw), Some((start, stop))) if start >= node.start_byte() && stop <= end => {
+            let a = start - node.start_byte();
+            let b = stop - node.start_byte();
+            format!("{}{}", &raw[..a], &raw[b..])
+        }
+        (Some(raw), _) => raw.to_string(),
+        (None, _) => return String::new(),
+    };
+    squeeze_whitespace(&strip_comments(&without_name))
+}
+
+/// Innermost leaf that spells the declared variable name inside a C/C++
+/// declarator chain. Bounded so a malformed tree cannot hang the scan.
+fn declared_name(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    for _ in 0..16 {
+        if DECLARED_NAME_KINDS.contains(&current.kind()) {
+            return Some(current);
+        }
+        if let Some(inner) = current.child_by_field_name("declarator") {
+            current = inner;
+            continue;
+        }
+        // `reference_declarator` spells `T&& v` as an unnamed identifier
+        // child; array/pointer declarators normally have a `declarator` field,
+        // but fall back to the first declarator-ish named child.
+        let mut cursor = current.walk();
+        let children: Vec<Node<'_>> = current.named_children(&mut cursor).collect();
+        let next = children
+            .iter()
+            .find(|child| child.kind().contains("declarator"))
+            .or_else(|| {
+                children
+                    .iter()
+                    .find(|child| DECLARED_NAME_KINDS.contains(&child.kind()))
+            })
+            .copied()?;
+        if next == current {
+            return None;
+        }
+        current = next;
+    }
+    None
+}
+
+/// Java: the `type` field (varargs keep their `...`).
+fn java_parameter_text(node: Node<'_>, source: &[u8]) -> String {
+    match node.kind() {
+        "spread_parameter" => {
+            let mut cursor = node.walk();
+            let ty = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() != "modifiers")
+                .and_then(|child| child.utf8_text(source).ok())
+                .map(|text| squeeze_whitespace(text.trim()))
+                .unwrap_or_default();
+            format!("{ty}...")
+        }
+        "receiver_parameter" => {
+            let mut cursor = node.walk();
+            let ty = node
+                .named_children(&mut cursor)
+                .find(|child| !child.kind().contains("annotation"))
+                .and_then(|child| child.utf8_text(source).ok())
+                .map(|text| squeeze_whitespace(text.trim()));
+            ty.unwrap_or_else(|| fallback_parameter_text(node, source))
+        }
+        _ => node
+            .child_by_field_name("type")
+            .and_then(|ty| ty.utf8_text(source).ok())
+            .map(|text| squeeze_whitespace(text.trim()))
+            .unwrap_or_else(|| fallback_parameter_text(node, source)),
+    }
+}
+
+/// C#: declaration text minus the variable name and any default value.
+/// Leading `ref`/`out`/`in`/`params`/`this` modifiers are preserved, and so is
+/// the array suffix of a `params` parameter.
+fn csharp_parameter_text(node: Node<'_>, source: &[u8]) -> String {
+    let mut end = node.end_byte();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "=" {
+            end = end.min(child.start_byte());
+            break;
+        }
+    }
+    let Some(raw) = text_between(source, node.start_byte(), end) else {
+        return fallback_parameter_text(node, source);
+    };
+    let without_name = match node.child_by_field_name("name") {
+        Some(name) if name.start_byte() >= node.start_byte() && name.end_byte() <= end => {
+            let a = name.start_byte() - node.start_byte();
+            let b = name.end_byte() - node.start_byte();
+            format!("{}{}", &raw[..a], &raw[b..])
+        }
+        _ => raw.to_string(),
+    };
+    squeeze_whitespace(&strip_comments(&without_name))
+}
+
+/// Rust: the `type` field of a parameter; `&self`/`&mut self` keep their
+/// receiver spelling; an untyped closure parameter is `_`.
+fn rust_parameter_text(node: Node<'_>, source: &[u8]) -> String {
+    match node.kind() {
+        "self_parameter" => fallback_parameter_text(node, source),
+        "identifier" | "mutable_specifier" => "_".to_string(),
+        _ => node
+            .child_by_field_name("type")
+            .and_then(|ty| ty.utf8_text(source).ok())
+            .map(|text| squeeze_whitespace(text.trim()))
+            .unwrap_or_else(|| "_".to_string()),
+    }
+}
+
+/// Python: annotations when present, otherwise the positional marker `_`.
+/// `def m(self, x, y=1)` -> `(_,_,_)`.
+fn python_parameter_text(node: Node<'_>, source: &[u8]) -> String {
+    match node.kind() {
+        "typed_parameter" | "typed_default_parameter" => node
+            .child_by_field_name("type")
+            .and_then(|ty| ty.utf8_text(source).ok())
+            .map(|text| squeeze_whitespace(text.trim()))
+            .unwrap_or_else(|| "_".to_string()),
+        "identifier"
+        | "default_parameter"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern"
+        | "tuple_pattern"
+        | "list_pattern" => "_".to_string(),
+        _ => "_".to_string(),
+    }
+}
+
+/// JavaScript/TypeScript: a type annotation when present, else `_`.
+/// TypeScript `required_parameter`/`optional_parameter` wrap the annotation in
+/// a `type_annotation` (`: number`), so a leading colon is stripped.
+fn js_parameter_text(node: Node<'_>, source: &[u8]) -> String {
+    if matches!(node.kind(), "required_parameter" | "optional_parameter") {
+        if let Some(ty) = node.child_by_field_name("type") {
+            if let Ok(text) = ty.utf8_text(source) {
+                let trimmed = text.trim().trim_start_matches(':').trim();
+                return squeeze_whitespace(trimmed);
+            }
+        }
+    }
+    if let Some(ty) = node.child_by_field_name("type") {
+        if let Ok(text) = ty.utf8_text(source) {
+            let trimmed = text.trim().trim_start_matches(':').trim();
+            if !trimmed.is_empty() {
+                return squeeze_whitespace(trimmed);
+            }
+        }
+    }
+    "_".to_string()
+}
+
+/// Go: one entry per declared name (they share a type); a variadic parameter
+/// keeps its `...`. A type-only declaration yields one entry.
+fn go_parameter_entries(node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let ty = node
+        .child_by_field_name("type")
+        .and_then(|ty| ty.utf8_text(source).ok())
+        .map(|text| squeeze_whitespace(text.trim()))
+        .unwrap_or_else(|| fallback_parameter_text(node, source));
+    let ty = if node.kind() == "variadic_parameter_declaration" {
+        format!("...{ty}")
+    } else {
+        ty
+    };
+
+    let mut cursor = node.walk();
+    let names = node.children_by_field_name("name", &mut cursor).count();
+    vec![ty; names.max(1)]
+}
+
+/// Trailing cv/ref/noexcept qualifiers of a C/C++ declarator.
+///
+/// The scan starts after the parameter list's closing `)` and stops at the
+/// first token that is not one of `const`, `volatile`, `&`, `&&`, `noexcept` or
+/// `noexcept(...)`. That keeps a trailing return type (`-> int`) out of the
+/// identity. The returned slice is untrimmed source text so callers can
+/// normalize it; it is empty when there is no declarator (every non-C/C++
+/// language) or nothing but a non-qualifier follows.
+///
+/// Bounded in both bytes visited and paren depth; malformed or truncated input
+/// yields `""` instead of panicking.
+fn qualifiers<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
+    let Some(declarator) = declarator_with_parameters(node) else {
+        return "";
+    };
+    let Some(params) = declarator.child_by_field_name("parameters") else {
+        return "";
+    };
+    let start = params.end_byte();
+    let end = declarator.end_byte().min(source.len());
+    if start >= end {
+        return "";
+    }
+    let Some(text) = text_between(source, start, end) else {
+        return "";
+    };
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+    let mut visited = 0usize;
+
+    while i < bytes.len() && visited < 512 {
+        visited += 1;
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+
+        let mut stop = i;
+        let accepted = match byte {
+            b'&' => {
+                stop = if bytes.get(i + 1) == Some(&b'&') {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                true
+            }
+            b'=' => false,
+            _ if byte.is_ascii_alphabetic() || byte == b'_' => {
+                while stop < bytes.len()
+                    && (bytes[stop].is_ascii_alphanumeric() || bytes[stop] == b'_')
+                {
+                    stop += 1;
+                }
+                match &text[i..stop] {
+                    "const" | "volatile" => true,
+                    "noexcept" => {
+                        // Optional `( condition )`, balanced and bounded.
+                        let mut j = stop;
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if bytes.get(j) == Some(&b'(') {
+                            let mut depth = 0usize;
+                            let mut k = j;
+                            let mut steps = 0usize;
+                            while k < bytes.len() && steps < 256 {
+                                steps += 1;
+                                match bytes[k] {
+                                    b'(' => depth += 1,
+                                    b')' => {
+                                        depth = depth.saturating_sub(1);
+                                        if depth == 0 {
+                                            k += 1;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                k += 1;
+                            }
+                            stop = k;
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !accepted {
+            break;
+        }
+        first.get_or_insert(i);
+        last = stop;
+        i = stop;
+    }
+
+    first.map_or("", |start| &text[start..last])
+}
+
+/// The declarator node that owns a parameter list, if the grammar hides both
+/// under a C/C++ declarator chain.
+fn declarator_with_parameters(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.child_by_field_name("declarator")?;
+    for _ in 0..16 {
+        if current.child_by_field_name("parameters").is_some() {
+            return Some(current);
+        }
+        current = current.child_by_field_name("declarator")?;
+    }
+    None
+}
+
+/// Normalize the raw trailing-qualifier slice into its canonical spelling.
+///
+/// `const &` and `const&` both become `const&`, while a following qualifier is
+/// space-separated: `const& noexcept`, `const&& noexcept(true)`.
+fn normalized_qualifiers(raw: &str) -> String {
     let without_comments = strip_comments(raw);
-    let inner = strip_outer_parens(without_comments.trim());
-    format!("({})", squeeze_whitespace(inner))
+    let mut out = String::new();
+    for token in without_comments.split_whitespace() {
+        if !out.is_empty() && token != "&" && token != "&&" {
+            out.push(' ');
+        }
+        out.push_str(token);
+    }
+    out
+}
+
+/// C++/Rust template context: `<T>` / `<A,B>` appended after the name.
+///
+/// C++ reads the enclosing `template_declaration` parameter lists (outermost
+/// first, so a nested member template reads `<T,U>`); Rust reads the function's
+/// own `type_parameters`. Declared template **names** are used, not their
+/// bounds and defaults, so renaming a bound or changing `typename` to `class`
+/// does not churn identity.
+///
+/// Known limit: a C++ template type parameter that the grammar cannot expose
+/// (for example inside a macro-generated declaration) is omitted rather than
+/// hashed; the resulting identity is less specific but stable.
+fn template_args(node: Node<'_>, lang: Lang, source: &[u8]) -> String {
+    let mut names: Vec<String> = Vec::new();
+    match lang {
+        Lang::Rust => {
+            if let Some(list) = node.child_by_field_name("type_parameters") {
+                collect_rust_template_names(list, source, &mut names);
+            }
+        }
+        Lang::Cpp => {
+            let mut current = node.parent();
+            for _ in 0..32 {
+                let Some(parent) = current else {
+                    break;
+                };
+                if parent.kind() == "template_declaration" {
+                    if let Some(list) = parent.child_by_field_name("parameters") {
+                        collect_cpp_template_names(list, source, &mut names);
+                    }
+                }
+                current = parent.parent();
+            }
+            // Collected innermost-first; spell the outermost template first.
+            names.reverse();
+        }
+        _ => {}
+    }
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", names.join(","))
+    }
+}
+
+fn collect_cpp_template_names(list: Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    let mut cursor = list.walk();
+    for child in list.named_children(&mut cursor) {
+        let name = match child.kind() {
+            "parameter_declaration"
+            | "optional_parameter_declaration"
+            | "variadic_parameter_declaration" => cpp_parameter_text(child, source),
+            "template_template_parameter_declaration" => child
+                .child_by_field_name("parameters")
+                .and_then(|nested| nested_template_parameter_name(nested, source))
+                .unwrap_or_default(),
+            _ => template_parameter_name(child, source).unwrap_or_default(),
+        };
+        if !name.is_empty() {
+            out.push(name);
+        }
+    }
+}
+
+/// Declared name of a C++ template type parameter.
+///
+/// `optional_type_parameter_declaration` exposes `name`; the plain and
+/// variadic forms only carry a `type_identifier` child.
+fn template_parameter_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if let Some(name) = node.child_by_field_name("name") {
+        if let Some(text) = field_text(name, source) {
+            return Some(squeeze_whitespace(&text));
+        }
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    children
+        .iter()
+        .rev()
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "type_identifier" | "identifier" | "type_descriptor"
+            )
+        })
+        .and_then(|child| child.utf8_text(source).ok())
+        .map(|text| squeeze_whitespace(text.trim()))
+}
+
+/// First nested type-parameter declaration inside a template-template
+/// parameter (`template <template <class> class C>` -> `C`).
+fn nested_template_parameter_name(list: Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = list.walk();
+    for child in list.named_children(&mut cursor) {
+        if child.kind().contains("type_parameter") {
+            return template_parameter_name(child, source);
+        }
+    }
+    None
+}
+
+fn collect_rust_template_names(list: Node<'_>, source: &[u8], out: &mut Vec<String>) {
+    let mut cursor = list.walk();
+    for child in list.named_children(&mut cursor) {
+        if let Some(name) = child.child_by_field_name("name") {
+            if let Some(text) = field_text(name, source) {
+                out.push(squeeze_whitespace(&text));
+            }
+        }
+    }
+}
+
+/// Slice `source[start..end]` as `&str`, or `None` on any out-of-range or
+/// non-UTF-8 boundary. Never panics.
+fn text_between(source: &[u8], start: usize, end: usize) -> Option<&str> {
+    if start >= end || end > source.len() {
+        return None;
+    }
+    std::str::from_utf8(source.get(start..end)?).ok()
 }
 
 /// Punctuation that never needs surrounding spaces in an identity.
-const IDENTITY_PUNCT: &[char] = &[',', '(', ')', '*', '&', '<', '>'];
+const IDENTITY_PUNCT: &[char] = &[',', '(', ')', '[', ']', '*', '&', '<', '>'];
 
 /// Collapse whitespace runs and drop spaces adjacent to [`IDENTITY_PUNCT`].
 ///
-/// `f( int  x , const char * p )` and `f(int x, const char*p)` become the same
-/// string, which is what makes identity survive reformatting.
+/// `const char * p` and `const char*p` become the same string, and so do
+/// `int a[3]` and `int a [ 3 ]`, which is what makes identity survive
+/// reformatting.
 fn squeeze_whitespace(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pending_space = false;
@@ -991,13 +1661,10 @@ mod tests {
         assert_eq!(file.functions.len(), 2);
         let main = function_named(&file, "main");
         assert_eq!(main.ccn, 1, "the closure's `if` belongs to the closure");
-        let closure = file
-            .functions
-            .iter()
-            .find(|f| f.name == "(anonymous)")
-            .expect("closure is anonymous");
+        let closure = function_named(&file, "f");
         assert_eq!(closure.ccn, 2);
         assert_eq!(closure.line, 2);
+        assert_eq!(closure.identity, "main()::lambda:f(i32)");
     }
 
     #[test]
@@ -1319,14 +1986,11 @@ mod tests {
             2,
             "only the outer `if` counts; the lambda's `if` must not inflate it"
         );
-        let lambda = file
-            .functions
-            .iter()
-            .find(|f| f.name == "(anonymous)")
-            .expect("lambda is anonymous");
+        let lambda = function_named(&file, "g");
         assert_eq!(lambda.ccn, 2);
         assert_eq!(lambda.params, 1);
         assert_eq!(lambda.line, 1);
+        assert_eq!(lambda.identity, "f()::lambda:g(int)");
     }
 
     // -- C# ---------------------------------------------------------------
@@ -1901,16 +2565,32 @@ mod tests {
 
     // -- Identities -------------------------------------------------------
 
+    /// Sorted identity list, so a source reorder can be compared without
+    /// depending on line order.
+    fn sorted_identities(file: &FileCcn) -> Vec<&str> {
+        let mut ids: Vec<&str> = file.functions.iter().map(|f| f.identity.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     #[test]
-    fn cpp_overloads_have_distinct_identities() {
+    fn cpp_const_and_plain_overloads_have_distinct_identities() {
+        // Definitions, not declarations: only a definition is measured. The
+        // identity rule is what a declaration would use once defined.
         let file = analyze(
-            "int f(int x) { return x; }\nint f(double x) { return 0; }\n",
+            "struct X { int f(int x) const { return x; } int f(int y) { return y; } };",
             Lang::Cpp,
         );
         assert_eq!(file.functions.len(), 2);
-        let identities: Vec<&str> = file.functions.iter().map(|f| f.identity.as_str()).collect();
-        assert_eq!(identities, vec!["f(int x)", "f(double x)"]);
-        assert_ne!(identities[0], identities[1]);
+        assert_eq!(
+            sorted_identities(&file),
+            vec!["X::f(int)", "X::f(int) const"],
+            "cv qualifier is identity"
+        );
+        assert_ne!(
+            file.functions[0].identity, file.functions[1].identity,
+            "the const and non-const overloads must not collide"
+        );
         assert_eq!(
             file.functions
                 .iter()
@@ -1922,6 +2602,245 @@ mod tests {
     }
 
     #[test]
+    fn reordering_const_and_plain_overloads_changes_no_identity() {
+        let plain_first = analyze(
+            "struct X { int f(int y) { return y; } int f(int x) const { return x; } };",
+            Lang::Cpp,
+        );
+        let const_first = analyze(
+            "struct X { int f(int x) const { return x; } int f(int y) { return y; } };",
+            Lang::Cpp,
+        );
+        assert_eq!(
+            sorted_identities(&plain_first),
+            sorted_identities(&const_first)
+        );
+        assert_eq!(
+            sorted_identities(&const_first),
+            vec!["X::f(int)", "X::f(int) const"]
+        );
+    }
+
+    #[test]
+    fn renaming_a_parameter_changes_no_identity() {
+        let before = analyze(
+            "int f(int x) { return x; }\nint f(double x) { return 0; }\n",
+            Lang::Cpp,
+        );
+        let renamed = analyze(
+            "int f(int y) { return y; }\nint f(double y) { return 0; }\n",
+            Lang::Cpp,
+        );
+        assert_eq!(sorted_identities(&before), sorted_identities(&renamed));
+        assert_eq!(sorted_identities(&renamed), vec!["f(double)", "f(int)"]);
+    }
+
+    #[test]
+    fn cpp_pointer_and_rvalue_reference_parameters_keep_their_types() {
+        let f = only("int f(const char* p, T&& v) { return 0; }", Lang::Cpp);
+        assert_eq!(f.identity, "f(const char*,T&&)");
+    }
+
+    #[test]
+    fn cpp_parameter_names_are_never_part_of_the_identity() {
+        // `int (*cb)(int)` demonstrates that pointer/array declarators keep
+        // their shape while only the declared name disappears.
+        let f = only(
+            "int f(int x, const char * p, int a[3], int (*cb)(int)) { return 0; }",
+            Lang::Cpp,
+        );
+        assert_eq!(f.identity, "f(int,const char*,int[3],int(*)(int))");
+    }
+
+    #[test]
+    fn cpp_trailing_noexcept_and_ref_qualifiers_are_identity() {
+        let file = analyze(
+            "struct X { \
+             void a() const & { } \
+             void b() && noexcept { } \
+             void c() const noexcept(true) { } \
+             };",
+            Lang::Cpp,
+        );
+        assert_eq!(
+            sorted_identities(&file),
+            vec![
+                "X::a() const&",
+                "X::b() && noexcept",
+                "X::c() const noexcept(true)"
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_lambdas_take_the_variable_name_not_a_line_number() {
+        // File-scope lambdas: no enclosing function, so the identity is the
+        // binding context alone. (The grammar parses `auto x = [] ...` as a
+        // declaration even though C++ requires function scope.)
+        let file = analyze(
+            "auto a = [](int x){ return x; };\nauto b = [](int x){ return x; };\n",
+            Lang::Cpp,
+        );
+        assert_eq!(file.functions.len(), 2);
+        assert_eq!(
+            file.functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            sorted_identities(&file),
+            vec!["lambda:a(int)", "lambda:b(int)"]
+        );
+
+        // Swapping the two declarations swaps the reported lines but not the
+        // identities attached to the bindings.
+        let swapped = analyze(
+            "auto b = [](int x){ return x; };\nauto a = [](int x){ return x; };\n",
+            Lang::Cpp,
+        );
+        assert_eq!(sorted_identities(&file), sorted_identities(&swapped));
+        assert_eq!(
+            sorted_identities(&swapped),
+            vec!["lambda:a(int)", "lambda:b(int)"]
+        );
+    }
+
+    #[test]
+    fn unbound_lambdas_stay_anonymous_without_a_line_number() {
+        let file = analyze("void f() { g([](int x){ return x; }); }", Lang::Cpp);
+        let lambda = file
+            .functions
+            .iter()
+            .find(|f| f.name == "(anonymous)")
+            .expect("unbound lambda stays anonymous");
+        assert_eq!(lambda.identity, "(anonymous)(int)");
+        assert!(!lambda.identity.contains(&format!(":{}", lambda.line)));
+    }
+
+    #[test]
+    fn nested_bound_lambdas_include_the_enclosing_identity() {
+        let file = analyze(
+            "void f() { auto outer = [](int x){ auto inner = [](double y){ return y; }; return x; }; }",
+            Lang::Cpp,
+        );
+        let outer = function_named(&file, "outer");
+        let inner = function_named(&file, "inner");
+        assert_eq!(outer.identity, "f()::lambda:outer(int)");
+        assert_eq!(
+            inner.identity,
+            "f()::lambda:outer(int)::lambda:inner(double)"
+        );
+    }
+
+    #[test]
+    fn cpp_template_context_is_part_of_the_identity() {
+        let f = only("template <typename T> T f(T x) { return x; }", Lang::Cpp);
+        assert_eq!(f.identity, "f<T>(T)");
+
+        // A method inside a class template carries the class template
+        // parameters; the nested member template adds its own, outermost
+        // first.
+        let file = analyze(
+            "template <class T> struct S { template <class U> void m(U u, T t) { } };",
+            Lang::Cpp,
+        );
+        assert_eq!(function_named(&file, "m").identity, "S::m<T,U>(U,T)");
+    }
+
+    #[test]
+    fn rust_generic_context_and_references_are_identity() {
+        let file = analyze(
+            "fn g<A: Clone, B>(a: A, b: &B) -> B { b.clone() }",
+            Lang::Rust,
+        );
+        assert_eq!(function_named(&file, "g").identity, "g<A,B>(A,&B)");
+    }
+
+    #[test]
+    fn rust_receiver_is_preserved_but_parameter_names_are_not() {
+        let file = analyze(
+            "struct Type;\nimpl Type {\n    fn m(&self, x: i32) { let _ = x; }\n}\n",
+            Lang::Rust,
+        );
+        let f = function_named(&file, "m");
+        assert_eq!(f.name, "m");
+        assert_eq!(f.identity, "Type::m(&self,i32)");
+    }
+
+    #[test]
+    fn java_identity_uses_types_and_preserves_varargs() {
+        let f = only("class A { void m(int x, String s) { } }", Lang::Java);
+        assert_eq!(f.name, "m");
+        assert_eq!(f.identity, "A::m(int,String)");
+
+        let varargs = only("class A { void m(int x, String... s) { } }", Lang::Java);
+        assert_eq!(varargs.identity, "A::m(int,String...)");
+    }
+
+    #[test]
+    fn python_untyped_parameters_are_positional_markers() {
+        let f = only(
+            "class A:\n    def m(self, x, y=1):\n        return x\n",
+            Lang::Python,
+        );
+        assert_eq!(f.name, "m");
+        assert_eq!(f.identity, "A::m(_,_,_)");
+
+        // An annotation is preferred when it exists.
+        let typed = only(
+            "class A:\n    def m(self, x: int, y: str):\n        return x\n",
+            Lang::Python,
+        );
+        assert_eq!(typed.identity, "A::m(_,int,str)");
+    }
+
+    #[test]
+    fn js_and_ts_lambdas_use_bindings_and_annotations() {
+        let untyped = only("const f = (x, y) => x;", Lang::JavaScript);
+        assert_eq!(untyped.identity, "lambda:f(_,_)");
+
+        let typed = only("function f(x: number, y?: string) {}", Lang::TypeScript);
+        assert_eq!(typed.identity, "f(number,string)");
+    }
+
+    #[test]
+    fn go_grouped_names_are_one_parameter_each_and_variadics_are_kept() {
+        let f = only(
+            "package p\n\nfunc f(x int, y, z string, rest ...int) {}\n",
+            Lang::Go,
+        );
+        assert_eq!(f.identity, "f(int,string,string,...int)");
+    }
+
+    #[test]
+    fn a_true_body_change_leaves_the_identity_alone() {
+        let before = only("int f(int x) { return x; }", Lang::C);
+        let after = only(
+            "int f(int x) { if (x) { x++; } if (x > 2) { x++; } return x; }",
+            Lang::C,
+        );
+        assert_eq!(before.identity, after.identity);
+        assert_ne!(before.ccn, after.ccn, "only complexity changed");
+    }
+
+    #[test]
+    fn malformed_cpp_identity_extraction_does_not_panic() {
+        // Truncated parameter list: tree-sitter may recover the function or
+        // report an error. Either outcome is acceptable; a panic is not.
+        match analyze_file(Path::new("broken.cpp"), b"int f(int x) { if (", Lang::Cpp) {
+            Ok(file) => {
+                for function in &file.functions {
+                    // Must have produced a string, and no panic occurred.
+                    assert!(!function.name.is_empty());
+                }
+            }
+            Err(err) => assert!(matches!(err, CcnError::ParseFailed { .. })),
+        }
+    }
+
+    #[test]
     fn cpp_identity_qualifies_namespace_and_class_but_the_name_does_not() {
         let file = analyze(
             "namespace N { class X { int m(int v) { return v; } }; }",
@@ -1930,26 +2849,8 @@ mod tests {
         assert_eq!(file.functions.len(), 1);
         let f = &file.functions[0];
         assert_eq!(f.name, "m");
-        assert_eq!(f.identity, "N::X::m(int v)");
+        assert_eq!(f.identity, "N::X::m(int)");
         assert!(f.identity.starts_with("N::X::"));
-    }
-
-    #[test]
-    fn java_identity_includes_the_class() {
-        let f = only("class A { int f(int x) { return x; } }", Lang::Java);
-        assert_eq!(f.name, "f");
-        assert_eq!(f.identity, "A::f(int x)");
-    }
-
-    #[test]
-    fn rust_impl_identity_includes_the_type() {
-        let file = analyze(
-            "struct Widget;\nimpl Widget {\n    fn draw(&self, x: i32) { let _ = x; }\n}\n",
-            Lang::Rust,
-        );
-        let f = function_named(&file, "draw");
-        assert_eq!(f.name, "draw");
-        assert_eq!(f.identity, "Widget::draw(&self,x: i32)");
     }
 
     #[test]
@@ -1965,6 +2866,7 @@ mod tests {
             file.functions[0].identity, file.functions[1].identity,
             "identical signatures collide on purpose"
         );
+        assert_eq!(file.functions[0].identity, "(anonymous)(_)");
         assert_ne!(
             file.functions[0].line, file.functions[1].line,
             "matching resolves the collision by source order"
@@ -1973,9 +2875,12 @@ mod tests {
 
     #[test]
     fn parameter_whitespace_and_comments_are_normalized_away() {
-        let a = only("int f( int  x , const char * p ) { return 0; }", Lang::Cpp);
-        let b = only("int f(int x, const char* p) { return 0; }", Lang::Cpp);
+        let a = only(
+            "int f( int  x , const char * p /* keep me */ ) { return 0; }",
+            Lang::Cpp,
+        );
+        let b = only("int f(int y, const char*p) { return 0; }", Lang::Cpp);
         assert_eq!(a.identity, b.identity);
-        assert_eq!(a.identity, "f(int x,const char*p)");
+        assert_eq!(a.identity, "f(int,const char*)");
     }
 }

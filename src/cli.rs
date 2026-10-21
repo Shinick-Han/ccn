@@ -98,8 +98,33 @@ pub struct Cli {
     pub sarif_min_ccn: u32,
 
     /// Exit with code 1 when `--baseline` finds added or worsened functions.
+    ///
+    /// The gate exits 2 instead when the comparison is incomplete: a changed
+    /// file that could not be parsed on either side, a read or view failure,
+    /// ambiguous matching, or (unless `--allow-best-effort` is set) a finding
+    /// from a best-effort parse.
     #[arg(long, requires = "baseline")]
     pub fail_on_new: bool,
+
+    /// Let best-effort findings count as findings instead of making the gate
+    /// incomplete.
+    ///
+    /// By default a `--fail-on-new` finding measured from a file with syntax
+    /// errors makes the comparison incomplete (exit 2): the number is advisory
+    /// and must not be read as an exact gate result. With this flag the same
+    /// finding behaves like an exact one (exit 1) and stays labelled advisory
+    /// in the report.
+    #[arg(long, requires = "baseline")]
+    pub allow_best_effort: bool,
+
+    /// Write a versioned JSON manifest of every accounted file.
+    ///
+    /// The manifest lists the baseline revision, threshold, completeness and
+    /// one row per expected or changed file with its outcome and reason. It is
+    /// written after the baseline comparison, so a path that cannot be created
+    /// is an operational error (exit 2).
+    #[arg(long, value_name = "PATH", requires = "baseline")]
+    pub manifest: Option<PathBuf>,
 
     /// How many commits/changelists the history pass considers.
     ///
@@ -242,6 +267,28 @@ mod tests {
     fn fail_over_parses_a_fractional_percentage() {
         let cli = Cli::parse_from(["ccn", "--fail-over", "2.5"]);
         assert_eq!(cli.fail_over, Some(2.5));
+    }
+
+    #[test]
+    fn allow_best_effort_and_manifest_need_a_baseline() {
+        assert!(Cli::try_parse_from(["ccn", "--allow-best-effort"]).is_err());
+        assert!(Cli::try_parse_from(["ccn", "--manifest", "m.json"]).is_err());
+
+        let cli = Cli::parse_from([
+            "ccn",
+            "--baseline",
+            "HEAD",
+            "--fail-on-new",
+            "--allow-best-effort",
+            "--manifest",
+            "m.json",
+        ]);
+        assert!(cli.allow_best_effort);
+        assert_eq!(
+            cli.manifest.as_deref(),
+            Some(std::path::Path::new("m.json"))
+        );
+        assert!(cli.fail_on_new);
     }
 
     #[test]

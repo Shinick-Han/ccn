@@ -49,6 +49,7 @@ fn main() {
     }
 
     // Baseline needs the VCS to hand back the old file contents.
+    let mut manifest_files = Vec::new();
     if let Some(rev) = &cli.baseline {
         match ccn::vcs::detect(Path::new(&result.root)) {
             Some(backend) => {
@@ -57,11 +58,34 @@ fn main() {
                     eprintln!("ccn: cannot resolve baseline revision {rev}");
                     std::process::exit(2);
                 }
-                report.baseline = Some(ccn::baseline::collect(&result, backend, rev, 10));
+                let (baseline, files) =
+                    ccn::baseline::collect_with_manifest(&result, backend, rev, 10);
+                report.baseline = Some(baseline);
+                manifest_files = files;
             }
             None => {
                 eprintln!("ccn: --baseline needs a git or Perforce workspace");
                 std::process::exit(2);
+            }
+        }
+    }
+
+    // The manifest is a separate, versioned document. A file that cannot be
+    // written is an operational error, exactly like a SARIF write failure: the
+    // caller asked for evidence and must not get a pass without it.
+    if let Some(target) = &cli.manifest {
+        if let Some(baseline) = &report.baseline {
+            let manifest = ccn::baseline::Manifest::new(baseline, manifest_files.clone());
+            match manifest
+                .to_json()
+                .map_err(|e| e.to_string())
+                .and_then(|json| std::fs::write(target, json).map_err(|e| e.to_string()))
+            {
+                Ok(()) => eprintln!("ccn: wrote manifest to {}", target.display()),
+                Err(e) => {
+                    eprintln!("ccn: could not write manifest to {}: {e}", target.display());
+                    operational_error = true;
+                }
             }
         }
     }
@@ -160,16 +184,33 @@ fn main() {
 
     let mut gate_failed = false;
 
-    // PR gate: any function that became complex in this change.
+    // PR gate: any function that became complex in this change. An incomplete
+    // comparison is not a pass: "changes=[]" must never be reported as success
+    // when some changed file was never measured.
     if cli.fail_on_new {
         if let Some(baseline) = &report.baseline {
-            // An unreadable file means the gate outcome is unknown, and unknown
-            // is not a pass: the caller must treat this as an operational error.
-            if baseline.files_unavailable > 0 {
+            let mut incomplete = baseline.incomplete_reasons();
+            if !cli.allow_best_effort {
+                let best_effort = baseline
+                    .changes
+                    .iter()
+                    .filter(|change| change.tier == ccn::ccn::types::CcnTier::BestEffort)
+                    .count();
+                if best_effort > 0 {
+                    incomplete.push(format!(
+                        "{best_effort} finding(s) come from best-effort parses (syntax errors); \
+                         pass --allow-best-effort to gate on them"
+                    ));
+                }
+            }
+            if !incomplete.is_empty() {
                 eprintln!(
-                    "ccn: {} file(s) could not be read at {}; the baseline gate is incomplete",
-                    baseline.files_unavailable, baseline.rev
+                    "ccn: the baseline gate against {} is incomplete:",
+                    baseline.rev
                 );
+                for reason in &incomplete {
+                    eprintln!("  - {reason}");
+                }
                 operational_error = true;
             }
             if ccn::baseline::has_changes(baseline) {

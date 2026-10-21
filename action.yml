@@ -47,7 +47,7 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Install ccn (prebuilt, else from source)
+    - name: Install ccn (verified prebuilt, else source for latest)
       shell: bash
       env:
         GITHUB_TOKEN: ${{ github.token }}
@@ -63,19 +63,23 @@ runs:
         arch="$(uname -m)"
 
         # Map the runner to the raw asset published by .github/workflows/release.yml.
-        # macOS job builds on the current macos-latest arch, hence one x64-named asset.
+        # Intel and Apple-silicon macOS are separate assets: a binary built for
+        # the other architecture cannot run, so the arch is part of the contract.
         case "$os" in
           Linux)
             if [[ "$arch" == "x86_64" ]]; then
               asset="ccn-linux-x64"
-              bin_name="ccn"
             else
               asset=""
-              bin_name="ccn"
             fi
+            bin_name="ccn"
             ;;
           Darwin)
-            asset="ccn-macos-x64"
+            case "$arch" in
+              x86_64) asset="ccn-macos-x64" ;;
+              arm64) asset="ccn-macos-arm64" ;;
+              *) asset="" ;;
+            esac
             bin_name="ccn"
             ;;
           MINGW*|MSYS*|CYGWIN*)
@@ -96,6 +100,10 @@ runs:
           echo "::error::invalid version input '$version' (expected a release tag such as v0.7.5)"
           exit 1
         fi
+        pinned=false
+        if [[ "$version" != "latest" ]]; then
+          pinned=true
+        fi
 
         if [[ "$version" == "latest" ]]; then
           url_base="https://github.com/Shinick-Han/ccn/releases/latest/download"
@@ -103,37 +111,103 @@ runs:
           url_base="https://github.com/Shinick-Han/ccn/releases/download/$version"
         fi
         tmp="$RUNNER_TEMP/ccn-bin"
+        sums="$RUNNER_TEMP/ccn-SHA256SUMS"
+        rm -f "$tmp" "$sums"
         path_taken="source"
 
-        # $1 is "auth" or "anon".
+        # $1 is "auth" or "anon"; $2 is the URL; $3 is the destination.
         download() {
-          local -a args=(-fsSL --retry 3 -o "$tmp")
-          if [[ "$1" == "auth" ]]; then
+          local mode="$1" url="$2" out="$3"
+          local -a args=(-fsSL --retry 3 -o "$out")
+          if [[ "$mode" == "auth" ]]; then
             args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
           fi
-          curl "${args[@]}" "$url_base/$asset" && [[ -s "$tmp" ]]
+          curl "${args[@]}" "$url"
+        }
+
+        sha256_of() {
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$1" | awk '{print $1}'
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$1" | awk '{print $1}'
+          elif [[ "$os" == MINGW* || "$os" == MSYS* || "$os" == CYGWIN* ]] \
+            && command -v powershell >/dev/null 2>&1; then
+            CCN_HASH_FILE="$1" powershell -NoProfile -Command \
+              '(Get-FileHash -Algorithm SHA256 -LiteralPath $env:CCN_HASH_FILE).Hash.ToLowerInvariant()' \
+              | tr -d '\r'
+          else
+            certutil -hashfile "$1" SHA256 | sed -n '2p' | tr -d ' \r'
+          fi
         }
 
         if [[ -n "$asset" ]]; then
           # Private repos need a token that can read Shinick-Han/ccn; a public
           # asset still downloads anonymously, so try that before giving up.
-          if [[ -n "${GITHUB_TOKEN:-}" ]] && download auth; then
+          if [[ -n "${GITHUB_TOKEN:-}" ]] && download auth "$url_base/$asset" "$tmp"; then
             path_taken="prebuilt"
-          elif download anon; then
+          elif download anon "$url_base/$asset" "$tmp"; then
             path_taken="prebuilt"
           fi
         fi
 
-        if [[ "$path_taken" == "prebuilt" ]]; then
+        if [[ "$path_taken" != "prebuilt" ]]; then
+          # A pinned request must never be served by the action's own checkout:
+          # the checkout can be a different version, which silently changes what
+          # the consumer is running. Only `latest` may fall back to source.
+          if [[ "$pinned" == true ]]; then
+            echo "::error::ccn $version has no downloadable prebuilt asset for $os/$arch${asset:+ ($asset)}; refusing to substitute a source build from the action checkout"
+            exit 1
+          fi
+          echo "::warning::prebuilt ccn was not available for $os/$arch; requested version was 'latest', building the action checkout from source"
+          (cd "$action_path" && cargo build --release --locked)
+          echo "ccn binary: source ($dest_dir/$bin_name)"
+        else
+          # Integrity and identity checks before the binary is ever executed.
+          have_sums=false
+          if [[ -n "${GITHUB_TOKEN:-}" ]] && download auth "$url_base/SHA256SUMS" "$sums"; then
+            have_sums=true
+          elif download anon "$url_base/SHA256SUMS" "$sums"; then
+            have_sums=true
+          fi
+
+          if [[ "$have_sums" == true ]]; then
+            expected="$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$sums")"
+            if [[ -z "$expected" ]]; then
+              echo "::error::SHA256SUMS for $version does not list $asset"
+              exit 1
+            fi
+            actual="$(sha256_of "$tmp")"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::SHA256 mismatch for $asset: expected $expected, got $actual"
+              exit 1
+            fi
+            echo "verified SHA256 $actual for $asset"
+          elif [[ "$pinned" == true ]]; then
+            echo "::error::ccn $version has no SHA256SUMS asset; refusing an unverified pinned binary"
+            exit 1
+          else
+            echo "::warning::SHA256SUMS not available for the latest release; continuing without a digest check"
+          fi
+
           cp "$tmp" "$dest_dir/$bin_name"
           if [[ "$os" != MINGW* && "$os" != MSYS* && "$os" != CYGWIN* ]]; then
             chmod +x "$dest_dir/$bin_name"
           fi
           echo "ccn binary: prebuilt ($asset from $version)"
-        else
-          echo "::warning::prebuilt ccn $version download unavailable; building from source"
-          (cd "$action_path" && cargo build --release --locked)
-          echo "ccn binary: source ($action_path/target/release/$bin_name)"
+        fi
+
+        # The binary must identify itself as the requested release. For
+        # `latest` the reported version is accepted and logged.
+        reported="$("$dest_dir/$bin_name" --version | head -n 1)"
+        echo "ccn reports: $reported"
+        reported_tag="${reported##* }"
+        reported_tag="${reported_tag#v}"
+        if [[ "$pinned" == true ]]; then
+          wanted="${version#v}"
+          if [[ "$reported_tag" != "$wanted" ]]; then
+            echo "::error::$dest_dir/$bin_name reports '$reported' but $version was requested"
+            exit 1
+          fi
         fi
 
         echo "CCN_BIN=$dest_dir/$bin_name" >> "$GITHUB_ENV"

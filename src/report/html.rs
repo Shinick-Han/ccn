@@ -394,16 +394,18 @@ fn baseline_section(baseline: &crate::baseline::Baseline) -> String {
         escape_html(&baseline.rev)
     );
     let mut sub = format!(
-        "<p class=\"sub\">{} added above CCN {} · {} worsened · {} files compared, {} skipped",
-        added, baseline.threshold, worsened, baseline.files_compared, baseline.files_skipped
+        "<p class=\"sub\">{} added above CCN {} · {} worsened · {}",
+        added,
+        baseline.threshold,
+        worsened,
+        baseline.counts_line()
     );
-    if baseline.files_unavailable > 0 {
-        let _ = write!(sub, ", {} unavailable", baseline.files_unavailable);
+    sub.push('.');
+    if !baseline.complete {
+        let reasons = baseline.incomplete_reasons();
+        let _ = write!(sub, " Incomplete: {}.", escape_html(&reasons.join("; ")));
     }
-    if baseline.files_unmapped > 0 {
-        let _ = write!(sub, ", {} unmapped", baseline.files_unmapped);
-    }
-    sub.push_str(".</p>\n");
+    sub.push_str("</p>\n");
     s.push_str(&sub);
     if baseline
         .changes

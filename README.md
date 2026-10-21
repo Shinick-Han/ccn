@@ -18,8 +18,9 @@ $ curl -LO https://github.com/Shinick-Han/ccn/releases/latest/download/ccn-linux
 ```
 
 npm packages: `@shinick/ccn` plus `@shinick/ccn-linux-x64`,
-`@shinick/ccn-darwin-arm64`, `@shinick/ccn-win32-x64`. Intel Macs and ARM
-Linux/Windows have no prebuilt package; build from source.
+`@shinick/ccn-darwin-x64`, `@shinick/ccn-darwin-arm64`,
+`@shinick/ccn-win32-x64`. ARM Linux/Windows has no prebuilt package; build from
+source.
 
 ```console
 $ ccn .                       # terminal summary + ccn-report.html
@@ -75,13 +76,21 @@ the methodology research behind the metric choices.
 
 ```
 p(c)  = clamp(log10(max(c,1)/10), 0, 1)          # 0 at the McCabe limit of 10
-debt  = Σ nloc(f)·p(ccn(f)) / Σ nloc(f)          # over measured functions
+debt  = Σ nloc(f)·p(ccn(f)) / Σ nloc(f)          # over exactly parsed functions
 score = 100 · (1 − debt)
 ```
 
-Read it as **"the share of lines living above the McCabe limit, log-scaled"**.
-It is deliberately not monotone in repository size, and one 900-CCN generated
-file cannot decide the grade.
+`nloc(f)` is the function's **physical span**, blanks and comments included, so
+layout inside a function moves the score as well as its decision points. Read
+the result as an **advisory, size-weighted complexity index**: it is not a
+validated code-health score, it does not predict defects or runtime, and it is
+not a release gate. Files parsed best-effort (syntax errors recovered) and
+heuristic files are excluded from the denominator; the report exposes how many
+functions were left out so the coverage is visible.
+
+The index is deliberately not monotone in repository size, and generated or
+vendored files are dropped before scoring. It is still a repository-level
+summary, not a per-file verdict.
 
 | Grade | Debt | Score |
 |---|---|---:|
@@ -93,7 +102,9 @@ file cannot decide the grade.
 
 Bands were calibrated on 11 real repositories on 2026-10-21; the corpus, the
 spread, and the limitations are in [`docs/calibration.md`](docs/calibration.md).
-Re-run `pwsh -File tools/calibrate.ps1` before changing them.
+That calibration predates the best-effort exclusion, so grades are marked
+**experimental** in the report until the corpus is re-measured. Re-run
+`pwsh -File tools/calibrate.ps1` before changing the bands.
 
 **The score and `%func > 10` answer different questions.** A repo can have 27%
 of its functions above CCN 10 and still score 90 if those functions are small.
@@ -178,14 +189,28 @@ Since origin/main  1 new >10 · 0 worsened   (66 files compared, 0 skipped)
 - **worsened**: it got worse — including functions that were **already over
   10**. A function is reported when CCN, nesting depth or length grows
   (`ccn +3`, `nesting +1`, `nloc +21`); identical or improved functions are
-  silent. So `30 → 33` is reported, not just the 9 → 11 crossing.
-- matching is by function name, consuming duplicates in source order.
+  silent. So `30 → 33` is reported, not just the 9 → 11 crossing. The finding's
+  message names only what changed: a length-only regression says "length
+  increased ... lines", not "complexity increased".
+- matching is **identity-first**: the engine's scope-qualified name plus
+  normalized parameters (`Widget::draw(int)`), so overload order does not look
+  like a change; a name-only match is used only when exactly one unmatched
+  baseline function carries that name.
 - a file that did not exist at the revision counts as an empty baseline, so its
   complex functions are reported as added. The revision itself is validated
   first, so a typo cannot turn the whole repository into "new".
 - **renames are followed** (`git diff -M`): a moved file is compared against its
   old path, so moving code does not look like a hundred new functions.
-- P4: `--baseline 123456` uses `p4 print @=123456` for the old contents.
+- P4: `--baseline 123456` reads each depot file's as-of tree revision
+  (`<depot-path>@123456`, the revision in effect at that changelist), never
+  `@=123456`.
+- the baseline summary distinguishes files **compared**, **skipped** (baseline
+  copy read but unparseable), **unavailable** (read/permission/revision error)
+  and **unmapped** (the VCS view has no history for that path; not an error).
+  The JSON exposes `files_unmapped` for the last case and `files_unknown` when a
+  relevant path could not be resolved to a comparison. Skipped, unavailable and
+  unknown comparisons mean the baseline is incomplete, so the gate does not
+  silently pass on unmeasured files.
 
 ## GitHub Actions
 
@@ -211,10 +236,14 @@ steps:
     with: { sarif_file: ccn.sarif }
 ```
 
-- the action first tries the prebuilt asset from this repository's latest
-  release (`ccn-linux-x64`, `ccn-macos-x64`, `ccn-windows-x64.exe`) and falls
-  back to `cargo build --release --locked`. Private repositories cannot be
-  downloaded anonymously, so they take the source path.
+- the action first tries the prebuilt asset for the runner (`ccn-linux-x64`,
+  `ccn-macos-x64` on Intel macOS, `ccn-macos-arm64` on Apple silicon,
+  `ccn-windows-x64.exe`) and verifies its `SHA256SUMS` digest and `--version`
+  before use. With `version: latest` a failed download falls back to
+  `cargo build --release --locked`; with a pinned tag an unavailable,
+  unverifiable or mismatched asset fails the step instead of silently running
+  the action checkout. Private repositories cannot be downloaded anonymously,
+  so they take the source path (which therefore requires `version: latest`).
 - it always passes `--no-report`.
 - `fail-on-new: "true"` makes the step fail when the PR adds or worsens a
   function above CCN 10. SARIF still uploads because of `if: always()`.
@@ -262,6 +291,11 @@ the conservative direction.
 Measured on a 1.7M-line repo: **3.7 s before caching → ~1.2 s with an empty
 cache and ~0.3-0.8 s warm**. Cache load itself is single-digit milliseconds on
 a small repo; the variance is Windows Defender scanning the cache file.
+
+The default lookup trusts mtime+size. On a gate or an NFS checkout — where mtime
+can be restored, coarse, or rewritten by a copy — pass `--verify-cache` to hash
+the file contents before reusing an entry. It costs more per file but cannot
+serve a stale measurement as the candidate's.
 
 ## Design decisions that are not obvious
 

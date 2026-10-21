@@ -12,6 +12,9 @@
 //! document. Paths are scan-root-relative with `/` separators; no absolute
 //! path is ever written, so a report stays valid when copied to another machine.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use serde_json::{json, Value};
 
 use crate::baseline::{Change, Kind};
@@ -95,6 +98,11 @@ fn full_findings(result: &ScanResult, min_ccn: u32) -> Vec<(String, usize, &'sta
         }
 
         let path = relative_uri(&file.path, &result.root);
+        let confidence = summary.tier.as_str();
+        // A degraded parse is measured but not trustworthy; say so here exactly
+        // as delta findings do, so a SARIF consumer cannot tell the two modes
+        // apart.
+        let suffix = best_effort_suffix(summary.tier);
         for function in &summary.detail {
             if function.ccn < min_ccn {
                 continue;
@@ -108,11 +116,18 @@ fn full_findings(result: &ScanResult, min_ccn: u32) -> Vec<(String, usize, &'sta
                     "level": full_level(function.ccn),
                     "message": {
                         "text": format!(
-                            "Function {} has cyclomatic complexity {} (limit {}).",
+                            "Function {} has cyclomatic complexity {} (limit {}).{suffix}",
                             function.name, function.ccn, min_ccn
                         )
                     },
-                    "locations": [location(&path, function.line, function.end_line)]
+                    "locations": [location(&path, function.line, function.end_line)],
+                    "partialFingerprints": {
+                        FINGERPRINT_KEY: fingerprint(&path, &function.identity)
+                    },
+                    "properties": {
+                        "confidence": confidence,
+                        "functionIdentity": function.identity
+                    }
                 }),
             ));
         }
@@ -134,37 +149,110 @@ fn delta_result(change: &Change, rule: &'static str, threshold: u32, root: &str)
         ),
         Kind::Worsened => (
             worsened_level(change.ccn),
-            format!(
-                "Function {} increased from {} to {} cyclomatic complexity (limit {}).",
-                change.name,
-                change.base_ccn.unwrap_or(0),
-                change.ccn,
-                threshold
-            ),
+            worsened_message(change, threshold),
         ),
     };
 
-    let confidence = match change.tier {
-        crate::ccn::types::CcnTier::Exact => "exact",
-        crate::ccn::types::CcnTier::BestEffort => "best-effort",
-        crate::ccn::types::CcnTier::Heuristic => "heuristic",
-    };
-    let message = if change.tier == crate::ccn::types::CcnTier::BestEffort {
-        format!("{message} (best-effort parse: the file has syntax errors)")
-    } else {
-        message
-    };
+    let confidence = change.tier.as_str();
+    let message = format!("{message}{}", best_effort_suffix(change.tier));
 
     json!({
         "ruleId": rule,
         "level": level,
         "message": { "text": message },
         "locations": [location(&path, change.line, 0)],
+        "partialFingerprints": {
+            FINGERPRINT_KEY: fingerprint(&path, &change.identity)
+        },
         "properties": {
             "confidence": confidence,
             "functionIdentity": change.identity
         }
     })
+}
+
+/// Describe a worsened function from *what actually changed*.
+///
+/// A length- or nesting-only regression must not claim that cyclomatic
+/// complexity grew, so CCN is mentioned only when the number really rose.
+fn worsened_message(change: &Change, threshold: u32) -> String {
+    let base_ccn = change.base_ccn.unwrap_or(0);
+    let mut parts: Vec<String> = Vec::new();
+
+    if change.ccn > base_ccn {
+        parts.push(format!(
+            "increased in cyclomatic complexity from {base_ccn} to {} (limit {threshold})",
+            change.ccn
+        ));
+    }
+
+    if reason_grew(change, "nesting +") {
+        if let Some(base) = change.base_max_nesting {
+            parts.push(format!(
+                "nesting depth increased from {base} to {}",
+                change.max_nesting
+            ));
+        }
+    }
+
+    if reason_grew(change, "nloc +") {
+        if let Some(base) = change.base_nloc {
+            parts.push(format!(
+                "length increased from {base} to {} lines",
+                change.nloc
+            ));
+        }
+    }
+
+    if parts.is_empty() {
+        // A `Change` built outside `baseline.rs` (tests, replay tools) may not
+        // carry a parseable reason. Fall back to the recorded reason strings
+        // rather than inventing a CCN claim.
+        if change.reasons.is_empty() {
+            parts.push(format!(
+                "changed from {} to {} cyclomatic complexity",
+                base_ccn, change.ccn
+            ));
+        } else {
+            return format!(
+                "Function {} worsened: {}.",
+                change.name,
+                change.reasons.join(", ")
+            );
+        }
+    }
+
+    format!("Function {} {}.", change.name, parts.join("; "))
+}
+
+/// True when `reasons` records a positive delta for `metric` (e.g. `"ccn +"`).
+fn reason_grew(change: &Change, metric: &str) -> bool {
+    change.reasons.iter().any(|reason| {
+        reason
+            .strip_prefix(metric)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .is_some_and(|delta| delta > 0)
+    })
+}
+
+fn best_effort_suffix(tier: CcnTier) -> &'static str {
+    if tier == CcnTier::BestEffort {
+        " (best-effort parse: the file has syntax errors)"
+    } else {
+        ""
+    }
+}
+
+/// Stable per-function key for `partialFingerprints`.
+///
+/// GitHub code scanning uses this to keep a result attached to the same
+/// function across commits. Path + identity survive line movement; the default
+/// hasher is deterministic within a build and needs no new dependency.
+fn fingerprint(path: &str, identity: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    identity.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn location(path: &str, start_line: usize, end_line: usize) -> Value {
@@ -220,6 +308,10 @@ const RULE_COMPLEX: &str = "ccn/complex-function";
 const RULE_ADDED: &str = "ccn/added-complex-function";
 const RULE_WORSENED: &str = "ccn/worsened-complex-function";
 
+/// Stable identifier for `partialFingerprints`; bump only if the hashed inputs
+/// change, or every tracked result would look new.
+const FINGERPRINT_KEY: &str = "ccnFunction/v1";
+
 fn rules() -> Value {
     json!([
         {
@@ -255,8 +347,14 @@ fn rules() -> Value {
 /// Normalise a scan-root-relative path for an `artifactLocation.uri`.
 ///
 /// The model already promises root-relative paths; this additionally strips a
-/// leaked Windows/absolute root prefix and converts separators, so an absolute
-/// path can never reach the document.
+/// leaked Windows/absolute root prefix, converts separators, resolves `.`/`..`
+/// segments without ever climbing out of the scan root, and percent-encodes the
+/// characters that would otherwise break a relative URI. An absolute path can
+/// never reach the document.
+///
+/// Clamping `..` matters for a scan root that is a subdirectory: a path such as
+/// `../shared/a.cpp` must not become a URI outside the repository, which code
+/// scanning cannot resolve.
 fn relative_uri(path: &str, root: &str) -> String {
     let normalised = path.replace('\\', "/");
     let normalised_root = root.replace('\\', "/");
@@ -286,7 +384,34 @@ fn relative_uri(path: &str, root: &str) -> String {
         uri = stripped;
     }
 
-    uri.to_string()
+    // Resolve `.`/`..` as a path would, but clamp at the root: a URI may never
+    // leave the repository, and repeated leading `..` segments are dropped
+    // rather than emitted.
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in uri.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+
+    let mut encoded = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            encoded.push('/');
+        }
+        for ch in segment.chars() {
+            match ch {
+                ' ' => encoded.push_str("%20"),
+                '#' => encoded.push_str("%23"),
+                other => encoded.push(other),
+            }
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -310,6 +435,14 @@ mod tests {
     }
 
     fn file(path: &str, functions: Vec<FunctionCcn>) -> crate::model::FileLoc {
+        file_with_tier(path, functions, CcnTier::Exact)
+    }
+
+    fn file_with_tier(
+        path: &str,
+        functions: Vec<FunctionCcn>,
+        tier: CcnTier,
+    ) -> crate::model::FileLoc {
         crate::model::FileLoc {
             path: path.to_string(),
             lang: "Rust".to_string(),
@@ -317,19 +450,21 @@ mod tests {
             loc: 100,
             comments: 0,
             blanks: 0,
-            ccn: Some(CcnSummary::from_file(FileCcn {
-                tier: CcnTier::Exact,
-                functions,
-            })),
+            ccn: Some(CcnSummary::from_file(FileCcn { tier, functions })),
+            ccn_skip: None,
             is_generated: false,
             is_vendored: false,
         }
     }
 
     fn scan_result(files: Vec<crate::model::FileLoc>) -> ScanResult {
+        scan_result_at("C:/Users/example/repo", files)
+    }
+
+    fn scan_result_at(root: &str, files: Vec<crate::model::FileLoc>) -> ScanResult {
         let loc: usize = files.iter().map(|f| f.loc).sum();
         ScanResult {
-            root: "C:/Users/example/repo".to_string(),
+            root: root.to_string(),
             files_analyzed: files.len(),
             loc_total: loc,
             loc,
@@ -345,6 +480,15 @@ mod tests {
 
     fn parsed(document: &str) -> Value {
         serde_json::from_str(document).expect("valid JSON")
+    }
+
+    fn baseline(changes: Vec<Change>) -> Baseline {
+        Baseline {
+            rev: "main".to_string(),
+            threshold: 10,
+            changes,
+            ..Baseline::default()
+        }
     }
 
     fn results(document: &Value) -> &Vec<Value> {
@@ -447,46 +591,38 @@ mod tests {
             vec![function("grew", 3, 9, 25), function("new", 12, 16, 15)],
         )]);
         let mut report = metrics::build(&result);
-        report.baseline = Some(Baseline {
-            rev: "main".to_string(),
-            threshold: 10,
-            files_compared: 1,
-            files_skipped: 0,
-            files_unavailable: 0,
-            files_unmapped: 0,
-            changes: vec![
-                Change {
-                    path: "src/a.rs".to_string(),
-                    name: "grew".to_string(),
-                    identity: "grew()".to_string(),
-                    line: 3,
-                    ccn: 25,
-                    base_ccn: Some(4),
-                    nloc: 40,
-                    base_nloc: Some(25),
-                    max_nesting: 2,
-                    base_max_nesting: Some(1),
-                    kind: Kind::Worsened,
-                    reasons: vec!["ccn +21".to_string()],
-                    tier: crate::ccn::types::CcnTier::Exact,
-                },
-                Change {
-                    path: "src/a.rs".to_string(),
-                    name: "new".to_string(),
-                    identity: "new()".to_string(),
-                    line: 12,
-                    ccn: 15,
-                    base_ccn: None,
-                    nloc: 15,
-                    base_nloc: None,
-                    max_nesting: 1,
-                    base_max_nesting: None,
-                    kind: Kind::Added,
-                    reasons: vec!["new function".to_string()],
-                    tier: crate::ccn::types::CcnTier::Exact,
-                },
-            ],
-        });
+        report.baseline = Some(baseline(vec![
+            Change {
+                path: "src/a.rs".to_string(),
+                name: "grew".to_string(),
+                identity: "grew()".to_string(),
+                line: 3,
+                ccn: 25,
+                base_ccn: Some(4),
+                nloc: 40,
+                base_nloc: Some(25),
+                max_nesting: 2,
+                base_max_nesting: Some(1),
+                kind: Kind::Worsened,
+                reasons: vec!["ccn +21".to_string()],
+                tier: crate::ccn::types::CcnTier::Exact,
+            },
+            Change {
+                path: "src/a.rs".to_string(),
+                name: "new".to_string(),
+                identity: "new()".to_string(),
+                line: 12,
+                ccn: 15,
+                base_ccn: None,
+                nloc: 15,
+                base_nloc: None,
+                max_nesting: 1,
+                base_max_nesting: None,
+                kind: Kind::Added,
+                reasons: vec!["new function".to_string()],
+                tier: crate::ccn::types::CcnTier::Exact,
+            },
+        ]));
 
         let document = parsed(&render(&result, &report, 10));
         let found = results(&document);
@@ -585,5 +721,153 @@ mod tests {
             .as_str()
             .expect("message text");
         assert!(text.contains(name), "{text}");
+    }
+
+    #[test]
+    fn full_mode_carries_confidence_identity_and_fingerprints() {
+        // A complete function and a file whose parse was recovered from syntax
+        // errors, in one scan: full-mode SARIF must distinguish them, exactly
+        // like delta mode does.
+        let degraded = file_with_tier(
+            "src/truncated.c",
+            vec![function("truncated", 1, 1, 14)],
+            CcnTier::BestEffort,
+        );
+        let result = scan_result(vec![
+            file("src/complete.c", vec![function("complete", 1, 20, 12)]),
+            degraded,
+        ]);
+        let report = metrics::build(&result);
+        let document = parsed(&render(&result, &report, 10));
+        let found = results(&document);
+
+        assert_eq!(found.len(), 2);
+        let complete = found
+            .iter()
+            .find(|r| {
+                r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "src/complete.c"
+            })
+            .expect("complete function result");
+        assert_eq!(complete["properties"]["confidence"], "exact");
+        assert_eq!(complete["properties"]["functionIdentity"], "complete()");
+        assert!(complete["message"]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("(limit 10)."));
+        assert!(complete["partialFingerprints"][FINGERPRINT_KEY].is_string());
+
+        let best = found
+            .iter()
+            .find(|r| {
+                r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                    == "src/truncated.c"
+            })
+            .expect("best-effort result");
+        assert_eq!(best["properties"]["confidence"], "best-effort");
+        assert_eq!(best["properties"]["functionIdentity"], "truncated()");
+        assert!(
+            best["message"]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("(best-effort parse: the file has syntax errors)"),
+            "{}",
+            best["message"]["text"]
+        );
+        assert!(best["partialFingerprints"][FINGERPRINT_KEY].is_string());
+        assert_ne!(
+            complete["partialFingerprints"][FINGERPRINT_KEY],
+            best["partialFingerprints"][FINGERPRINT_KEY]
+        );
+    }
+
+    #[test]
+    fn length_only_delta_does_not_claim_complexity_grew() {
+        let result = scan_result(vec![file("src/a.rs", vec![function("longer", 3, 63, 20)])]);
+        let mut report = metrics::build(&result);
+        report.baseline = Some(baseline(vec![Change {
+            path: "src/a.rs".to_string(),
+            name: "longer".to_string(),
+            identity: "longer()".to_string(),
+            line: 3,
+            ccn: 20,
+            base_ccn: Some(20),
+            nloc: 61,
+            base_nloc: Some(40),
+            max_nesting: 2,
+            base_max_nesting: Some(2),
+            kind: Kind::Worsened,
+            reasons: vec!["nloc +21".to_string()],
+            tier: CcnTier::Exact,
+        }]));
+        let document = parsed(&render(&result, &report, 10));
+        let text = results(&document)[0]["message"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            text.contains("length increased from 40 to 61 lines"),
+            "{text}"
+        );
+        assert!(!text.contains("cyclomatic complexity"), "{text}");
+    }
+
+    #[test]
+    fn nesting_only_delta_names_nesting() {
+        let result = scan_result(vec![file("src/a.rs", vec![function("nested", 1, 8, 12)])]);
+        let mut report = metrics::build(&result);
+        report.baseline = Some(baseline(vec![Change {
+            path: "src/a.rs".to_string(),
+            name: "nested".to_string(),
+            identity: "nested()".to_string(),
+            line: 1,
+            ccn: 12,
+            base_ccn: Some(12),
+            nloc: 8,
+            base_nloc: Some(8),
+            max_nesting: 4,
+            base_max_nesting: Some(2),
+            kind: Kind::Worsened,
+            reasons: vec!["nesting +2".to_string()],
+            tier: CcnTier::Exact,
+        }]));
+        let document = parsed(&render(&result, &report, 10));
+        let text = results(&document)[0]["message"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            text.contains("nesting depth increased from 2 to 4"),
+            "{text}"
+        );
+        assert!(!text.contains("cyclomatic complexity"), "{text}");
+    }
+
+    #[test]
+    fn subroot_scan_uris_stay_inside_the_repository_and_are_escaped() {
+        let result = scan_result_at(
+            "C:/repo/sub",
+            vec![
+                file("C:/repo/sub/src/a b#c.cpp", vec![function("f", 1, 2, 22)]),
+                file("../shared/outside.rs", vec![function("g", 3, 4, 22)]),
+            ],
+        );
+        let report = metrics::build(&result);
+        let document = render(&result, &report, 10);
+
+        assert!(!document.contains("../"), "{document}");
+        let value = parsed(&document);
+        let uris: Vec<&str> = results(&value)
+            .iter()
+            .map(|r| {
+                r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert!(uris.contains(&"src/a%20b%23c.cpp"), "{uris:?}");
+        assert!(uris.contains(&"shared/outside.rs"), "{uris:?}");
+        assert!(uris.iter().all(|uri| !uri.starts_with('/')));
     }
 }

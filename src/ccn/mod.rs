@@ -119,6 +119,28 @@ mod tests {
     }
 
     #[test]
+    fn a_cpp_header_keeps_const_overloads_distinct_through_the_dispatcher() {
+        // `.h` prefers C, but the C++ parse wins and identities come from the
+        // same engine path. This is the dispatcher-level guard for the P1-1
+        // const/plain overload collision.
+        let source = br#"
+struct X {
+    int f(int x) const { return x; }
+    int f(int y) { return y; }
+};
+"#;
+        let summary = analyze_file(Path::new("include/x.h"), source, "C++");
+        assert_eq!(summary.tier, CcnTier::Exact);
+        let mut identities: Vec<&str> =
+            summary.detail.iter().map(|f| f.identity.as_str()).collect();
+        identities.sort_unstable();
+        assert_eq!(identities, vec!["X::f(int)", "X::f(int) const"]);
+        let mut names = function_names(&summary);
+        names.sort_unstable();
+        assert_eq!(names, vec!["f", "f"]);
+    }
+
+    #[test]
     fn unknown_language_degrades_to_heuristic() {
         let s = analyze_file(Path::new("a.rb"), b"if x then y end", "Ruby");
         assert_eq!(s.tier, CcnTier::Heuristic);

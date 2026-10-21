@@ -15,12 +15,12 @@ use rayon::prelude::*;
 
 use crate::ccn::types::CcnTier;
 use crate::generated;
-use crate::model::{ExcludedFiles, FileLoc, LangSummary, RepoCcn, ScanResult};
+use crate::model::{CcnSkip, ExcludedFiles, FileLoc, LangSummary, RepoCcn, ScanResult};
 
 /// Files above this size are not opened by the CCN pass. Generated bundles and
 /// checked-in vendored blobs live here and a 40 MB `min.js` would dominate both
 /// the runtime and the histogram.
-const MAX_CCN_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_CCN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// User-facing spellings for tokei's display names.
 ///
@@ -206,8 +206,10 @@ fn lang_allowed(opts: &ScanOptions, lang: tokei::LanguageType) -> bool {
             .any(|wanted| lang_matches(wanted, lang.name()))
 }
 
-/// Scan `opts.root`. Never fails on unreadable individual files: they are
-/// skipped, and the CCN pass treats an unreadable file as "no CCN".
+/// Scan `opts.root`. Never fails on unreadable individual files: a file that
+/// cannot be read is reported with [`CcnSkip::ReadError`] and zero lines, so
+/// the file count stays honest and a baseline comparison can tell "could not
+/// measure" apart from "nothing to measure".
 ///
 /// Two modes share one walk:
 /// - **cold**: read the file once, count LOC and CCN from the same bytes, then
@@ -514,7 +516,7 @@ fn resolve_file(
                 Ok(bytes) => verified_bytes = Some(bytes),
                 // Unreadable now: measuring nothing is honest, and the stale
                 // entry must not survive into the next cache.
-                Err(_) => return None,
+                Err(_) => return Some((unreadable_loc(path, lang), None)),
             }
         }
     }
@@ -524,7 +526,12 @@ fn resolve_file(
     // parsed, not a second read that may have seen something else.
     let bytes = match verified_bytes {
         Some(bytes) => bytes,
-        None => std::fs::read(abs).ok()?,
+        None => match std::fs::read(abs) {
+            Ok(bytes) => bytes,
+            // A read failure is recorded, not silently dropped: dropping it is
+            // what let an unmeasured file disappear from a baseline gate.
+            Err(_) => return Some((unreadable_loc(path, lang), None)),
+        },
     };
     let digest = crate::cache::content_digest(&bytes);
 
@@ -546,15 +553,22 @@ fn resolve_file(
     };
 
     // The size guard keeps AST parsing off minified bundles; the bytes are
-    // already in memory because LOC needed them.
-    let ccn = if !opts.no_ccn && bytes.len() as u64 <= MAX_CCN_BYTES {
-        Some(crate::ccn::analyze_file(
-            Path::new(&path),
-            &bytes,
-            lang.name(),
-        ))
+    // already in memory because LOC needed them. The reason is recorded on the
+    // file, because "no CCN" alone cannot distinguish a deliberate exclusion
+    // from a measurement that never happened.
+    let (ccn, ccn_skip) = if opts.no_ccn {
+        (None, None)
+    } else if bytes.len() as u64 > MAX_CCN_BYTES {
+        (None, Some(CcnSkip::Oversize))
     } else {
-        None
+        let summary = crate::ccn::analyze_file(Path::new(&path), &bytes, lang.name());
+        let wired = has_ccn_grammar(&path, lang.name());
+        let skip = if wired {
+            None
+        } else {
+            Some(CcnSkip::NoGrammar)
+        };
+        (Some(summary), skip)
     };
 
     // Fingerprint *after* the read. If the file changed between the stat and
@@ -575,6 +589,7 @@ fn resolve_file(
             comments: stats.comments,
             blanks: stats.blanks,
             ccn: ccn.clone(),
+            ccn_skip,
             is_generated: class.is_generated,
             is_vendored: class.is_vendored,
         })
@@ -589,11 +604,43 @@ fn resolve_file(
             comments: stats.comments,
             blanks: stats.blanks,
             ccn,
+            ccn_skip,
             is_generated: class.is_generated,
             is_vendored: class.is_vendored,
         },
         entry,
     ))
+}
+
+/// The record for a file whose bytes could not be read.
+///
+/// `loc_total` stays 0 because no line count was established, and the skip
+/// reason is recorded so the baseline accounting can say "unreadable" instead
+/// of silently losing the file.
+fn unreadable_loc(path: String, lang: tokei::LanguageType) -> FileLoc {
+    FileLoc {
+        path,
+        lang: lang.name().to_string(),
+        loc_total: 0,
+        loc: 0,
+        comments: 0,
+        blanks: 0,
+        ccn: None,
+        ccn_skip: Some(CcnSkip::ReadError),
+        is_generated: false,
+        is_vendored: false,
+    }
+}
+
+/// `true` when the language has a tier-1 tree-sitter grammar wired in.
+///
+/// The extension wins over tokei's name, exactly like
+/// [`crate::ccn::analyze_file`], so the accounting names the same language the
+/// parser picked.
+fn has_ccn_grammar(path: &str, tokei_name: &str) -> bool {
+    crate::ccn::Lang::from_path(path)
+        .or_else(|| crate::ccn::Lang::from_tokei_name(tokei_name))
+        .is_some()
 }
 
 /// Reproduce a cache hit as the report record it stood for.
@@ -606,6 +653,7 @@ fn file_loc_from_entry(path: String, entry: &crate::cache::Entry) -> FileLoc {
         comments: entry.comments,
         blanks: entry.blanks,
         ccn: entry.ccn.clone(),
+        ccn_skip: entry.ccn_skip,
         is_generated: entry.is_generated,
         is_vendored: entry.is_vendored,
     }

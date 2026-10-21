@@ -29,21 +29,31 @@ use crate::git::{self, Churn};
 
 /// Outcome of reading one path at one revision.
 ///
-/// The four states exist because a baseline comparison must distinguish a
-/// genuinely new file ([`FileAt::Absent`], an empty baseline) and a path the
-/// version-control view does not contain ([`FileAt::Unmapped`]) from an
-/// infrastructure failure ([`FileAt::Unavailable`] — permission denied, an
-/// expired ticket, a timeout, an unknown revision, a truncated/errored VCS
-/// response). Folding the latter into "absent" fabricates `Added` findings from
-/// unreadable data.
+/// The five states exist because a baseline comparison must distinguish a
+/// genuinely new file ([`FileAt::Absent`], an empty baseline), a path the
+/// version-control view definitively does not contain ([`FileAt::Unmapped`]),
+/// a path the view *might* contain but the mapping is incomplete
+/// ([`FileAt::Unknown`]) and an infrastructure failure
+/// ([`FileAt::Unavailable`] — permission denied, an expired ticket, a timeout,
+/// an unknown revision, a truncated/errored VCS response). Folding any of the
+/// latter into "absent" fabricates `Added` findings from unreadable data, and
+/// folding [`FileAt::Unknown`] into [`FileAt::Unmapped`] silently drops files
+/// that an unsupported view pattern may cover.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileAt {
     /// The bytes of the path at that revision.
     Found(Vec<u8>),
     /// The path has no revision at that revision (added later / deleted).
     Absent,
-    /// the path is not in this client's view; it has no depot history and must be skipped, not reported as new or as a read failure
+    /// The path is not in this client's view and the mapping is **complete**: it
+    /// has no depot history and must be skipped, not reported as new or as a
+    /// read failure.
     Unmapped,
+    /// The path is not mapped, but the mapping itself is incomplete (an
+    /// unsupported view pattern such as `*`/`%%n`, an unparseable view line, or
+    /// the single `p4 where` fallback). The path may be in view, so the caller
+    /// must treat the comparison as incomplete rather than as "no history".
+    Unknown,
     /// Could not determine: permission, timeout, unknown rev, VCS/transport error.
     Unavailable,
 }
@@ -137,10 +147,13 @@ pub fn rev_exists(scan_root: &Path, backend: Backend, rev: &str) -> bool {
 /// [`FileAt::Absent`] means "no baseline version" (a file added after `rev`, or
 /// deleted at it), which the baseline comparison treats as an empty file.
 /// [`FileAt::Unavailable`] means the backend could not answer — the caller must
-/// not invent a baseline from it. [`FileAt::Unmapped`] means the backend's view
-/// does not contain the path at all (a Perforce exclusion or a file the client
-/// does not map): it has no history to compare against, so it must be skipped
-/// rather than counted as new or as a failure. Git never returns it.
+/// not invent a baseline from it. [`FileAt::Unmapped`] means the backend's
+/// complete view does not contain the path at all (a Perforce exclusion or a
+/// file the client does not map): it has no history to compare against, so it
+/// must be skipped rather than counted as new or as a failure. [`FileAt::Unknown`]
+/// means the path is not mapped *and* the mapping is incomplete, so the path may
+/// be in view and the comparison must be reported as incomplete. Git never
+/// returns `Unmapped` or `Unknown`.
 pub fn file_at(scan_root: &Path, backend: Backend, rev: &str, path: &str) -> FileAt {
     match backend {
         Backend::Git => {

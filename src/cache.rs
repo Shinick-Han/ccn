@@ -64,8 +64,11 @@ use crate::ccn::types::CcnSummary;
 /// changes; this covers rule-table changes that do not move the crate version.
 ///
 /// Version 3 added `tool_version` and `Entry::content_hash`. Version 4 added
-/// `FunctionCcn::identity` (the serialized shape changed).
-pub const CACHE_VERSION: u32 = 4;
+/// `FunctionCcn::identity` (the serialized shape changed). Version 5 added
+/// `Entry::ccn_skip` and tightened `FunctionCcn::identity` semantics (C++
+/// cv/ref qualifiers in, parameter names out), so an old entry's identity can
+/// no longer be trusted for baseline matching.
+pub const CACHE_VERSION: u32 = 5;
 
 /// What identifies a file's content without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +117,10 @@ pub struct Entry {
     pub blanks: usize,
     #[serde(default)]
     pub ccn: Option<CcnSummary>,
+    /// Why CCN produced no summary, carried so a warm scan reports the same
+    /// accounting as a cold one.
+    #[serde(default)]
+    pub ccn_skip: Option<crate::model::CcnSkip>,
     #[serde(default)]
     pub is_generated: bool,
     #[serde(default)]
@@ -323,6 +330,7 @@ mod tests {
                     max_nesting: 0,
                 }],
             })),
+            ccn_skip: None,
             is_generated: false,
             is_vendored: false,
         }
@@ -396,6 +404,33 @@ mod tests {
                 }
             )
             .is_none());
+    }
+
+    #[test]
+    fn ccn_skip_roundtrips_through_the_cache() {
+        let dir = temp_dir("skip");
+        let path = dir.join("cache.json");
+        let root = "C:/skip";
+        let mut cache = Cache::new(root);
+        let mut skipped = entry(1, 2);
+        skipped.ccn = None;
+        skipped.ccn_skip = Some(crate::model::CcnSkip::ReadError);
+        cache.insert("src/a.rs".into(), skipped);
+        cache.save_to(&path).expect("save");
+
+        let loaded = Cache::load_from(&path, root);
+        let got = loaded
+            .get(
+                "src/a.rs",
+                Fingerprint {
+                    mtime_ns: 1,
+                    size: 2,
+                },
+            )
+            .expect("hit");
+        assert_eq!(got.ccn_skip, Some(crate::model::CcnSkip::ReadError));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

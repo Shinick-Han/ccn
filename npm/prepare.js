@@ -15,7 +15,8 @@ const ROOT = __dirname;
 
 const TARGETS = [
   { dir: "platforms/linux-x64", asset: "ccn-linux-x64", file: "ccn" },
-  { dir: "platforms/darwin-arm64", asset: "ccn-macos-x64", file: "ccn" },
+  { dir: "platforms/darwin-x64", asset: "ccn-macos-x64", file: "ccn" },
+  { dir: "platforms/darwin-arm64", asset: "ccn-macos-arm64", file: "ccn" },
   { dir: "platforms/win32-x64", asset: "ccn-windows-x64.exe", file: "ccn.exe" }
 ];
 

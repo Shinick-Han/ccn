@@ -519,6 +519,7 @@ mod tests {
                 tier: CcnTier::Exact,
                 functions: vec![function],
             })),
+            ccn_skip: None,
             is_generated: false,
             is_vendored: false,
         };

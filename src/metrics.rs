@@ -408,8 +408,11 @@ pub struct Report {
 }
 
 pub const BIN_SPEC_VERSION: u32 = 1;
-/// Grades are anchored to the reference corpus in `docs/calibration.md`.
-pub const HEALTH_EXPERIMENTAL: bool = false;
+/// Grades are anchored to the reference corpus in `docs/calibration.md`, but
+/// that 11-repository calibration predates the best-effort exclusion: the
+/// denominator now omits degraded parses, so a grade is advisory until the
+/// corpus is re-measured. The flag keeps the report from implying otherwise.
+pub const HEALTH_EXPERIMENTAL: bool = true;
 /// Surfaced in the report footer so a reader knows what "A" was measured against.
 pub const HEALTH_CALIBRATION: &str = "grades calibrated on 11 repositories, 2026-10-21";
 
@@ -732,6 +735,7 @@ mod tests {
             comments: 0,
             blanks: 0,
             ccn: Some(summary),
+            ccn_skip: None,
             is_generated: false,
             is_vendored: false,
         }
@@ -997,10 +1001,10 @@ mod tests {
     }
 
     #[test]
-    fn calibration_note_is_present_when_grades_are_no_longer_experimental() {
+    fn calibration_note_is_present_while_grades_are_experimental() {
         // Compile-time assertions: flipping the flag without updating the note
         // (or the note without the flag) is a review error, not a runtime one.
-        const { assert!(!HEALTH_EXPERIMENTAL) };
+        const { assert!(HEALTH_EXPERIMENTAL) };
         const { assert!(!HEALTH_CALIBRATION.is_empty()) };
         assert!(HEALTH_CALIBRATION.contains("11 repositories"));
     }

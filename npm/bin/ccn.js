@@ -29,7 +29,7 @@ const binary = resolveBinary();
 if (!fs.existsSync(binary)) {
   console.error(
     "ccn: no binary for " + target + ".\n" +
-      "Supported: linux-x64, darwin-arm64, win32-x64.\n" +
+      "Supported: linux-x64, darwin-x64, darwin-arm64, win32-x64.\n" +
       "Build from source (https://github.com/Shinick-Han/ccn) or set CCN_BINARY_PATH."
   );
   process.exit(1);

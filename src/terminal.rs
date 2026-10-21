@@ -199,16 +199,17 @@ fn baseline_block(report: &Report, sep: &str) -> String {
         .count();
 
     let mut out = format!(
-        "  Since {}  {added} new >{} {sep} {worsened} worsened   ({} files compared, {} skipped",
-        baseline.rev, baseline.threshold, baseline.files_compared, baseline.files_skipped,
+        "  Since {}  {added} new >{} {sep} {worsened} worsened   {}",
+        baseline.rev,
+        baseline.threshold,
+        baseline.counts_line(),
     );
-    if baseline.files_unavailable > 0 {
-        out.push_str(&format!(", {} unavailable", baseline.files_unavailable));
+    out.push('\n');
+    if !baseline.complete {
+        for reason in baseline.incomplete_reasons() {
+            out.push_str(&format!("  incomplete: {reason}\n"));
+        }
     }
-    if baseline.files_unmapped > 0 {
-        out.push_str(&format!(", {} unmapped", baseline.files_unmapped));
-    }
-    out.push_str(")\n");
     if best_effort > 0 {
         out.push_str(&format!(
             "  {} finding(s) come from best-effort parses (syntax errors) and are advisory\n",
@@ -583,6 +584,7 @@ mod tests {
             comments: 1,
             blanks: 1,
             ccn,
+            ccn_skip: None,
             is_generated: false,
             is_vendored: false,
         }

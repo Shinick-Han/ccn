@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.7.8 (2026-10-22)
+
+The trust-contract release: the reproduced P0/P1 holes from the second review
+(`docs/reviews/codex-roi-review-2026-10-21.md`) are closed or fail closed.
+
+### Comparison completeness (P0-2)
+
+- Every expected file now has one recorded outcome. `Baseline` publishes
+  `files_expected`, `files_compared`, `files_skipped`, `files_unmeasured`,
+  `files_oversize`, `files_unreadable`, `files_unmapped`, `files_unknown`,
+  `files_unavailable`, `files_ambiguous`, and `complete`.
+- A changed file that cannot be measured (truncated current, unparseable
+  baseline, read failure, ambiguous match, unsupported view) makes
+  `--fail-on-new` exit **2** with a per-reason message. It can no longer look
+  like "no changes".
+- Oversize and genuinely out-of-view files are explicit accepted exclusions,
+  not silent omissions.
+- New `--manifest <path>` writes a versioned per-file outcome manifest
+  (tool version, baseline, counts, outcome, reason, baseline presence).
+- New `--allow-best-effort` opts into advisory best-effort findings; without it
+  a best-effort finding makes the enforced gate incomplete (exit 2).
+- Cache format 5 records why CCN was skipped (`oversize`, `read-error`,
+  `no-grammar`).
+
+### Identity and matching (P1-1)
+
+- Identity now carries C++ cv/ref/noexcept qualifiers and template parameters,
+  and excludes parameter names: `X::f(int) const` vs `X::f(int)`,
+  `f<T>(T)`.
+- Bound lambdas use their variable name (`lambda:a(int)`) instead of a shared
+  `(anonymous)`; unbound lambdas stay explicitly anonymous and ambiguous.
+- Baseline matching reserves all exact identities before any name fallback;
+  fallback requires uniqueness on both sides and compatible scope. Const
+  overload reorder, lambda reorder, parameter rename, and a new overload
+  inserted before an unchanged function no longer fabricate deltas.
+- Ambiguous matching is withheld and counted (`files_ambiguous`), never
+  guessed.
+
+### Perforce views (P0-1)
+
+- View lines are evaluated in client-spec order: later lines override, and a
+  later include re-adds an earlier exclusion.
+- Unsupported patterns (`*`, `%%n`) and the `p4 where` fallback mark the
+  mapping **incomplete** instead of silently dropping files.
+- New `FileAt::Unknown` distinguishes an incomplete mapping from a
+  server-confirmed out-of-view file (`Unmapped`); `Unknown` fails the enforced
+  gate with exit 2.
+
+### Reports, release, and docs
+
+- Full-mode SARIF now includes `properties.confidence` and
+  `properties.functionIdentity`, a best-effort message suffix, and stable
+  `partialFingerprints`; delta messages distinguish CCN growth from
+  length/nesting growth; sub-root URIs stay in-repo and are escaped.
+- Pinned `action.yml` versions never fall back to building the action checkout:
+  a missing pinned asset, checksum mismatch, or version mismatch fails. Both
+  `latest` and pinned downloads are checksum- and `--version`-verified.
+- macOS ships two native assets: `ccn-macos-x64` (Intel, `macos-15-intel`) and
+  `ccn-macos-arm64` (`macos-latest`). npm gains
+  `@shinick/ccn-darwin-x64`; the action selects by `uname -m`.
+- Health is labelled experimental again (the 11-repo calibration predates
+  best-effort exclusion); README no longer implies a validated grade or a
+  runtime/defect prediction.
+- New design-partner pilot kit: `docs/pilot/design-partner-pilot-2026-10.md`,
+  `dossier-template.md`, `checklist.md`.
+
 ## 0.7.7 (2026-10-21)
 
 Complex Perforce views and the first large-repository scale evidence.

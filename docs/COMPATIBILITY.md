@@ -11,7 +11,8 @@ JSON is plain UTF-8 with no version-specific features.
 | Platform | Asset | Minimum |
 |---|---|---|
 | Linux x86_64 | `ccn-linux-x64` | glibc **2.28** (AlmaLinux/RHEL/Rocky 8+, Debian 10+, Ubuntu 20.04+) |
-| macOS (Apple Silicon runner) | `ccn-macos-x64` | macOS 11+ |
+| macOS x86_64 (Intel) | `ccn-macos-x64` | macOS 11+ |
+| macOS arm64 (Apple silicon) | `ccn-macos-arm64` | macOS 11+ |
 | Windows x86_64 | `ccn-windows-x64.exe` | Windows 10+ (MSVC runtime is linked statically where possible) |
 
 These minimums describe the **prebuilt release assets**. Running a downloaded

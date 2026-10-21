@@ -20,8 +20,8 @@ tag push
        cargo fmt --check
        cargo clippy --locked --all-targets -- -D warnings
        cargo test --release --locked
-  -> linux, macos, windows           (needs: checks)
-  -> checksums                       (needs: [linux, macos, windows])
+  -> linux, macos-x64, macos-arm64, windows   (needs: checks)
+  -> checksums                       (needs: [linux, macos-x64, macos-arm64, windows])
 ```
 
 `checks` must be green before any build job starts, so a tag that fails
@@ -29,14 +29,17 @@ formatting, lints or tests cannot produce a release asset at all. The Linux job
 still runs `cargo build --release --locked` inside an AlmaLinux 8 container, but
 the suite is not repeated there: the ubuntu job is the gate.
 
-The three build jobs then run in parallel and attach their binary to the same
-GitHub release with generated release notes. Finally `checksums` downloads the
-three published assets, hashes exactly the bytes a consumer would get, and
-uploads `SHA256SUMS` to the same release. It does not regenerate release notes.
+The four build jobs then run in parallel and attach their binary to the same
+GitHub release with generated release notes. The macOS jobs assert their runner
+architecture (`macos-15-intel` = `x86_64`, `macos-latest` = `arm64`) before building,
+so an asset name cannot quietly describe the wrong CPU. Finally `checksums`
+downloads every published `ccn-*` asset, hashes exactly the bytes a consumer
+would get, and uploads `SHA256SUMS` to the same release. It does not regenerate
+release notes.
 
 ## Verifying a download
 
-Every release carries `SHA256SUMS` next to the three binaries. Download it and
+Every release carries `SHA256SUMS` next to the four binaries. Download it and
 the asset(s) into the same directory (`ccn-*` covers all of them):
 
 ```sh
@@ -72,14 +75,15 @@ it as an integrity check, not provenance.
 
 Raw single-file binaries, no archives:
 
-| Asset                  | Runner           | Source path              |
-| ---------------------- | ---------------- | ------------------------ |
-| `ccn-linux-x64`        | `ubuntu-latest`  | `target/release/ccn`     |
-| `ccn-macos-x64`        | `macos-latest`   | `target/release/ccn`     |
-| `ccn-windows-x64.exe`  | `windows-latest` | `target/release/ccn.exe` |
+| Asset                  | Runner           | Architecture | Source path              |
+| ---------------------- | ---------------- | ------------ | ------------------------ |
+| `ccn-linux-x64`        | `ubuntu-latest`  | x86_64       | `target/release/ccn`     |
+| `ccn-macos-x64`        | `macos-15-intel`       | x86_64       | `target/release/ccn`     |
+| `ccn-macos-arm64`      | `macos-latest`   | arm64        | `target/release/ccn`     |
+| `ccn-windows-x64.exe`  | `windows-latest` | x86_64       | `target/release/ccn.exe` |
 
 Install by downloading the asset, `chmod +x` on Unix, and putting it on `PATH`.
-`SHA256SUMS` is published by the `checksums` job after all three binaries, so it
+`SHA256SUMS` is published by the `checksums` job after all four binaries, so it
 never lists an asset that does not exist.
 
 ## How the action uses these assets
@@ -102,8 +106,25 @@ this input decides which binary it downloads.
 
 The action places the binary at `<action_path>/target/release/ccn` (`ccn.exe` on
 Windows, where the extensionless path still resolves), which is where the scan
-step looks. If the download fails, the action logs `prebuilt` vs `source` and
-falls back to `cargo build --release --locked` inside the checked-out action.
+step looks.
+
+Before using a downloaded binary the action:
+
+1. downloads `SHA256SUMS` from the same release and compares the asset's digest
+   (`sha256sum`, `shasum -a 256`, or `Get-FileHash`/`certutil` on Windows);
+2. runs `<binary> --version` and, for a pinned tag, requires the reported
+   version to equal the tag with its leading `v` stripped. For `latest` it logs
+   the reported version.
+
+Failure rules:
+
+- with `version: latest`, a missing asset, missing `SHA256SUMS`, or a download
+  failure only warns and falls back to `cargo build --release --locked` inside
+  the checked-out action;
+- with a pinned tag, any of those is a step failure. The action never
+  substitutes its own checkout for the requested release, because that would
+  silently run a different version. A `SHA256SUMS` file that exists but does not
+  list the selected asset is always an error.
 
 ## Action pinning
 
@@ -137,9 +158,9 @@ repository and confirm it appears in the pinned form above.
 ## Private repositories
 
 Downloading release assets from a **private** repository without authentication
-returns HTTP 404, so an unauthenticated `curl` from another repository fails and
-the action builds from source instead (this always works, but is slower and
-needs a Rust toolchain on the runner).
+returns HTTP 404. With `version: latest` the action then builds from source
+(slower, and it needs a Rust toolchain on the runner); with a pinned tag the
+step fails rather than running a checkout that may be a different version.
 
 The action sends `Authorization: Bearer $GITHUB_TOKEN` when a token is present
 and retries anonymously, then falls back. `GITHUB_TOKEN` only helps when that
@@ -150,23 +171,23 @@ path is used and everything works without a token.
 
 ## macOS architecture
 
-`macos-latest` currently runs on Apple silicon (`arm64`), so `ccn-macos-x64` is
-a native `arm64` binary despite its name — it is neither a universal binary nor
-an Intel-native build. The action maps both `arm64` and `x86_64` Darwin to this
-single asset, so on an Intel runner the downloaded binary is the wrong
-architecture and will not run. Intel users should build from source (the action
-falls back automatically only when the download itself fails). The asset name is
-kept stable so action downloads do not depend on the runner image of the day.
+macOS gets two native binaries: `ccn-macos-x64` from `macos-15-intel` (Intel) and
+`ccn-macos-arm64` from `macos-latest` (Apple silicon). Neither is a universal
+binary; the action selects by `uname -m` (`x86_64` → `ccn-macos-x64`, `arm64` →
+`ccn-macos-arm64`) and the npm packages select by npm's `cpu` field. Running the
+wrong one fails at exec time, so the build jobs assert the runner architecture
+rather than trusting the image label.
 
 ## npm
 
-`npm/` contains four packages:
+`npm/` contains five packages:
 
 | package | contents |
 |---|---|
-| `@shinick/ccn` | 2 KB launcher (`bin/ccn.js`), `optionalDependencies` on the three platform packages |
+| `@shinick/ccn` | 2 KB launcher (`bin/ccn.js`), `optionalDependencies` on the four platform packages |
 | `@shinick/ccn-linux-x64` | `ccn-linux-x64` (glibc 2.28) |
-| `@shinick/ccn-darwin-arm64` | `ccn-macos-x64` (arm64) |
+| `@shinick/ccn-darwin-x64` | `ccn-macos-x64` (Intel) |
+| `@shinick/ccn-darwin-arm64` | `ccn-macos-arm64` (Apple silicon) |
 | `@shinick/ccn-win32-x64` | `ccn-windows-x64.exe` |
 
 No install script runs: npm picks the platform package through its `os`/`cpu`
@@ -177,7 +198,7 @@ Publish flow:
 ```powershell
 npm login
 node npm/prepare.js          # downloads the release binaries into platforms/*/vendor
-pwsh -File npm/publish.ps1   # publishes the three platform packages, then the main one
+pwsh -File npm/publish.ps1   # publishes the platform packages, then the main one
 ```
 
 The binaries are gitignored (`npm/platforms/*/vendor/`) so the repository does

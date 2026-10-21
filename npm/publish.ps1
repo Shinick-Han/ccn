@@ -13,6 +13,7 @@ $version = (Get-Content (Join-Path $root 'package.json') -Raw | ConvertFrom-Json
 
 $platforms = @(
     'platforms/linux-x64',
+    'platforms/darwin-x64',
     'platforms/darwin-arm64',
     'platforms/win32-x64'
 )

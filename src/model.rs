@@ -4,15 +4,33 @@
 //! generation, caching and any future consumer all read this shape.
 //! See `docs/PLAN.md` §5.3/§5.4.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ccn::types::{CcnSummary, CcnTier};
+
+/// Why a file has no per-function CCN despite CCN being enabled.
+///
+/// This is the scanner's own account of a skipped CCN pass. Without it a
+/// consumer only sees `ccn: None` and cannot tell "deliberately out of scope"
+/// (a language with no grammar) from "the measurement failed" (a read error or
+/// the size guard), which is exactly the ambiguity that let an incomplete
+/// baseline comparison look like a clean one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CcnSkip {
+    /// Deliberately not parsed: the file exceeds the CCN size guard.
+    Oversize,
+    /// The file could not be read, so there is nothing to parse.
+    ReadError,
+    /// No CCN grammar is wired for this language (e.g. Markdown).
+    NoGrammar,
+}
 
 /// One file's line statistics.
 ///
 /// `loc` is non-blank, non-comment physical lines (what tokei calls `code`);
 /// `loc_total` includes blanks and comments.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct FileLoc {
     pub path: String,
     pub lang: String,
@@ -25,6 +43,11 @@ pub struct FileLoc {
     /// guard. The tier inside the summary says how much to trust it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ccn: Option<CcnSummary>,
+    /// Why the CCN pass produced no summary. `None` means "nothing was
+    /// skipped": either CCN ran, or CCN was disabled for the whole scan
+    /// (`--no-ccn` may therefore leave both `ccn` and `ccn_skip` empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ccn_skip: Option<CcnSkip>,
     /// Produced by a generator (marker in the file head, or a generated
     /// filename). Excluded from every metric in [`crate::metrics::Report`] but
     /// kept in the JSON so a consumer can see what was dropped.
@@ -302,6 +325,7 @@ mod tests {
             comments: 0,
             blanks: 0,
             ccn,
+            ccn_skip: None,
             is_generated: false,
             is_vendored: false,
         }

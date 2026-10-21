@@ -1,0 +1,14 @@
+{
+  "name": "@shinick/ccn-darwin-x64",
+  "version": "0.7.8",
+  "description": "ccn binary for macOS Intel",
+  "license": "MIT",
+  "homepage": "https://github.com/Shinick-Han/ccn",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shinick-Han/ccn.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["vendor/ccn"]
+}

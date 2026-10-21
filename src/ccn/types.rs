@@ -128,9 +128,28 @@ pub struct FunctionCcn {
     /// Best-effort name. Anonymous callbacks become `(anonymous)`; the engine
     /// may recover a name from `const x = () => {}` / object properties.
     pub name: String,
-    /// Stable match key: scope-qualified name plus normalized parameter list,
-    /// e.g. `Widget::draw(int, const char*)`. Used by baseline matching so
-    /// overload order cannot be mistaken for a change.
+    /// Stable match key derived from structure, never declaration spelling.
+    ///
+    /// Grammar:
+    ///
+    /// ```text
+    /// named      := [scope "::"] name ["<" targs ">"] "(" ptypes ")" [" " qualifiers]
+    /// lambda     := [enclosing "::"] "lambda:" binding "(" ptypes ")"
+    /// anonymous  := "(anonymous)" "(" ptypes ")"
+    /// ```
+    ///
+    /// - scope: enclosing namespace/class/impl, e.g. `N::X::m`.
+    /// - ptypes: parameter **types** with names removed (`X::f(int)`), or a
+    ///   positional `_` for an untyped Python/JS/TS parameter.
+    /// - qualifiers: C++ trailing `const`/`volatile`/`&`/`&&`/`noexcept`, so
+    ///   `X::f(int) const` and `X::f(int)` are distinct.
+    /// - targs: C++/Rust template parameter names, e.g. `f<T>(T)`.
+    /// - lambda: a lambda bound to a named variable is
+    ///   `enclosing::lambda:name(ptypes)`; an unbound lambda stays
+    ///   `(anonymous)(ptypes)` with no line number.
+    ///
+    /// Used by baseline matching so overload order, parameter renames and
+    /// sibling lambda reordering cannot be mistaken for a change.
     ///
     /// Additive in the serialized shape: files written before this field
     /// existed deserialize it as `""`, which baseline matching treats as

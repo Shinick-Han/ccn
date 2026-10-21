@@ -1275,6 +1275,7 @@ mod tests {
                 tier: CcnTier::Exact,
                 functions,
             })),
+            ccn_skip: None,
             is_generated: false,
             is_vendored: false,
         }
