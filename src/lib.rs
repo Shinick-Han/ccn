@@ -14,4 +14,5 @@ pub mod metrics;
 pub mod model;
 pub mod report;
 pub mod terminal;
+pub mod theme;
 pub mod tui;

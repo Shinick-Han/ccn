@@ -101,6 +101,10 @@ mauve → blue → teal, with the over-limit bins in gold and coral.
 Everything is static: no animation, no shader loop, no external font or image.
 The light theme is the same palette on lilac paper, not an inversion.
 
+The TUI (`--tui`) uses the same tokens: `#12121C` canvas, `#1A1B2A` cards, a
+mauve focused border, selected rows on `#2D2F46`, the grade badge in its
+semantic colour, the CCN bar ramp, and risk-coloured `max CCN` values.
+
 ## Trend, diff mode, ownership
 
 - **`--trend`** appends a small snapshot to `<repo>/.ccn/history.json` (max 200)
