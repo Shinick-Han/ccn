@@ -96,6 +96,24 @@ Read both numbers; neither is "the" answer.
 - The calibration corpus is one developer's machine, mostly TypeScript.
   Treat absolute grades as indicative outside that population.
 
+## "No parsed functions"
+
+If a repository reports no functions, `tools/diagnose.py` groups every file by
+language and tier and prints the reason (Python 3.8+, no dependencies):
+
+```console
+$ python3 tools/diagnose.py /path/to/workspace
+language          files   exact    heur    none  note
+Kotlin                2       0       2       0  no grammar yet (tier 3)
+Rust                120     118       2       0
+```
+
+- **heur** with a "no grammar" note: the language is not in the ten tier-1
+  grammars; those files only get a file-level number.
+- **heur** in a supported language: the file failed to parse (truncated,
+  unsupported dialect, invalid UTF-8).
+- **none**: the file was not read (permissions, >8 MiB, or vanished mid-scan).
+
 ## Look
 
 The report borrows its visual language from AuraDeck's "cyber-pastel" palette
