@@ -967,10 +967,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_subdirectory_scan_root_is_stripped_from_the_key() {
         let out = "//depot/proj/... //client/proj/... C:\\ws\\proj\\...\n";
         let mapping =
             parse_where(out, Path::new("C:\\ws\\proj\\src")).expect("mapping for a subdirectory");
+
+        assert_eq!(
+            mapping.relative("//depot/proj/src/a.rs").as_deref(),
+            Some("a.rs")
+        );
+        assert_eq!(
+            mapping.relative("//depot/proj/top.rs"),
+            None,
+            "a file above the scan root is dropped"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_subdirectory_scan_root_is_stripped_from_the_key() {
+        let out = "//depot/proj/... //client/proj/... /ws/proj/...\n";
+        let mapping =
+            parse_where(out, Path::new("/ws/proj/src")).expect("mapping for a subdirectory");
 
         assert_eq!(
             mapping.relative("//depot/proj/src/a.rs").as_deref(),
@@ -1173,6 +1192,24 @@ no files to display
     }
 
     #[test]
+    #[cfg(unix)]
+    fn depot_file_reapplies_the_scan_root_offset() {
+        let out = "//depot/proj/... //client/proj/... /ws/proj/...\n";
+        let mapping =
+            parse_where(out, Path::new("/ws/proj/src")).expect("mapping for a subdirectory");
+
+        assert_eq!(
+            mapping.depot_file("a.rs").as_deref(),
+            Some("//depot/proj/src/a.rs")
+        );
+        assert_eq!(
+            mapping.relative("//depot/proj/src/a.rs").as_deref(),
+            Some("a.rs")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn depot_file_reapplies_the_scan_root_offset() {
         let out = "//depot/proj/... //client/proj/... C:\\ws\\proj\\...\n";
         let mapping =

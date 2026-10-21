@@ -668,9 +668,18 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn relative_paths_use_forward_slashes() {
         let root = Path::new("C:\\repo");
         let path = Path::new("C:\\repo\\src\\main.rs");
+        assert_eq!(relative_display(root, path), "src/main.rs");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relative_paths_use_forward_slashes() {
+        let root = Path::new("/repo");
+        let path = Path::new("/repo/src/main.rs");
         assert_eq!(relative_display(root, path), "src/main.rs");
     }
 
