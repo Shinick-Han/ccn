@@ -101,6 +101,30 @@ pub fn collect_history(scan_root: &Path, backend: Backend, max_changes: u32) -> 
     }
 }
 
+/// True when `rev` exists in the backend (a commit or a changelist).
+pub fn rev_exists(scan_root: &Path, backend: Backend, rev: &str) -> bool {
+    match backend {
+        Backend::Git => git::rev_exists(scan_root, rev),
+        Backend::P4 => crate::p4::rev_exists(scan_root, rev),
+    }
+}
+
+/// File contents at `rev`, keyed by a scan-root-relative path.
+///
+/// `None` means "no baseline version" (a file added after `rev`, or a rev the
+/// backend cannot read), which the baseline comparison treats as an empty file.
+pub fn file_at(scan_root: &Path, backend: Backend, rev: &str, path: &str) -> Option<Vec<u8>> {
+    match backend {
+        Backend::Git => {
+            let work_tree = git::work_tree(scan_root)?;
+            let prefix = git_prefix(scan_root, &work_tree)?;
+            git::file_at(scan_root, rev, &format!("{prefix}{path}"))
+        }
+        // P4 keys are already scan-root-relative.
+        Backend::P4 => crate::p4::file_at(scan_root, rev, path),
+    }
+}
+
 /// Paths changed since `rev`, relative to the scan root.
 ///
 /// Files outside the scan root are dropped: a scan of `repo/sub` must never see

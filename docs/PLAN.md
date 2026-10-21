@@ -879,3 +879,48 @@ clippy -D warnings, fmt clean
 
 
 
+
+---
+
+## 23. PR 베이스라인 (2026-10-21, 0.5.0)
+
+"이 PR이 새로 만든 복잡한 함수"를 짚는 기능. `--baseline <rev>` + `--fail-on-new`.
+
+### 동작
+
+1. `vcs::rev_exists`로 리비전을 먼저 검증한다(오타가 전체 저장소를 "신규"로 만들지 않게).
+2. 측정 대상 파일마다 `vcs::file_at`으로 **옛 버전 바이트**를 가져온다.
+   - git: `git show <rev>:<path>`
+   - p4: `p4 -q print -q <depot>@=<CL>`
+3. `ccn::analyze_file`로 옛 함수 목록을 뽑아 현재와 **이름 기준**으로 매칭한다(중복은 소스 순서로 소비).
+4. `added`(베이스에 없고 CCN > 10), `worsened`(10 이하 → 초과)만 리포트.
+
+### 발견하고 고친 것
+
+첫 구현은 베이스에 파일이 없으면 **skip**했다. 그런데 PR에서 새 파일은 신규 복잡 함수가 가장 많이 생기는 곳이다. → `rev_exists`로 리비전을 검증한 뒤, `file_at == None`은 "그 리비전에 파일 없음"으로 해석해 **빈 베이스**로 비교한다. `files_skipped`는 베이스를 파싱할 수 없을 때만 증가한다.
+
+### 실측 (CCN 저장소, HEAD~1 대비)
+
+```
+Since HEAD~1  1 new >10 · 0 worsened   (66 files compared, 0 skipped)
+  + 11   parse_changes            src/p4.rs:510
+```
+
+`--fail-on-new`는 이 경우 exit 1. 잘못된 리비전은 exit 2.
+
+### 리포트
+
+- 터미널: Health/Trend 아래 `Since <rev>` 블록 + 상위 5개
+- HTML: `Since <rev>` 패널(테이블: change/function/CCN/was/location)
+- JSON: `Report.baseline`
+
+### 한계
+
+- **이름 기준 매칭**이라 이름을 바꾼 함수는 "added"로 보인다(의도적 단순화).
+- 파일 리네임은 git이 경로를 따라가지 않는다(새 경로 = 신규).
+- P4는 여전히 실서버 미검증.
+
+### 다음
+
+- GitHub Action + SARIF (PR 코멘트/코드스캔 탭)
+- 파일 리네임 추적(`git diff -M`)

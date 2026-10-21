@@ -195,6 +195,58 @@ pub fn changed_since(repo: &Path, rev: &str) -> Option<HashSet<String>> {
     Some(changed)
 }
 
+/// True when `rev` resolves to a commit in `repo`.
+pub fn rev_exists(repo: &Path, rev: &str) -> bool {
+    if rev.is_empty() || rev.starts_with('-') || rev.contains(char::is_whitespace) {
+        return false;
+    }
+    let Some(top) = work_tree(repo) else {
+        return false;
+    };
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(top)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{rev}^{{commit}}"));
+    run(cmd).is_some()
+}
+
+/// Raw contents of `path` (work-tree-relative, `/`-separated) at `rev`.
+///
+/// Returns `None` when the rev/path does not exist or git fails.
+///
+/// The bytes are returned **verbatim** — no `String` round trip, no lossy
+/// decoding — because baseline files may be non-UTF-8 (a Latin-1 source file, or
+/// any binary asset a language's "source" glob happens to match) and a baseline
+/// has to reproduce the old file exactly to be compared against the new one.
+///
+/// A file that was added after `rev` is legitimately absent there, and an unknown
+/// revision is indistinguishable from a missing path at this layer: both are
+/// `None`, the same "could not ask" degrade the rest of this module uses.
+///
+/// `rev` is rejected before spawning when it is empty, starts with `-` (an
+/// option smuggled into the argument list) or contains whitespace (which could
+/// split the `rev:path` operand). `path` is rejected when empty or containing a
+/// NUL, which `Command` could not pass to the child at all.
+pub fn file_at(repo: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
+    if rev.is_empty() || rev.starts_with('-') || rev.contains(char::is_whitespace) {
+        return None;
+    }
+    if path.is_empty() || path.contains('\0') {
+        return None;
+    }
+    let work_tree = work_tree(repo)?;
+
+    // One operand, not two: `git show <rev>:<path>` is the whole specification.
+    // The path is not option-parsed after the colon, and `rev` was checked above.
+    let spec = format!("{rev}:{path}");
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(&work_tree).args(["show", &spec]);
+    // `run` returns stdout bytes as-is and is already `None` on a non-zero exit
+    // or a timeout, which is exactly the missing-file contract here.
+    run(cmd)
+}
+
 /// Work-tree root for `dir`, or `None` when git cannot answer.
 pub fn work_tree(dir: &Path) -> Option<PathBuf> {
     if !dir.is_dir() {
@@ -465,6 +517,11 @@ mod tests {
     }
 
     fn write(dir: &Path, name: &str, body: &str) {
+        write_bytes(dir, name, body.as_bytes());
+    }
+
+    /// Byte-exact writer: `write` would force the body through UTF-8.
+    fn write_bytes(dir: &Path, name: &str, body: &[u8]) {
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create parent");
@@ -779,5 +836,75 @@ mod tests {
         init_repo(tmp.path());
         // No commit yet: `git log` fails, which is `None`, not an error.
         assert!(collect(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn file_at_returns_the_exact_bytes_including_non_utf8() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("file-at-bytes");
+        init_repo(tmp.path());
+
+        // Korean text proves the UTF-8 path is untouched; the `0xFF 0xFE` pair
+        // is not valid UTF-8 at all, so any `String` round trip would lose it.
+        let mut body = "// 한국어 주석\nfn main() {}\n".as_bytes().to_vec();
+        body.extend_from_slice(&[0xFF, 0xFE]);
+        body.extend_from_slice(b"\n");
+        write_bytes(tmp.path(), "a.rs", &body);
+        commit(tmp.path(), "first");
+
+        let got = file_at(tmp.path(), "HEAD", "a.rs").expect("a.rs at HEAD");
+        assert_eq!(got, body, "bytes must round-trip exactly");
+        assert!(
+            String::from_utf8(got.clone()).is_err(),
+            "the 0xFF 0xFE pair is not valid UTF-8"
+        );
+        assert!(got.windows(9).any(|w| w == "한국어".as_bytes()));
+    }
+
+    #[test]
+    fn file_at_is_none_for_a_missing_path_or_revision() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("file-at-missing");
+        init_repo(tmp.path());
+        write(tmp.path(), "a.rs", "1\n");
+        commit(tmp.path(), "first");
+
+        assert!(file_at(tmp.path(), "HEAD", "missing.rs").is_none());
+        assert!(file_at(tmp.path(), "no-such-rev", "a.rs").is_none());
+        assert!(file_at(tmp.path(), "HEAD", "a.rs").is_some());
+    }
+
+    #[test]
+    fn file_at_rejects_bad_arguments_before_spawning() {
+        let tmp = TempDir::new("file-at-bad-args");
+        // No repository and possibly no git: the rejection happens on the
+        // arguments alone, so these are `None` regardless.
+        assert!(file_at(tmp.path(), "-pwn", "a.rs").is_none());
+        assert!(file_at(tmp.path(), "", "a.rs").is_none());
+        assert!(file_at(tmp.path(), "HEAD", "").is_none());
+        assert!(file_at(tmp.path(), "HEAD", "a\0b.rs").is_none());
+        assert!(file_at(tmp.path(), "HE AD", "a.rs").is_none());
+    }
+
+    #[test]
+    fn file_at_reads_a_path_in_a_subdirectory() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("file-at-sub");
+        init_repo(tmp.path());
+        write(tmp.path(), "sub/a.rs", "sub\n");
+        commit(tmp.path(), "first");
+
+        assert_eq!(
+            file_at(tmp.path(), "HEAD", "sub/a.rs").as_deref(),
+            Some(b"sub\n".as_slice())
+        );
+        // The path is work-tree relative, not relative to some invocation dir.
+        assert!(file_at(tmp.path(), "HEAD", "a.rs").is_none());
     }
 }

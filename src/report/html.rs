@@ -103,6 +103,9 @@ pub fn render(report: &Report) -> String {
     if let Some(trend) = &report.trend {
         out.push_str(&trend_section(trend));
     }
+    if let Some(baseline) = &report.baseline {
+        out.push_str(&baseline_section(baseline));
+    }
 
     // --- CCN per function (primary) ---------------------------------------
     out.push_str("<section class=\"panel\" aria-labelledby=\"ccn-h\">\n");
@@ -366,6 +369,64 @@ fn trend_section(trend: &crate::history::Trend) -> String {
         );
     }
 
+    s.push_str("</section>\n");
+    s
+}
+
+/// Functions that became complex since the baseline revision.
+fn baseline_section(baseline: &crate::baseline::Baseline) -> String {
+    use crate::baseline::Kind;
+
+    let added = baseline
+        .changes
+        .iter()
+        .filter(|c| c.kind == Kind::Added)
+        .count();
+    let worsened = baseline.changes.len() - added;
+
+    let mut s = String::from("<section class=\"panel\" aria-labelledby=\"baseline-h\">\n");
+    let _ = writeln!(
+        s,
+        "<h2 id=\"baseline-h\">Since {}</h2>",
+        escape_html(&baseline.rev)
+    );
+    let _ = writeln!(
+        s,
+        "<p class=\"sub\">{} added above CCN {} · {} worsened · {} files compared, {} skipped.</p>",
+        added, baseline.threshold, worsened, baseline.files_compared, baseline.files_skipped
+    );
+
+    if baseline.changes.is_empty() {
+        s.push_str("<p class=\"empty\">no function became more complex</p>\n");
+    } else {
+        s.push_str("<div class=\"table-wrap\"><table>\n<thead><tr>");
+        for heading in ["change", "function", "CCN", "was", "location"] {
+            let _ = write!(s, "<th scope=\"col\">{heading}</th>");
+        }
+        s.push_str("</tr></thead>\n<tbody>\n");
+        for change in &baseline.changes {
+            let kind = match change.kind {
+                Kind::Added => "+ added",
+                Kind::Worsened => "~ worsened",
+            };
+            let was = change
+                .base_ccn
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "—".to_string());
+            let _ = writeln!(
+                s,
+                "<tr><td>{}</td><td><code>{}</code></td><td class=\"num\">{}</td>\
+                 <td class=\"num\">{}</td><td><code>{}:{}</code></td></tr>",
+                kind,
+                escape_html(&change.name),
+                change.ccn,
+                was,
+                escape_html(&change.path),
+                change.line
+            );
+        }
+        s.push_str("</tbody></table></div>\n");
+    }
     s.push_str("</section>\n");
     s
 }
@@ -995,6 +1056,7 @@ mod tests {
             hotspots: Vec::new(),
             churn: std::collections::HashMap::new(),
             trend: None,
+            baseline: None,
             bin_spec_version: 1,
             health_experimental: true,
         }

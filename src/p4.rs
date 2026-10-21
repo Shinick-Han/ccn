@@ -17,6 +17,7 @@
 //! p4 opened                                     # pending local edits
 //! p4 changes -m <n> -s submitted -ztag <depot_prefix>...
 //! p4 describe -s -ztag <cl>                     # one per changelist, in parallel
+//! p4 -q print -q <depot>@=<cl>                   # raw contents of one file
 //! ```
 //!
 //! # Line counts are unavailable
@@ -124,6 +125,45 @@ pub fn changed_since(dir: &Path, rev: &str) -> Option<HashSet<String>> {
     }
 
     Some(changed)
+}
+
+/// Raw contents of the scan-root-relative `path` at changelist `rev`.
+///
+/// Only submitted changelists are addressable: `123`, `#123` and `@123` are
+/// accepted, while `opened`, `pending` and `default` return `None` because a
+/// pending edit has no stored revision the server could print. A `path` that is
+/// empty, absolute, contains a NUL, or contains a `..` segment is rejected
+/// before `p4` is spawned, so the request can never name a file outside the
+/// mapped workspace.
+///
+/// The bytes are returned exactly as `p4 print -q` wrote them to stdout, without
+/// decoding or newline translation. Returns `None` when `dir` is not mapped by
+/// `p4 where`, or when `p4` fails or exceeds [`TIMEOUT`].
+/// True when `rev` is a changelist the server knows about.
+pub fn rev_exists(dir: &Path, rev: &str) -> bool {
+    let Some(Rev::Since(cl)) = parse_rev(rev) else {
+        return false;
+    };
+    let spec = format!("@={cl}");
+    run_p4(dir, &["-q", "changes", "-m1", "-s", "submitted", &spec])
+        .is_some_and(|out| !out.trim().is_empty())
+}
+
+pub fn file_at(dir: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
+    let Rev::Since(cl) = parse_rev(rev)? else {
+        // Pending local edits are not revisions on the server.
+        return None;
+    };
+    // Validate the path before `p4 where`: a bad argument must not cost a spawn.
+    let rel = relative_file_path(path)?;
+    let mapping = mapping_for(dir)?;
+    let depot = mapping.depot_file(&rel)?;
+    let spec = format!("{depot}@={cl}");
+    // The leading `-q` is the global quiet flag (informational messages on
+    // stderr, which parsing ignores); `print -q` is the command option that
+    // suppresses the `//depot/...#rev - ...` header line, which would otherwise
+    // be prepended to the captured bytes.
+    run_p4_bytes(dir, &["-q", "print", "-q", &spec])
 }
 
 /// Churn and authorship for the last `max_changes` submitted changelists.
@@ -268,6 +308,47 @@ impl Mapping {
             return None;
         }
         Some(rel.replace('\\', "/"))
+    }
+
+    /// Depot path for the scan-root-relative `path`, or `None` when the path is
+    /// not a plain relative path inside the workspace (see
+    /// [`relative_file_path`]).
+    ///
+    /// This is the inverse of [`Mapping::relative`]: the scan root's own offset
+    /// inside the local root is re-applied, so a workspace whose scan root is
+    /// `proj/src` turns `a.rs` back into `//depot/proj/src/a.rs`.
+    fn depot_file(&self, path: &str) -> Option<String> {
+        if self.depot_prefix.is_empty() {
+            return None;
+        }
+        let rel = relative_file_path(path)?;
+        Some(format!("{}/{}{}", self.depot_prefix, self.scan_prefix, rel))
+    }
+}
+
+/// Normalise a scan-root-relative file argument: `\` becomes `/`, `.` and empty
+/// segments are dropped, and `None` is returned for an empty or absolute path, a
+/// `..` segment or an embedded NUL.
+///
+/// A leading separator is rejected rather than stripped because silently
+/// reinterpreting `/etc/passwd` as a path under the workspace would answer a
+/// different question than the caller asked.
+fn relative_file_path(path: &str) -> Option<String> {
+    if path.contains('\0') || path.starts_with('/') || path.starts_with('\\') {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in path.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => return None,
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
     }
 }
 
@@ -571,10 +652,16 @@ fn has_workspace_hint(dir: &Path) -> bool {
 /// Run `p4 <args>` with `dir` as the working directory (so `P4CONFIG` discovery
 /// matches the tree being scanned) and return stdout on success.
 fn run_p4(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = run_p4_bytes(dir, args)?;
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// [`run_p4`] without the UTF-8 lossy conversion, for callers that need the
+/// exact bytes (`p4 print` may return binary files).
+fn run_p4_bytes(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut cmd = Command::new("p4");
     cmd.current_dir(dir).args(args);
-    let out = run(cmd)?;
-    Some(String::from_utf8_lossy(&out).into_owned())
+    run(cmd)
 }
 
 /// Spawn `cmd`, capture stdout and stderr to EOF, and give up after [`TIMEOUT`].
@@ -845,5 +932,89 @@ no files to display
         assert!(collect_history(tmp.path(), 10).is_none());
         assert!(collect_history(&tmp.path().join("missing"), 10).is_none());
         assert!(changed_since(&tmp.path().join("missing"), "123").is_none());
+    }
+
+    #[test]
+    fn file_at_accepts_only_numeric_changelists_without_a_server() {
+        let tmp = TempDir::new("file-rev");
+        // `opened`/`pending`/`default` name no server-side revision, and the
+        // malformed values are rejected before any `p4` process exists.
+        for bad in [
+            "", "opened", "OPENED", "pending", "default", "-x", "12 3", "#", "@", "12a",
+        ] {
+            assert!(
+                file_at(tmp.path(), bad, "src/a.rs").is_none(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn file_at_rejects_paths_that_leave_the_workspace() {
+        let tmp = TempDir::new("file-path");
+        for bad in [
+            "../outside.rs",
+            "src/../../outside.rs",
+            "..\\outside.rs",
+            "src/a\0.rs",
+            "",
+            "/etc/passwd",
+        ] {
+            assert!(
+                file_at(tmp.path(), "123", bad).is_none(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn depot_file_joins_the_mapping_with_the_relative_path() {
+        let out = "//depot/proj/... //client/proj/... C:\\ws\\proj\\...\n";
+        let mapping = parse_where(out, Path::new("C:\\ws\\proj")).expect("mapping");
+
+        assert_eq!(
+            mapping.depot_file("src/a.rs").as_deref(),
+            Some("//depot/proj/src/a.rs")
+        );
+        assert_eq!(
+            mapping.depot_file("a.rs").as_deref(),
+            Some("//depot/proj/a.rs")
+        );
+        assert_eq!(
+            mapping.depot_file("src\\a.rs").as_deref(),
+            Some("//depot/proj/src/a.rs"),
+            "Windows separators are normalised"
+        );
+
+        assert_eq!(mapping.depot_file("../outside.rs"), None);
+        assert_eq!(mapping.depot_file("src/../../outside.rs"), None);
+        assert_eq!(mapping.depot_file("/abs/outside.rs"), None);
+        assert_eq!(mapping.depot_file(""), None);
+    }
+
+    #[test]
+    fn depot_file_reapplies_the_scan_root_offset() {
+        let out = "//depot/proj/... //client/proj/... C:\\ws\\proj\\...\n";
+        let mapping =
+            parse_where(out, Path::new("C:\\ws\\proj\\src")).expect("mapping for a subdirectory");
+
+        assert_eq!(
+            mapping.depot_file("a.rs").as_deref(),
+            Some("//depot/proj/src/a.rs")
+        );
+        // Round-trip with the depot→scan-relative direction.
+        assert_eq!(
+            mapping.relative("//depot/proj/src/a.rs").as_deref(),
+            Some("a.rs")
+        );
+    }
+
+    #[test]
+    fn file_at_returns_none_without_a_server_and_never_panics() {
+        let tmp = TempDir::new("file-at");
+        // With no workspace (and possibly no `p4` on PATH) the lookup fails; the
+        // only hard requirement is that it does not panic or hang.
+        assert!(file_at(tmp.path(), "123", "src/a.rs").is_none());
+        assert!(file_at(&tmp.path().join("missing"), "123", "src/a.rs").is_none());
     }
 }

@@ -60,6 +60,17 @@ pub struct Cli {
     #[arg(long)]
     pub hotspots: bool,
 
+    /// Compare function complexity against a revision.
+    ///
+    /// Git: `HEAD~1`, a branch, or a commit. Perforce: a changelist number.
+    /// Reports functions that were added above CCN 10 or crossed it.
+    #[arg(long, value_name = "REV")]
+    pub baseline: Option<String>,
+
+    /// Exit with code 1 when `--baseline` finds added or worsened functions.
+    #[arg(long, requires = "baseline")]
+    pub fail_on_new: bool,
+
     /// How many commits/changelists the history pass considers.
     ///
     /// Git can scan a year cheaply; Perforce needs one `p4 describe` per

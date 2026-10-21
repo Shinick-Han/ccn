@@ -180,6 +180,45 @@ fn trend_block(report: &Report, sep: &str, ci: bool) -> String {
     out
 }
 
+/// Functions that became complex since `--baseline`, right under the trend.
+fn baseline_block(report: &Report, sep: &str) -> String {
+    let Some(baseline) = &report.baseline else {
+        return String::new();
+    };
+    let added = baseline
+        .changes
+        .iter()
+        .filter(|c| c.kind == crate::baseline::Kind::Added)
+        .count();
+    let worsened = baseline.changes.len() - added;
+
+    let mut out = format!(
+        "  Since {}  {added} new >{} {sep} {worsened} worsened   ({} files compared, {} skipped)\n",
+        baseline.rev, baseline.threshold, baseline.files_compared, baseline.files_skipped,
+    );
+    for change in baseline.changes.iter().take(5) {
+        let marker = match change.kind {
+            crate::baseline::Kind::Added => '+',
+            crate::baseline::Kind::Worsened => '~',
+        };
+        let was = match change.base_ccn {
+            Some(previous) => format!(" (was {previous})"),
+            None => String::new(),
+        };
+        let mut line = format!(
+            "    {marker} {:<4} {:<24} {}:{}{}",
+            change.ccn, change.name, change.path, change.line, was
+        );
+        if line.chars().count() > 100 {
+            line = line.chars().take(97).collect::<String>();
+            line.push_str("...");
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 fn health_block(report: &Report, sep: &str) -> String {
     let mut out = String::new();
     let Some(health) = &report.health else {
@@ -403,6 +442,7 @@ pub fn render(result: &ScanResult, report: &Report, opts: &TerminalOptions) -> S
     // Directly under the score it compares: history is a gloss on health, not
     // a separate section.
     out.push_str(&trend_block(report, sep, opts.ci));
+    out.push_str(&baseline_block(report, sep));
     out.push_str(&stats_block(report, sep));
 
     if opts.distributions {

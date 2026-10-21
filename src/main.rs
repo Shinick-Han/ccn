@@ -15,6 +15,7 @@ fn main() {
     };
 
     let mut report = ccn::metrics::build_with(&result, cli.hotspots, cli.history_limit);
+    let mut exit_code = 0;
 
     // Record the snapshot only after the report exists: the trend compares
     // reports, not scans. A failed write must not fail the command.
@@ -23,6 +24,24 @@ fn main() {
         match ccn::history::record(&result.root, snapshot) {
             Ok(trend) => report.trend = trend,
             Err(e) => eprintln!("ccn: could not write history: {e}"),
+        }
+    }
+
+    // Baseline needs the VCS to hand back the old file contents.
+    if let Some(rev) = &cli.baseline {
+        match ccn::vcs::detect(Path::new(&result.root)) {
+            Some(backend) => {
+                // Validate once: a typo must not make every file look "new".
+                if !ccn::vcs::rev_exists(Path::new(&result.root), backend, rev) {
+                    eprintln!("ccn: cannot resolve baseline revision {rev}");
+                    std::process::exit(2);
+                }
+                report.baseline = Some(ccn::baseline::collect(&result, backend, rev, 10));
+            }
+            None => {
+                eprintln!("ccn: --baseline needs a git or Perforce workspace");
+                std::process::exit(2);
+            }
         }
     }
 
@@ -36,8 +55,6 @@ fn main() {
         }
         return;
     }
-
-    let mut exit_code = 0;
 
     if cli.tui {
         match ccn::tui::run(&result, &report) {
@@ -92,6 +109,21 @@ fn main() {
                     cli.report.display()
                 );
                 exit_code = 2;
+            }
+        }
+    }
+
+    // PR gate: any function that became complex in this change.
+    if cli.fail_on_new {
+        if let Some(baseline) = &report.baseline {
+            if ccn::baseline::has_changes(baseline) {
+                eprintln!(
+                    "ccn: {} function(s) added or worsened above CCN {} since {}",
+                    baseline.changes.len(),
+                    baseline.threshold,
+                    baseline.rev
+                );
+                exit_code = 1;
             }
         }
     }

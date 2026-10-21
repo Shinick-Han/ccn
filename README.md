@@ -14,6 +14,8 @@ $ ccn . --hotspots            # + git churn ranking and ownership (runs git log)
 $ ccn . --trend               # compare with the previous scan, and record this one
 $ ccn . --since HEAD~1        # only files changed since a revision (git)
 $ ccn . --since 123456        # ...or a Perforce changelist (or `opened`)
+$ ccn . --baseline HEAD~1     # functions that became complex since a revision
+$ ccn . --baseline HEAD~1 --fail-on-new   # PR gate: exit 1 if any
 $ ccn . --no-cache            # ignore the per-file cache
 $ ccn . --fail-over 2.0       # exit 1 if >2% of functions exceed CCN 10
 $ ccn . --lang rust,python    # restrict to languages
@@ -120,6 +122,29 @@ semantic colour, the CCN bar ramp, and risk-coloured `max CCN` values.
   full-repo score. Deleted files are skipped; untracked files are not included.
 - **`--hotspots`** now also reports the top author per hotspot (`alice +2`) from
   the same single `git log` pass.
+
+## PR baseline
+
+```powershell
+ccn . --baseline origin/main --fail-on-new
+```
+
+Compares every measured function against its counterpart at the revision and
+reports only the delta:
+
+```
+Since origin/main  1 new >10 · 0 worsened   (66 files compared, 0 skipped)
+  + 11   parse_changes            src/p4.rs:510
+  ~ 18   handle                   src/api.ts:88 (was 9)
+```
+
+- **added**: the function did not exist at the revision and is already over 10.
+- **worsened**: it existed at or under 10 and crossed it.
+- matching is by function name, consuming duplicates in source order.
+- a file that did not exist at the revision counts as an empty baseline, so its
+  complex functions are reported as added. The revision itself is validated
+  first, so a typo cannot turn the whole repository into "new".
+- P4: `--baseline 123456` uses `p4 print @=123456` for the old contents.
 
 ## Perforce
 

@@ -3,6 +3,7 @@
 //! M0 scope: LOC collection and the JSON contract. CCN parsing and the report
 //! land in M1/M2; see `docs/PLAN.md`.
 
+pub mod baseline;
 pub mod cache;
 pub mod ccn;
 pub mod cli;

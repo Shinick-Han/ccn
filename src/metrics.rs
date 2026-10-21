@@ -386,6 +386,8 @@ pub struct Report {
     /// Comparison with the previous recorded snapshot. `None` without
     /// `--trend`, or on the first recorded run.
     pub trend: Option<crate::history::Trend>,
+    /// Functions that became complex since `--baseline <rev>`.
+    pub baseline: Option<crate::baseline::Baseline>,
     pub bin_spec_version: u32,
     /// Grade bands are not calibrated yet; the report must say so.
     pub health_experimental: bool,
@@ -673,6 +675,7 @@ pub fn build_with(result: &ScanResult, enable_history: bool, history_limit: u32)
         hotspots,
         churn,
         trend: None,
+        baseline: None,
         bin_spec_version: BIN_SPEC_VERSION,
         health_experimental: HEALTH_EXPERIMENTAL,
     }
