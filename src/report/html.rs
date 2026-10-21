@@ -771,34 +771,49 @@ this.textContent='theme: '+n;this.setAttribute('aria-pressed',n==='dark'?'true':
 
 const CSS: &str = r##":root{
   color-scheme: light;
-  --bg:#faf9f7; --panel:#ffffff; --fg:#1c1e21; --muted:#5b6167; --rule:#d9dcdf;
-  --accent:#1f5c99; --focus:#0b57a4; --chip:#e9f0f8; --chip-fg:#173f66; --grid:#e3e6e9;
-  --good:#1c6b3f; --bad:#a8321f;
-  --s0:#16456f; --s1:#26679a; --s2:#3f86bb; --s3:#6ea6cf; --s4:#9dc3e0; --s5:#c9dff0;
-  --bar-files:#2a6699; --bar-lines:#8fb9d9;
+  /* Paper-light take on AuraDeck's cyber-pastel: lilac paper, mauve/sky rules. */
+  --bg:#f8f6fc; --panel:#ffffff; --fg:#22213a; --muted:#5f5e78; --rule:#e4e0ef;
+  --accent:#6b4fb8; --focus:#4b3596; --chip:#f1ebfb; --chip-fg:#46307f; --grid:#ece8f6;
+  --good:#2f7d5b; --bad:#b23a48;
+  --mauve:#8b6fd6; --sky:#3a9db3;
+  --glow1:rgba(139,111,214,.11); --glow2:rgba(58,157,179,.09);
+  --s0:#6c5ce0; --s1:#7b6bea; --s2:#5e86d8; --s3:#2f8fa6; --s4:#9a6b00; --s5:#b3263b;
+  --bar-files:#6c5ce0; --bar-lines:#3a9db3;
+  --grade-a:#2f7d5b; --grade-b:#35599e; --grade-c:#8a6100; --grade-d:#a24c22; --grade-e:#a8263c;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme="light"]){
     color-scheme: dark;
-    --bg:#121517; --panel:#181c1f; --fg:#e7eaec; --muted:#a2aab2; --rule:#2f353b;
-    --accent:#8ab8e0; --focus:#8ec5ff; --chip:#1e2b36; --chip-fg:#cfe3f2; --grid:#262c31;
-    --good:#7fc79b; --bad:#ef9a8b;
-    --s0:#2b5f8a; --s1:#3f7cad; --s2:#5b9bca; --s3:#7db4da; --s4:#a3cbe6; --s5:#cbe2f2;
-    --bar-files:#5b9bca; --bar-lines:#a8cbe4;
+    /* AuraDeck "Aura Cyber-Pastel": canvas 12121C, card 1A1B2A, mauve -> sky. */
+    --bg:#12121c; --panel:#1a1b2a; --fg:#cdd4f4; --muted:#8b92b8; --rule:#2e3150;
+    --accent:#cba6f7; --focus:#89dceb; --chip:#2d2f46; --chip-fg:#e9e2ff; --grid:#2a2d48;
+    --good:#a6e3a1; --bad:#f38ba8;
+    --mauve:#cba6f7; --sky:#89dceb;
+    --glow1:rgba(203,166,247,.10); --glow2:rgba(137,220,235,.08);
+    --s0:#7c6cf2; --s1:#8b7bf5; --s2:#7fa6f7; --s3:#89dceb; --s4:#f9e2af; --s5:#f38ba8;
+    --bar-files:#8b7bf5; --bar-lines:#89dceb;
+    --grade-a:#a6e3a1; --grade-b:#89b4fa; --grade-c:#f9e2af; --grade-d:#fab387; --grade-e:#f38ba8;
   }
 }
 :root[data-theme="dark"]{
   color-scheme: dark;
-  --bg:#121517; --panel:#181c1f; --fg:#e7eaec; --muted:#a2aab2; --rule:#2f353b;
-  --accent:#8ab8e0; --focus:#8ec5ff; --chip:#1e2b36; --chip-fg:#cfe3f2; --grid:#262c31;
-  --good:#7fc79b; --bad:#ef9a8b;
-  --s0:#2b5f8a; --s1:#3f7cad; --s2:#5b9bca; --s3:#7db4da; --s4:#a3cbe6; --s5:#cbe2f2;
-  --bar-files:#5b9bca; --bar-lines:#a8cbe4;
+  --bg:#12121c; --panel:#1a1b2a; --fg:#cdd4f4; --muted:#8b92b8; --rule:#2e3150;
+  --accent:#cba6f7; --focus:#89dceb; --chip:#2d2f46; --chip-fg:#e9e2ff; --grid:#2a2d48;
+  --good:#a6e3a1; --bad:#f38ba8;
+  --mauve:#cba6f7; --sky:#89dceb;
+  --glow1:rgba(203,166,247,.10); --glow2:rgba(137,220,235,.08);
+  --s0:#7c6cf2; --s1:#8b7bf5; --s2:#7fa6f7; --s3:#89dceb; --s4:#f9e2af; --s5:#f38ba8;
+  --bar-files:#8b7bf5; --bar-lines:#89dceb;
+  --grade-a:#a6e3a1; --grade-b:#89b4fa; --grade-c:#f9e2af; --grade-d:#fab387; --grade-e:#f38ba8;
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{
-  margin:0; background:var(--bg); color:var(--fg);
+  margin:0; color:var(--fg);
+  background:
+    radial-gradient(900px 480px at 8% -12%, var(--glow1), transparent 62%),
+    radial-gradient(820px 460px at 100% 0%, var(--glow2), transparent 58%),
+    var(--bg);
   font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   transition:background-color .12s ease,color .12s ease;
 }
@@ -811,6 +826,17 @@ body{
 .score strong{font-size:2.6rem;line-height:1;color:var(--fg);font-variant-numeric:tabular-nums}
 .score.none{font-size:1.5rem;font-weight:600;color:var(--fg)}
 .grade{font-weight:600;font-size:.9rem;padding:.25rem .55rem;border-radius:999px;background:var(--chip);color:var(--chip-fg);border:1px solid var(--rule)}
+.grade-a{color:var(--grade-a);border-color:var(--grade-a)}
+.grade-b{color:var(--grade-b);border-color:var(--grade-b)}
+.grade-c{color:var(--grade-c);border-color:var(--grade-c)}
+.grade-d{color:var(--grade-d);border-color:var(--grade-d)}
+.grade-e{color:var(--grade-e);border-color:var(--grade-e)}
+/* Aura-style hairline: a frozen slice of the deck's border wave. */
+.verdict,.panel,.trend{position:relative;overflow:hidden}
+.verdict::before,.panel::before,.trend::before{
+  content:"";position:absolute;left:0;right:0;top:0;height:2px;
+  background:linear-gradient(90deg,var(--mauve),var(--sky));opacity:.85;
+}
 .theme-toggle{margin-left:auto;font:inherit;font-size:.8rem;padding:.35rem .6rem;border-radius:8px;border:1px solid var(--rule);background:transparent;color:var(--muted);cursor:pointer}
 .theme-toggle:hover{color:var(--fg)}
 .theme-toggle:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
@@ -832,7 +858,8 @@ body{
 .delta.good{color:var(--good)}
 .delta.bad{color:var(--bad)}
 .panel{background:var(--panel);border:1px solid var(--rule);border-radius:12px;padding:18px 20px;margin-top:16px}
-.panel h2{margin:0 0 .25rem;font-size:1.05rem}
+.panel h2{margin:0 0 .35rem;font-size:.78rem;font-weight:600;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);display:flex;align-items:center;gap:.5rem}
+.panel h2::before{content:"";flex:none;width:14px;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--mauve),var(--sky))}
 .sub{margin:0 0 .75rem;color:var(--muted);font-size:.85rem}
 .caption{margin:.75rem 0 0;color:var(--muted);font-size:.8rem}
 .empty{margin:.5rem 0 0;padding:1.5rem;text-align:center;color:var(--muted);border:1px dashed var(--rule);border-radius:8px;font-size:.9rem}

@@ -90,6 +90,17 @@ Read both numbers; neither is "the" answer.
 - The calibration corpus is one developer's machine, mostly TypeScript.
   Treat absolute grades as indicative outside that population.
 
+## Look
+
+The report borrows its visual language from AuraDeck's "cyber-pastel" palette
+(Catppuccin Mocha base): `#12121C` canvas, `#1A1B2A` cards, a mauve-to-sky
+hairline on every panel, uppercase micro-labels, tabular numerals, and semantic
+grade colours (mint / sky / gold / peach / coral). The bar ramp runs
+mauve → blue → teal, with the over-limit bins in gold and coral.
+
+Everything is static: no animation, no shader loop, no external font or image.
+The light theme is the same palette on lilac paper, not an inversion.
+
 ## Trend, diff mode, ownership
 
 - **`--trend`** appends a small snapshot to `<repo>/.ccn/history.json` (max 200)
