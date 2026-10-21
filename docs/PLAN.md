@@ -785,5 +785,39 @@ ccn . --trend  (2회 연속)
 clippy -D warnings, fmt clean
 ```
 
+---
+
+## 21. 스냅샷 버전 정합성 (2026-10-21, 0.3.1)
+
+트렌드의 마지막 구멍을 막았다: **버전이 다른 두 스냅샷을 조용히 비교하던 문제.**
+
+### 변경
+
+- `Snapshot`에 `tool_version`, `bin_spec_version`, `health_calibration` 추가
+  (`#[serde(default)]`라 0.3.0 이전 스냅샷도 읽힌다).
+- `Trend::compatibility_warning()`:
+  - 세 필드가 모두 비어 있으면 `previous snapshot predates versioning; deltas are not comparable`
+  - 도구 버전이 다르면 `ccn 0.2.0 -> 0.3.1`
+  - bin spec이 다르면 `bin spec v1 -> v2`
+  - 보정 코퍼스가 다르면 `grade calibration changed`
+- 터미널: 트렌드 줄 아래 `  !      ...` (100컬럼 제한)
+- HTML: `.trend-warn` 문단, `role="status"`
+
+### 실측
+
+0.3.0이 기록한 이력(버전 필드 없음)에 0.3.1로 `--trend`:
+
+```
+Trend  health 97.0 → 97.0 (+0.1) · >10 1.8% → 1.8% (0.0pp)
+!      previous snapshot predates versioning; deltas are not comparable
+```
+
+다음 실행(둘 다 0.3.1)에서는 경고가 사라진다.
+
+### 남은 것
+
+- 스냅샷에 git HEAD를 넣으면 "어느 커밋에서 측정했는지"까지 추적할 수 있다.
+- `--since` 결과는 여전히 트렌드에 기록하지 않는다(의도).
+
 
 

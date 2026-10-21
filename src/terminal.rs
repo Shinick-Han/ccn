@@ -165,6 +165,18 @@ fn trend_block(report: &Report, sep: &str, ci: bool) -> String {
         signed(delta),
     ));
     out.push('\n');
+
+    // A delta across a tool/band change is still printed (the numbers are real
+    // measurements), but the reader is told not to compare them.
+    if let Some(warning) = trend.compatibility_warning() {
+        let mut line = format!("  !      {warning}");
+        if line.chars().count() > 100 {
+            line = line.chars().take(97).collect::<String>();
+            line.push_str("...");
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
     out
 }
 
@@ -892,6 +904,9 @@ mod tests {
             pct_over_10,
             ccn_max: 0,
             files_measured: 0,
+            tool_version: "0.3.0".to_string(),
+            bin_spec_version: 1,
+            health_calibration: "test".to_string(),
         };
         Trend {
             // Same letter on both sides unless a test builds its own pair.
@@ -914,6 +929,9 @@ mod tests {
                 pct_over_10: 5.3,
                 ccn_max: 1,
                 files_measured: 1,
+                tool_version: "0.3.0".to_string(),
+                bin_spec_version: 1,
+                health_calibration: "test".to_string(),
             },
             current: crate::history::Snapshot {
                 at_unix: 0,
@@ -924,6 +942,9 @@ mod tests {
                 pct_over_10: 5.8,
                 ccn_max: 1,
                 files_measured: 1,
+                tool_version: "0.3.0".to_string(),
+                bin_spec_version: 1,
+                health_calibration: "test".to_string(),
             },
         });
         let out = render(&result, &report, &TerminalOptions::default());
@@ -1120,5 +1141,25 @@ mod tests {
             "--top 0 hides the block:\n{none}"
         );
         assert!(!none.contains("0.87"), "{none}");
+    }
+
+    #[test]
+    fn a_version_change_produces_a_comparability_warning() {
+        use crate::history::{Snapshot, Trend};
+
+        let result = sample_scan();
+        let mut report = build(&result);
+        let mut previous = Snapshot::from_report(&report);
+        previous.tool_version = "0.2.0".to_string();
+        let current = Snapshot::from_report(&report);
+        report.trend = Some(Trend { previous, current });
+
+        let out = render(&result, &report, &TerminalOptions::default());
+        assert!(out.contains("!      not comparable"), "{out}");
+        assert!(out.contains("ccn 0.2.0 -> "), "{out}");
+        // Still under the 100-column budget.
+        for line in out.lines() {
+            assert!(line.chars().count() <= 100, "too wide: {line}");
+        }
     }
 }

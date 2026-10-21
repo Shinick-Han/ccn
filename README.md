@@ -95,6 +95,9 @@ Read both numbers; neither is "the" answer.
 - **`--trend`** appends a small snapshot to `<repo>/.ccn/history.json` (max 200)
   and prints the delta from the previous run: health, grade, `%func >10`. The
   file is plain JSON so it diffs cleanly in a commit. First run has no trend.
+  Snapshots record the tool version, bin-spec version and grade calibration;
+  when they differ from the previous snapshot the report prints
+  `! not comparable: ...` instead of silently comparing apples to oranges.
 - **`--since <rev>`** analyses only the files changed between `<rev>` and the
   working tree (`git diff --name-only --diff-filter=ACMR`). The resulting health
   describes **the change**, not the repository — do not compare it to a

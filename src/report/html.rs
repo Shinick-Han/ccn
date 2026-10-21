@@ -350,7 +350,17 @@ fn trend_section(trend: &crate::history::Trend) -> String {
         }
     }
 
-    s.push_str("</p>\n</section>\n");
+    s.push_str("</p>\n");
+
+    if let Some(warning) = trend.compatibility_warning() {
+        let _ = writeln!(
+            s,
+            "<p class=\"trend-warn\" role=\"status\">! {}</p>",
+            escape_html(&warning)
+        );
+    }
+
+    s.push_str("</section>\n");
     s
 }
 
@@ -813,6 +823,7 @@ body{
 .trend h2{margin:0;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
 .trend-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:.35rem 1.6rem;margin:.35rem 0 0;font-size:.9rem}
 .trend-item{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:.35rem;font-variant-numeric:tabular-nums}
+.trend-warn{margin:.35rem 0 0;font-size:.82rem;color:var(--bad)}
 .trend-label{color:var(--muted)}
 .trend-num{font-weight:600}
 .trend-arrow{color:var(--muted)}
@@ -1094,6 +1105,9 @@ mod tests {
             pct_over_10,
             ccn_max: 0,
             files_measured: 0,
+            tool_version: "0.3.0".to_string(),
+            bin_spec_version: 1,
+            health_calibration: "test".to_string(),
         }
     }
 
@@ -1280,5 +1294,21 @@ mod tests {
             .collect();
         let html = render(&r);
         assert!(html.len() < 120_000, "rendered {} bytes", html.len());
+    }
+
+    #[test]
+    fn a_version_change_renders_a_comparability_warning() {
+        use crate::history::{Snapshot, Trend};
+
+        let mut r = sample();
+        let mut previous = Snapshot::from_report(&r);
+        previous.tool_version = "0.2.0".to_string();
+        let current = Snapshot::from_report(&r);
+        r.trend = Some(Trend { previous, current });
+
+        let html = render(&r);
+        assert!(html.contains("class=\"trend-warn\""), "{html}");
+        assert!(html.contains("not comparable"), "{html}");
+        assert!(html.contains("ccn 0.2.0"), "{html}");
     }
 }

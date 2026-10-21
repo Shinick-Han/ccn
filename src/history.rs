@@ -29,7 +29,7 @@ const HISTORY_CAP: usize = 200;
 
 /// One scan's headline numbers. Deliberately small: this file is committed and
 /// read by humans, so it must stay reviewable in a diff.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Unix seconds.
     pub at_unix: u64,
@@ -40,6 +40,14 @@ pub struct Snapshot {
     pub pct_over_10: f64,
     pub ccn_max: u32,
     pub files_measured: usize,
+    /// Version identity. A delta across a tool/band change is not a code
+    /// change, so the trend must be able to say "not comparable".
+    #[serde(default)]
+    pub tool_version: String,
+    #[serde(default)]
+    pub bin_spec_version: u32,
+    #[serde(default)]
+    pub health_calibration: String,
 }
 
 impl Snapshot {
@@ -64,6 +72,9 @@ impl Snapshot {
             pct_over_10: report.health.as_ref().map_or(0.0, |h| h.pct_over_10),
             ccn_max: report.stats.ccn_max,
             files_measured: report.files_measured,
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            bin_spec_version: report.bin_spec_version,
+            health_calibration: crate::metrics::HEALTH_CALIBRATION.to_string(),
         }
     }
 }
@@ -85,6 +96,59 @@ impl Trend {
 
     pub fn pct_over_10_delta(&self) -> f64 {
         self.current.pct_over_10 - self.previous.pct_over_10
+    }
+
+    /// `Some(reason)` when the two snapshots were produced by different tools,
+    /// bin specs or grade calibrations.
+    ///
+    /// A delta across a version change is not a code change. The report still
+    /// shows the numbers (they are real measurements), but it must say that the
+    /// comparison is not apples-to-apples.
+    pub fn compatibility_warning(&self) -> Option<String> {
+        let previous = &self.previous;
+        let current = &self.current;
+
+        // Snapshots written before 0.3.1 have none of these fields.
+        if previous.tool_version.is_empty()
+            && previous.bin_spec_version == 0
+            && previous.health_calibration.is_empty()
+        {
+            return Some(
+                "previous snapshot predates versioning; deltas are not comparable".to_string(),
+            );
+        }
+
+        let mut differences: Vec<String> = Vec::new();
+        if previous.tool_version != current.tool_version {
+            differences.push(format!(
+                "ccn {} -> {}",
+                known(&previous.tool_version),
+                known(&current.tool_version)
+            ));
+        }
+        if previous.bin_spec_version != current.bin_spec_version {
+            differences.push(format!(
+                "bin spec v{} -> v{}",
+                previous.bin_spec_version, current.bin_spec_version
+            ));
+        }
+        if previous.health_calibration != current.health_calibration {
+            differences.push("grade calibration changed".to_string());
+        }
+
+        if differences.is_empty() {
+            None
+        } else {
+            Some(format!("not comparable: {}", differences.join("; ")))
+        }
+    }
+}
+
+fn known(version: &str) -> &str {
+    if version.is_empty() {
+        "unknown"
+    } else {
+        version
     }
 }
 
@@ -203,6 +267,9 @@ mod tests {
             pct_over_10,
             ccn_max: 20,
             files_measured: 4,
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            bin_spec_version: crate::metrics::BIN_SPEC_VERSION,
+            health_calibration: crate::metrics::HEALTH_CALIBRATION.to_string(),
         }
     }
 
@@ -342,6 +409,62 @@ mod tests {
         };
         assert_eq!(trend.health_delta(), None);
         assert!((trend.pct_over_10_delta() - (-1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn same_versions_have_no_compatibility_warning() {
+        let trend = Trend {
+            previous: snap(1, 90.0, 5.0),
+            current: snap(2, 91.0, 4.0),
+        };
+        assert_eq!(trend.compatibility_warning(), None);
+    }
+
+    #[test]
+    fn a_tool_version_change_is_reported() {
+        let mut previous = snap(1, 90.0, 5.0);
+        previous.tool_version = "0.2.0".to_string();
+        let trend = Trend {
+            previous,
+            current: snap(2, 91.0, 4.0),
+        };
+        let warning = trend.compatibility_warning().expect("warning");
+        assert!(warning.contains("ccn 0.2.0 -> "), "{warning}");
+    }
+
+    #[test]
+    fn a_bin_spec_or_calibration_change_is_reported() {
+        let mut previous = snap(1, 90.0, 5.0);
+        previous.bin_spec_version = 0;
+        let trend = Trend {
+            previous,
+            current: snap(2, 91.0, 4.0),
+        };
+        let warning = trend.compatibility_warning().expect("warning");
+        assert!(warning.contains("bin spec v0 -> v1"), "{warning}");
+
+        let mut previous = snap(1, 90.0, 5.0);
+        previous.health_calibration = "older corpus".to_string();
+        let trend = Trend {
+            previous,
+            current: snap(2, 91.0, 4.0),
+        };
+        let warning = trend.compatibility_warning().expect("warning");
+        assert!(warning.contains("grade calibration changed"), "{warning}");
+    }
+
+    #[test]
+    fn a_pre_versioning_snapshot_is_called_out() {
+        let mut previous = snap(1, 90.0, 5.0);
+        previous.tool_version.clear();
+        previous.bin_spec_version = 0;
+        previous.health_calibration.clear();
+        let trend = Trend {
+            previous,
+            current: snap(2, 91.0, 4.0),
+        };
+        let warning = trend.compatibility_warning().expect("warning");
+        assert!(warning.contains("predates versioning"), "{warning}");
     }
 
     #[test]
