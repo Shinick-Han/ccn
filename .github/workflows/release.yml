@@ -10,23 +10,91 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: build ${{ matrix.asset }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            asset: ccn-linux-x64
-            artifact: ccn
-          - os: macos-latest
-            asset: ccn-macos-x64
-            artifact: ccn
-          - os: windows-latest
-            asset: ccn-windows-x64.exe
-            artifact: ccn.exe
+  linux:
+    name: build ccn-linux-x64 (AlmaLinux 8 / glibc 2.28)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      # Building on ubuntu-latest links against glibc 2.39, which AlmaLinux 8
+      # (glibc 2.28) cannot run. Build inside the oldest supported userland
+      # instead, then assert the symbol versions before publishing.
+      - name: Build in AlmaLinux 8
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/src" -w /src almalinux:8 bash -c '
+            set -euo pipefail
+            dnf install -y --setopt=install_weak_deps=False \
+              gcc gcc-c++ make git tar gzip curl ca-certificates binutils
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+            cargo build --release --locked
+          '
+
+      - name: Assert glibc <= 2.28
+        run: |
+          set -euo pipefail
+          binary=target/release/ccn
+          test -f "$binary"
+          max=$(objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n1)
+          echo "highest glibc symbol: ${max:-none}"
+          if [[ -z "${max:-}" ]]; then
+            echo "::error::could not read GLIBC symbol versions"
+            exit 1
+          fi
+          newest=$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -n1)
+          if [[ "$newest" != "GLIBC_2.28" ]]; then
+            echo "::error::$binary requires $max, newer than AlmaLinux 8's GLIBC_2.28"
+            exit 1
+          fi
+
+      - name: Stage asset
+        run: |
+          set -euo pipefail
+          cp target/release/ccn ccn-linux-x64
+          chmod +x ccn-linux-x64
+          ls -l ccn-linux-x64
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ccn-linux-x64
+          generate_release_notes: true
+
+  macos:
+    name: build ccn-macos-x64
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Stage asset
+        run: |
+          set -euo pipefail
+          cp target/release/ccn ccn-macos-x64
+          chmod +x ccn-macos-x64
+          ls -l ccn-macos-x64
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ccn-macos-x64
+          generate_release_notes: true
+
+  windows:
+    name: build ccn-windows-x64.exe
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,19 +112,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          src="target/release/${{ matrix.artifact }}"
-          if [[ ! -f "$src" ]]; then
-            echo "::error::missing build output: $src"
-            exit 1
-          fi
-          cp "$src" "${{ matrix.asset }}"
-          if [[ "${RUNNER_OS}" != "Windows" ]]; then
-            chmod +x "${{ matrix.asset }}"
-          fi
-          ls -l "${{ matrix.asset }}"
+          cp target/release/ccn.exe ccn-windows-x64.exe
+          ls -l ccn-windows-x64.exe
 
       - name: Publish release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: ccn-windows-x64.exe
           generate_release_notes: true

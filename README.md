@@ -3,6 +3,9 @@
 Repository code-health scanner: per-file LOC, per-function CCN, distribution
 histograms, trend and hotspot ranking. One static binary, ten languages.
 
+Linux builds target **glibc 2.28** (AlmaLinux/RHEL 8), and there is **no Python
+dependency** at build or run time — see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+
 ```console
 $ ccn .                       # terminal summary + ccn-report.html
 $ ccn . --tui                 # interactive dashboard (browse all files)
