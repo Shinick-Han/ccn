@@ -130,17 +130,35 @@ fn with_parser<R>(lang: Lang, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
 /// a tree that recovered *no* function at all is an error, so the dispatcher
 /// can try a sibling grammar (or the heuristic) without losing a whole file to
 /// one broken line.
-pub fn analyze_file(_path: &Path, source: &[u8], lang: Lang) -> Result<FileCcn, CcnError> {
+pub fn analyze_file(path: &Path, source: &[u8], lang: Lang) -> Result<FileCcn, CcnError> {
+    analyze_file_diagnostic(path, source, lang).map(|(file, _had_error)| file)
+}
+
+/// Same as [`analyze_file`], plus whether the tree contained `ERROR`/`MISSING`
+/// nodes.
+///
+/// The dispatcher needs that signal to decide whether a sibling grammar is
+/// worth trying: `CcnTier::BestEffort` alone says the parse was degraded, but
+/// not whether a different grammar would have been clean. Callers that only
+/// want the measurement should keep using [`analyze_file`].
+pub fn analyze_file_diagnostic(
+    _path: &Path,
+    source: &[u8],
+    lang: Lang,
+) -> Result<(FileCcn, bool), CcnError> {
     let table = rules::rules(lang);
     let tier = rules::tier(lang);
 
     // Whitespace-only input still parses, but skipping it keeps the empty-file
     // path free of grammar quirks (notably Python indentation errors).
     if source.iter().all(u8::is_ascii_whitespace) {
-        return Ok(FileCcn {
-            tier,
-            functions: Vec::new(),
-        });
+        return Ok((
+            FileCcn {
+                tier,
+                functions: Vec::new(),
+            },
+            false,
+        ));
     }
 
     let parsed =
@@ -173,10 +191,11 @@ pub fn analyze_file(_path: &Path, source: &[u8], lang: Lang) -> Result<FileCcn, 
             .then_with(|| b.end_line.cmp(&a.end_line))
     });
 
-    Ok(FileCcn {
+    let file = FileCcn {
         tier: if has_error { CcnTier::BestEffort } else { tier },
         functions,
-    })
+    };
+    Ok((file, has_error))
 }
 
 /// Read-only context shared by the two iterative walkers.

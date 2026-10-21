@@ -18,12 +18,32 @@
 //!
 //! Every entry point returns `None` rather than an error when the backend
 //! cannot answer: history is an optional enrichment, and the scan degrades to
-//! the CCN/LOC-only view.
+//! the CCN/LOC-only view. The one exception is [`file_at`], whose result is a
+//! [`FileAt`]: for a baseline, "the file did not exist then" and "the file
+//! could not be read" must never be confused.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::git::{self, Churn};
+
+/// Outcome of reading one path at one revision.
+///
+/// The three states exist because a baseline comparison must distinguish a
+/// genuinely new file ([`FileAt::Absent`], an empty baseline) from an
+/// infrastructure failure ([`FileAt::Unavailable`] — permission denied, an
+/// expired ticket, a timeout, an unknown revision, a truncated/errored VCS
+/// response). Folding the latter into "absent" fabricates `Added` findings from
+/// unreadable data.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileAt {
+    /// The bytes of the path at that revision.
+    Found(Vec<u8>),
+    /// The path has no revision at that revision (added later / deleted).
+    Absent,
+    /// Could not determine: permission, timeout, unknown rev, VCS/transport error.
+    Unavailable,
+}
 
 /// Which version-control system a scan is reading history from.
 /// Default window for history collection: the last 300 commits/changelists.
@@ -111,13 +131,19 @@ pub fn rev_exists(scan_root: &Path, backend: Backend, rev: &str) -> bool {
 
 /// File contents at `rev`, keyed by a scan-root-relative path.
 ///
-/// `None` means "no baseline version" (a file added after `rev`, or a rev the
-/// backend cannot read), which the baseline comparison treats as an empty file.
-pub fn file_at(scan_root: &Path, backend: Backend, rev: &str, path: &str) -> Option<Vec<u8>> {
+/// [`FileAt::Absent`] means "no baseline version" (a file added after `rev`, or
+/// deleted at it), which the baseline comparison treats as an empty file.
+/// [`FileAt::Unavailable`] means the backend could not answer — the caller must
+/// not invent a baseline from it.
+pub fn file_at(scan_root: &Path, backend: Backend, rev: &str, path: &str) -> FileAt {
     match backend {
         Backend::Git => {
-            let work_tree = git::work_tree(scan_root)?;
-            let prefix = git_prefix(scan_root, &work_tree)?;
+            let Some(work_tree) = git::work_tree(scan_root) else {
+                return FileAt::Unavailable;
+            };
+            let Some(prefix) = git_prefix(scan_root, &work_tree) else {
+                return FileAt::Unavailable;
+            };
             git::file_at(scan_root, rev, &format!("{prefix}{path}"))
         }
         // P4 keys are already scan-root-relative.

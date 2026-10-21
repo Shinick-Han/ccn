@@ -50,6 +50,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::vcs::FileAt;
+
 /// Per-file change history, in the last 365 days.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Churn {
@@ -264,38 +266,121 @@ pub fn rev_exists(repo: &Path, rev: &str) -> bool {
 
 /// Raw contents of `path` (work-tree-relative, `/`-separated) at `rev`.
 ///
-/// Returns `None` when the rev/path does not exist or git fails.
+/// The three [`FileAt`] states are kept distinct on purpose:
+///
+/// - `git show <rev>:<path>` succeeds -> [`FileAt::Found`] with the bytes as-is;
+/// - it fails, the commit exists, and `git cat-file -e <rev>:<path>` reports
+///   the object is absent -> [`FileAt::Absent`] (the file did not exist at
+///   `rev`: added later, deleted, or never committed);
+/// - anything else (`cat-file` says the object exists even though `show`
+///   failed, the revision itself does not resolve, git is missing, a spawn
+///   fails, or either command exceeds [`TIMEOUT`]) -> [`FileAt::Unavailable`].
+///
+/// The last rule is the point: a permission error, a corrupt object read or a
+/// timeout must not be reported as "the file was new", because that turns
+/// unreadable history into fabricated `Added` findings.
 ///
 /// The bytes are returned **verbatim** — no `String` round trip, no lossy
 /// decoding — because baseline files may be non-UTF-8 (a Latin-1 source file, or
 /// any binary asset a language's "source" glob happens to match) and a baseline
 /// has to reproduce the old file exactly to be compared against the new one.
 ///
-/// A file that was added after `rev` is legitimately absent there, and an unknown
-/// revision is indistinguishable from a missing path at this layer: both are
-/// `None`, the same "could not ask" degrade the rest of this module uses.
-///
-/// `rev` is rejected before spawning when it is empty, starts with `-` (an
-/// option smuggled into the argument list) or contains whitespace (which could
-/// split the `rev:path` operand). `path` is rejected when empty or containing a
-/// NUL, which `Command` could not pass to the child at all.
-pub fn file_at(repo: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
+/// `rev` is rejected when it is empty, starts with `-` (an option smuggled into
+/// the argument list) or contains whitespace (which could split the `rev:path`
+/// operand). `path` is rejected when it is not a plain existing-tree path: empty,
+/// containing a NUL, absolute, a Windows separator, or a `..`/empty segment.
+/// A rejected argument is `Unavailable`, never `Absent`, because no question was
+/// actually asked of the repository.
+pub fn file_at(repo: &Path, rev: &str, path: &str) -> FileAt {
     if rev.is_empty() || rev.starts_with('-') || rev.contains(char::is_whitespace) {
-        return None;
+        return FileAt::Unavailable;
     }
-    if path.is_empty() || path.contains('\0') {
-        return None;
+    if !is_tree_path(path) {
+        return FileAt::Unavailable;
     }
-    let work_tree = work_tree(repo)?;
+    let Some(work_tree) = work_tree(repo) else {
+        return FileAt::Unavailable;
+    };
 
     // One operand, not two: `git show <rev>:<path>` is the whole specification.
     // The path is not option-parsed after the colon, and `rev` was checked above.
     let spec = format!("{rev}:{path}");
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(&work_tree).args(["show", &spec]);
-    // `run` returns stdout bytes as-is and is already `None` on a non-zero exit
-    // or a timeout, which is exactly the missing-file contract here.
-    run(cmd)
+    match run_exit(cmd) {
+        Some((true, bytes)) => FileAt::Found(bytes),
+        // `show` ran and failed: absence or a read failure, decided below.
+        Some((false, _)) => classify_failed_show(&work_tree, rev, &spec),
+        // Spawn failure or timeout: we did not learn anything.
+        None => FileAt::Unavailable,
+    }
+}
+
+/// Decide whether a failed `git show <rev>:<path>` was absence or a failure.
+///
+/// Runs only after `show` exited non-zero:
+///
+/// 1. the revision must resolve to a commit, else nothing can be said
+///    ([`FileAt::Unavailable`], not "the file did not exist yet");
+/// 2. the commit's **tree** must be readable, which separates "the object store
+///    answered and the path is not in that tree" from "the repository could not
+///    be read at all";
+/// 3. with both proven, `git cat-file -e <rev>:<path>` returning non-zero is the
+///    tree saying the path has no object there -> [`FileAt::Absent`]. If it
+///    returns zero the object exists and only `show` failed (e.g. an unreadable
+///    blob), which is [`FileAt::Unavailable`].
+///
+/// Exit status only: no diagnostic text is parsed, so a localized or reworded
+/// git message cannot flip a failure into "absent".
+fn classify_failed_show(work_tree: &Path, rev: &str, spec: &str) -> FileAt {
+    if !commit_exists(work_tree, rev) {
+        return FileAt::Unavailable;
+    }
+    if !object_exists(work_tree, &format!("{rev}^{{tree}}")) {
+        return FileAt::Unavailable;
+    }
+    match cat_file_exists(work_tree, spec) {
+        Some(true) => FileAt::Unavailable,
+        Some(false) => FileAt::Absent,
+        None => FileAt::Unavailable,
+    }
+}
+
+/// True when `rev` resolves to a commit in `work_tree`.
+fn commit_exists(work_tree: &Path, rev: &str) -> bool {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(work_tree)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("{rev}^{{commit}}"));
+    matches!(run_exit(cmd), Some((true, _)))
+}
+
+/// `git cat-file -e <spec>`: `Some(true)` if the object is there,
+/// `Some(false)` if git ran and said no, `None` if git could not run.
+fn object_exists(work_tree: &Path, spec: &str) -> bool {
+    cat_file_exists(work_tree, spec).unwrap_or(false)
+}
+
+fn cat_file_exists(work_tree: &Path, spec: &str) -> Option<bool> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(work_tree).args(["cat-file", "-e", spec]);
+    run_exit(cmd).map(|(success, _)| success)
+}
+
+/// True when `path` is a plain relative path that can exist in a git tree.
+///
+/// Backslashes are rejected: every caller passes `/`-separated tree paths, and a
+/// Windows-looking path would silently address a different (or no) object.
+fn is_tree_path(path: &str) -> bool {
+    if path.is_empty() || path.contains('\0') || path.contains('\\') {
+        return false;
+    }
+    if path.starts_with('/') {
+        return false;
+    }
+    path.split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 /// Work-tree root for `dir`, or `None` when git cannot answer.
@@ -454,7 +539,15 @@ fn count(field: &str) -> u32 {
 /// than a scan without hotspots. The reader thread is joined in every path so
 /// no thread is leaked, and stdout is drained past the capture cap so a killed
 /// or oversized child never blocks on a full pipe.
-fn run(mut cmd: Command) -> Option<Vec<u8>> {
+fn run(cmd: Command) -> Option<Vec<u8>> {
+    let (success, out) = run_exit(cmd)?;
+    success.then_some(out)
+}
+
+/// [`run`] that keeps the child's exit status. `None` still means the command
+/// could not run at all (spawn failure, I/O error or [`TIMEOUT`]), which callers
+/// must not confuse with "ran and failed".
+fn run_exit(mut cmd: Command) -> Option<(bool, Vec<u8>)> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -485,7 +578,7 @@ fn run(mut cmd: Command) -> Option<Vec<u8>> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let out = reader.join().ok()?;
-                return status.success().then_some(out);
+                return Some((status.success(), out));
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -968,7 +1061,10 @@ mod tests {
         write_bytes(tmp.path(), "a.rs", &body);
         commit(tmp.path(), "first");
 
-        let got = file_at(tmp.path(), "HEAD", "a.rs").expect("a.rs at HEAD");
+        let got = match file_at(tmp.path(), "HEAD", "a.rs") {
+            FileAt::Found(bytes) => bytes,
+            other => panic!("a.rs at HEAD must be Found, got {other:?}"),
+        };
         assert_eq!(got, body, "bytes must round-trip exactly");
         assert!(
             String::from_utf8(got.clone()).is_err(),
@@ -978,30 +1074,89 @@ mod tests {
     }
 
     #[test]
-    fn file_at_is_none_for_a_missing_path_or_revision() {
+    fn file_at_is_found_at_the_old_rev_and_absent_after_deletion() {
         if !git_works() {
             return;
         }
-        let tmp = TempDir::new("file-at-missing");
+        let tmp = TempDir::new("file-at-deleted");
+        init_repo(tmp.path());
+        write(tmp.path(), "a.rs", "old\n");
+        commit(tmp.path(), "first");
+        fs::remove_file(tmp.path().join("a.rs")).expect("delete a.rs");
+        commit(tmp.path(), "remove a.rs");
+
+        assert_eq!(
+            file_at(tmp.path(), "HEAD", "a.rs"),
+            FileAt::Absent,
+            "a deleted file has no revision at HEAD, which is absence, not a failure"
+        );
+        assert_eq!(
+            file_at(tmp.path(), "HEAD~1", "a.rs"),
+            FileAt::Found(b"old\n".to_vec()),
+            "the deleted file is still readable at the revision that had it"
+        );
+    }
+
+    #[test]
+    fn file_at_is_absent_for_a_file_added_after_the_rev() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("file-at-added-later");
+        init_repo(tmp.path());
+        write(tmp.path(), "old.rs", "1\n");
+        commit(tmp.path(), "first");
+        write(tmp.path(), "new.rs", "2\n");
+        commit(tmp.path(), "add new.rs");
+
+        assert_eq!(
+            file_at(tmp.path(), "HEAD~1", "new.rs"),
+            FileAt::Absent,
+            "added after HEAD~1: an empty baseline, not a read failure"
+        );
+        assert_eq!(
+            file_at(tmp.path(), "HEAD", "new.rs"),
+            FileAt::Found(b"2\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn file_at_is_unavailable_for_an_unknown_revision_or_path_outside_the_tree() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("file-at-unavailable");
         init_repo(tmp.path());
         write(tmp.path(), "a.rs", "1\n");
         commit(tmp.path(), "first");
 
-        assert!(file_at(tmp.path(), "HEAD", "missing.rs").is_none());
-        assert!(file_at(tmp.path(), "no-such-rev", "a.rs").is_none());
-        assert!(file_at(tmp.path(), "HEAD", "a.rs").is_some());
+        assert_eq!(
+            file_at(tmp.path(), "no-such-rev-4c1f", "a.rs"),
+            FileAt::Unavailable,
+            "an unknown revision says nothing about the path, so it is not Absent"
+        );
+        for outside in ["../outside.rs", "/etc/passwd", "..\\outside.rs", "a//b.rs"] {
+            assert_eq!(
+                file_at(tmp.path(), "HEAD", outside),
+                FileAt::Unavailable,
+                "{outside:?} must not be answered as Absent"
+            );
+        }
+        // A path that never existed in a resolvable commit is still genuine
+        // absence: the question was well formed and the tree answered it.
+        assert_eq!(file_at(tmp.path(), "HEAD", "missing.rs"), FileAt::Absent);
     }
 
     #[test]
     fn file_at_rejects_bad_arguments_before_spawning() {
         let tmp = TempDir::new("file-at-bad-args");
         // No repository and possibly no git: the rejection happens on the
-        // arguments alone, so these are `None` regardless.
-        assert!(file_at(tmp.path(), "-pwn", "a.rs").is_none());
-        assert!(file_at(tmp.path(), "", "a.rs").is_none());
-        assert!(file_at(tmp.path(), "HEAD", "").is_none());
-        assert!(file_at(tmp.path(), "HEAD", "a\0b.rs").is_none());
-        assert!(file_at(tmp.path(), "HE AD", "a.rs").is_none());
+        // arguments alone, so these are `Unavailable` regardless.
+        assert_eq!(file_at(tmp.path(), "-pwn", "a.rs"), FileAt::Unavailable);
+        assert_eq!(file_at(tmp.path(), "", "a.rs"), FileAt::Unavailable);
+        assert_eq!(file_at(tmp.path(), "HEAD", ""), FileAt::Unavailable);
+        assert_eq!(file_at(tmp.path(), "HEAD", "a\0b.rs"), FileAt::Unavailable);
+        assert_eq!(file_at(tmp.path(), "HE AD", "a.rs"), FileAt::Unavailable);
     }
 
     #[test]
@@ -1015,10 +1170,10 @@ mod tests {
         commit(tmp.path(), "first");
 
         assert_eq!(
-            file_at(tmp.path(), "HEAD", "sub/a.rs").as_deref(),
-            Some(b"sub\n".as_slice())
+            file_at(tmp.path(), "HEAD", "sub/a.rs"),
+            FileAt::Found(b"sub\n".to_vec())
         );
         // The path is work-tree relative, not relative to some invocation dir.
-        assert!(file_at(tmp.path(), "HEAD", "a.rs").is_none());
+        assert_eq!(file_at(tmp.path(), "HEAD", "a.rs"), FileAt::Absent);
     }
 }

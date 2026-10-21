@@ -176,6 +176,9 @@ pub struct Health {
     pub over_50: usize,
     /// Share of measured functions above 10, in percent.
     pub pct_over_10: f64,
+    /// Functions in best-effort files. Excluded from the score, reported so a
+    /// reader knows how much of the repository was not cleanly measured.
+    pub best_effort_functions: usize,
 }
 
 /// Grade bands, calibrated on 11 real repositories (2026-10-21).
@@ -220,6 +223,7 @@ pub fn health(files: &[FileLoc]) -> Option<Health> {
     let mut over_10 = 0usize;
     let mut over_20 = 0usize;
     let mut over_50 = 0usize;
+    let mut best_effort_functions = 0usize;
 
     for file in files {
         if file.is_excluded() {
@@ -227,6 +231,12 @@ pub fn health(files: &[FileLoc]) -> Option<Health> {
         }
         let Some(summary) = &file.ccn else { continue };
         if summary.tier == CcnTier::Heuristic {
+            continue;
+        }
+        // A degraded parse is a guess about the function's edges. Scoring it as
+        // exact would let a broken build flatter (or damn) the repository.
+        if summary.tier == CcnTier::BestEffort {
+            best_effort_functions += summary.functions;
             continue;
         }
         for f in &summary.detail {
@@ -258,6 +268,7 @@ pub fn health(files: &[FileLoc]) -> Option<Health> {
         over_20,
         over_50,
         pct_over_10: over_10 as f64 * 100.0 / functions as f64,
+        best_effort_functions,
     })
 }
 
@@ -333,6 +344,9 @@ pub struct RepoStats {
     /// Share of all code lines contained in the largest 10% of files, percent.
     pub loc_share_top10pct: f64,
     pub files_exact: usize,
+    /// Files that parsed only partially; their functions are charted but not
+    /// scored.
+    pub files_best_effort: usize,
     pub files_heuristic: usize,
     pub files_without_ccn: usize,
     /// Files dropped from every statistic above: generated first, then
@@ -504,6 +518,7 @@ pub fn build_with(result: &ScanResult, enable_history: bool, history_limit: u32)
     let mut ccn_file_values: Vec<u32> = Vec::new();
     let mut ccn_file_weights: Vec<u32> = Vec::new();
     let mut files_exact = 0usize;
+    let mut files_best_effort = 0usize;
     let mut files_heuristic = 0usize;
     let mut files_without_ccn = 0usize;
 
@@ -512,7 +527,11 @@ pub fn build_with(result: &ScanResult, enable_history: bool, history_limit: u32)
             None => files_without_ccn += 1,
             Some(summary) if summary.tier == CcnTier::Heuristic => files_heuristic += 1,
             Some(summary) => {
-                files_exact += 1;
+                if summary.tier == CcnTier::BestEffort {
+                    files_best_effort += 1;
+                } else {
+                    files_exact += 1;
+                }
                 if summary.max > 0 {
                     ccn_file_values.push(summary.max);
                     ccn_file_weights.push(file.loc as u32);
@@ -551,6 +570,7 @@ pub fn build_with(result: &ScanResult, enable_history: bool, history_limit: u32)
             top_loc as f64 * 100.0 / all_loc as f64
         },
         files_exact,
+        files_best_effort,
         files_heuristic,
         files_without_ccn,
         files_excluded_generated: result.files_excluded.generated,
@@ -750,6 +770,29 @@ mod tests {
             languages: Vec::new(),
             files,
         }
+    }
+
+    #[test]
+    fn best_effort_files_are_reported_but_never_scored_as_exact() {
+        let exact = file("src/a.ts", 100, vec![func(5, 100)]);
+        let mut degraded = file("src/b.h", 100, vec![func(80, 100)]);
+        degraded.ccn = Some(CcnSummary::from_file(FileCcn {
+            tier: CcnTier::BestEffort,
+            functions: vec![func(80, 100)],
+        }));
+
+        let report = build(&scan_result(vec![exact, degraded]));
+
+        assert_eq!(report.stats.files_exact, 1);
+        assert_eq!(report.stats.files_best_effort, 1);
+        let h = report.health.as_ref().expect("one exact function");
+        assert_eq!(h.functions, 1, "degraded function must not be scored");
+        assert_eq!(h.best_effort_functions, 1);
+        assert_eq!(h.score, 100.0, "the CCN-80 guess must not lower the score");
+        assert_eq!(
+            report.stats.functions_total, 2,
+            "both files still feed the charted histogram"
+        );
     }
 
     #[test]

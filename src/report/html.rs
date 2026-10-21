@@ -122,8 +122,9 @@ pub fn render(report: &Report) -> String {
     }
     let _ = writeln!(
         out,
-        "<p class=\"caption\">functions measured: {} · heuristic files excluded: {}</p>",
+        "<p class=\"caption\">functions measured: {} · best-effort files (charted, not scored): {} · heuristic files excluded: {}</p>",
         int(report.stats.functions_total as u64),
+        int(report.stats.files_best_effort as u64),
         int(report.stats.files_heuristic as u64)
     );
     out.push_str("</section>\n");
@@ -198,9 +199,11 @@ pub fn render(report: &Report) -> String {
     );
     let _ = writeln!(
         out,
-        "<p>tiers: exact {} files · heuristic {} files · no CCN {} files. \
-         Heuristic file-level counts never enter the function histogram.</p>",
+        "<p>tiers: exact {} files · best-effort {} files · heuristic {} files · no CCN {} files. \
+         Best-effort and heuristic counts never enter the health score; best-effort functions \
+         are charted but a degraded parse is not trusted as an exact measurement.</p>",
         int(report.stats.files_exact as u64),
+        int(report.stats.files_best_effort as u64),
         int(report.stats.files_heuristic as u64),
         int(report.stats.files_without_ccn as u64)
     );
@@ -390,11 +393,25 @@ fn baseline_section(baseline: &crate::baseline::Baseline) -> String {
         "<h2 id=\"baseline-h\">Since {}</h2>",
         escape_html(&baseline.rev)
     );
-    let _ = writeln!(
-        s,
-        "<p class=\"sub\">{} added above CCN {} · {} worsened · {} files compared, {} skipped.</p>",
+    let mut sub = format!(
+        "<p class=\"sub\">{} added above CCN {} · {} worsened · {} files compared, {} skipped",
         added, baseline.threshold, worsened, baseline.files_compared, baseline.files_skipped
     );
+    if baseline.files_unavailable > 0 {
+        let _ = write!(sub, ", {} unavailable", baseline.files_unavailable);
+    }
+    sub.push_str(".</p>\n");
+    s.push_str(&sub);
+    if baseline
+        .changes
+        .iter()
+        .any(|c| c.tier == crate::ccn::types::CcnTier::BestEffort)
+    {
+        s.push_str(
+            "<p class=\"sub\">Best-effort findings come from files with syntax errors; \
+             they are advisory, not exact measurements.</p>\n",
+        );
+    }
 
     if baseline.changes.is_empty() {
         s.push_str("<p class=\"empty\">no function became more complex</p>\n");
@@ -408,6 +425,11 @@ fn baseline_section(baseline: &crate::baseline::Baseline) -> String {
             let kind = match change.kind {
                 Kind::Added => "+ added",
                 Kind::Worsened => "~ worsened",
+            };
+            let kind = if change.tier == crate::ccn::types::CcnTier::BestEffort {
+                format!("{kind} · best-effort")
+            } else {
+                kind.to_string()
             };
             let was = change
                 .base_ccn
@@ -1002,6 +1024,7 @@ mod tests {
             functions_total: 12,
             loc_share_top10pct: 61.0,
             files_exact: 11,
+            files_best_effort: 0,
             files_heuristic: 2,
             files_without_ccn: 1,
             files_excluded_generated: 0,
@@ -1047,6 +1070,7 @@ mod tests {
                 over_20: 2,
                 over_50: 1,
                 pct_over_10: 25.0,
+                best_effort_functions: 0,
             }),
             stats: stats(),
             top: vec![row("src/parser/grammar.ts", 0.62)],

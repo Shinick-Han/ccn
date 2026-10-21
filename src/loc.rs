@@ -86,6 +86,13 @@ pub struct ScanOptions {
     pub include_generated: bool,
     /// Disable the persistent per-file cache (always parse every file).
     pub no_cache: bool,
+    /// Re-read every cache hit and recompute its content digest, re-parsing on
+    /// a mismatch.
+    ///
+    /// The default warm path trusts `(mtime, size)`. A writer that preserves
+    /// both can defeat that, so gates and NFS checkouts should pay for this
+    /// full read instead (see `cache.rs`).
+    pub verify_cache: bool,
     /// Only analyse files changed since this git revision.
     pub since: Option<String>,
 }
@@ -102,6 +109,7 @@ impl Default for ScanOptions {
             no_ccn: false,
             include_generated: false,
             no_cache: false,
+            verify_cache: false,
             since: None,
         }
     }
@@ -201,9 +209,11 @@ fn lang_allowed(opts: &ScanOptions, lang: tokei::LanguageType) -> bool {
 /// skipped, and the CCN pass treats an unreadable file as "no CCN".
 ///
 /// Two modes share one walk:
-/// - **cold**: parse LOC with tokei's per-file parser, read the bytes once for
-///   CCN and generated-file markers, then store everything in the cache;
-/// - **warm**: a stat per file and one cache lookup. No read, no AST.
+/// - **cold**: read the file once, count LOC and CCN from the same bytes, then
+///   store the record in the cache;
+/// - **warm**: a stat per file and one cache lookup. No read, no AST — except
+///   with [`ScanOptions::verify_cache`], which reads each hit to check its
+///   digest.
 pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
     let target = canonical_root(&opts.root)?;
 
@@ -248,11 +258,9 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
         crate::cache::Cache::default()
     };
     let load_elapsed = load_started.elapsed();
-    let mut next = crate::cache::Cache {
-        version: crate::cache::CACHE_VERSION,
-        root: root_display.clone(),
-        entries: std::collections::HashMap::new(),
-    };
+    // Every measured file lands here, hit or miss, so a warm run reproduces
+    // the loaded map exactly and can be left untouched.
+    let mut next = crate::cache::Cache::new(root_display.clone());
 
     let classify_exclusions = !opts.include_generated;
 
@@ -295,12 +303,10 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
     }
 
     let mut files: Vec<FileLoc> = Vec::with_capacity(resolved.len());
-    let mut dirty = false;
     for item in resolved.into_iter().flatten() {
         let (loc, entry) = item;
         if let Some(entry) = entry {
             next.insert(loc.path.clone(), entry);
-            dirty = true;
         }
         files.push(loc);
     }
@@ -310,8 +316,10 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
     // Rewriting a multi-megabyte cache on a fully-cached run would cost more
-    // than the parse it saves, so only write when a file was added or changed.
-    if use_cache && (dirty || old.len() != next.len()) {
+    // than the parse it saves. The map comparison is the whole condition: a
+    // warm run carries every hit forward unchanged, so `next == old`; an added,
+    // edited or deleted file changes it and is persisted.
+    if use_cache && next.entries != old.entries {
         // A failed cache write must never fail the scan; the next run is simply
         // cold again.
         let _ = next.save();
@@ -462,8 +470,12 @@ fn walk_source_files(
     out
 }
 
-/// Resolve one file: cache hit -> cached record; miss -> parse and build a new
-/// cache entry.
+/// Resolve one file: cache hit -> cached record; miss -> read, measure and
+/// build a new cache entry.
+///
+/// The returned entry is the record that belongs in the next cache in *both*
+/// cases. A hit returns a clone of the cached entry, which is what lets a warm
+/// scan reproduce the loaded cache instead of emptying it.
 fn resolve_file(
     abs: &Path,
     lang: tokei::LanguageType,
@@ -474,98 +486,154 @@ fn resolve_file(
     classify_exclusions: bool,
 ) -> Option<(FileLoc, Option<crate::cache::Entry>)> {
     let path = relative_display(root, abs);
-    let fingerprint = crate::cache::Fingerprint::of(abs);
 
-    if let Some(fp) = fingerprint {
+    // One stat up front: this is the entire warm path.
+    let before = crate::cache::Fingerprint::of(abs);
+    let mut verified_bytes: Option<Vec<u8>> = None;
+
+    if let Some(fp) = before {
         if let Some(hit) = old.get(&path, fp) {
-            return Some((
-                FileLoc {
-                    path,
-                    lang: hit.lang.clone(),
-                    loc_total: hit.loc_total,
-                    loc: hit.loc,
-                    comments: hit.comments,
-                    blanks: hit.blanks,
-                    ccn: hit.ccn.clone(),
-                    is_generated: hit.is_generated,
-                    is_vendored: hit.is_vendored,
-                },
-                None,
-            ));
+            if !opts.verify_cache {
+                return Some((file_loc_from_entry(path, hit), Some(hit.clone())));
+            }
+            // Slow but correct: mtime+size said "unchanged", the bytes decide.
+            match std::fs::read(abs) {
+                Ok(bytes) if crate::cache::content_digest(&bytes) == hit.content_hash => {
+                    return Some((file_loc_from_entry(path, hit), Some(hit.clone())));
+                }
+                // Digest mismatch: re-measure from the bytes we already hold.
+                Ok(bytes) => verified_bytes = Some(bytes),
+                // Unreadable now: measuring nothing is honest, and the stale
+                // entry must not survive into the next cache.
+                Err(_) => return None,
+            }
         }
     }
 
-    // `parse` reads the file itself (with encoding detection). The CCN pass
-    // needs the bytes anyway; on a miss that second read is the price of a
-    // correct embedded-language LOC count.
-    let report = lang.parse(abs.to_path_buf(), config).ok()?;
-    let stats = report.stats.summarise();
+    // One read serves LOC, generated-file markers and CCN. Reusing the bytes
+    // also means the digest stored with the entry describes exactly what was
+    // parsed, not a second read that may have seen something else.
+    let bytes = match verified_bytes {
+        Some(bytes) => bytes,
+        None => std::fs::read(abs).ok()?,
+    };
+    let digest = crate::cache::content_digest(&bytes);
+
+    // `LanguageType::parse` decodes BOM-marked UTF-16/UTF-8 before counting;
+    // `tokei_slice` reproduces that for the bytes we already read.
+    let stats = lang
+        .parse_from_slice(tokei_slice(&bytes), config)
+        .summarise();
     let loc_total = stats.lines();
     if loc_total == 0 {
         return None;
     }
 
-    let mut is_generated = false;
-    let mut is_vendored = false;
-    if classify_exclusions {
-        let class = generated::classify(&path, &[]);
-        is_generated = class.is_generated;
-        is_vendored = class.is_vendored;
-    }
+    let class = if classify_exclusions {
+        // Path rules plus generator markers in the head of the same bytes.
+        generated::classify(&path, &bytes)
+    } else {
+        generated::Classification::SOURCE
+    };
 
-    let mut ccn = None;
-    if !opts.no_ccn {
-        // Size check before opening: a minified bundle is the one file class
-        // that makes AST parsing both pointless and unbounded.
-        let size_ok = std::fs::metadata(abs)
-            .map(|m| m.len() <= MAX_CCN_BYTES)
-            .unwrap_or(false);
-        if size_ok {
-            if let Ok(bytes) = std::fs::read(abs) {
-                if classify_exclusions {
-                    // Same bytes as the CCN pass: markers live in the head, and
-                    // this is the only place the file is opened.
-                    let class = generated::classify(&path, &bytes);
-                    is_generated = class.is_generated;
-                    is_vendored = class.is_vendored;
-                }
-                ccn = Some(crate::ccn::analyze_file(
-                    Path::new(&path),
-                    &bytes,
-                    lang.name(),
-                ));
-            }
+    // The size guard keeps AST parsing off minified bundles; the bytes are
+    // already in memory because LOC needed them.
+    let ccn = if !opts.no_ccn && bytes.len() as u64 <= MAX_CCN_BYTES {
+        Some(crate::ccn::analyze_file(
+            Path::new(&path),
+            &bytes,
+            lang.name(),
+        ))
+    } else {
+        None
+    };
+
+    // Fingerprint *after* the read. If the file changed between the stat and
+    // the read, the record is still reported but not cached: the next run is a
+    // miss instead of a hit on bytes we did not measure. Best effort — without
+    // the pre-read stat there is nothing to compare against.
+    let entry = crate::cache::Fingerprint::of(abs).and_then(|after| {
+        if before.is_some_and(|before| before != after) {
+            return None;
         }
-    }
-
-    let lang_name = lang.name().to_string();
-    let entry = fingerprint.map(|fp| crate::cache::Entry {
-        mtime_ns: fp.mtime_ns,
-        size: fp.size,
-        lang: lang_name.clone(),
-        loc_total,
-        loc: stats.code,
-        comments: stats.comments,
-        blanks: stats.blanks,
-        ccn: ccn.clone(),
-        is_generated,
-        is_vendored,
+        Some(crate::cache::Entry {
+            mtime_ns: after.mtime_ns,
+            size: after.size,
+            content_hash: digest,
+            lang: lang.name().to_string(),
+            loc_total,
+            loc: stats.code,
+            comments: stats.comments,
+            blanks: stats.blanks,
+            ccn: ccn.clone(),
+            is_generated: class.is_generated,
+            is_vendored: class.is_vendored,
+        })
     });
 
     Some((
         FileLoc {
             path,
-            lang: lang_name,
+            lang: lang.name().to_string(),
             loc_total,
             loc: stats.code,
             comments: stats.comments,
             blanks: stats.blanks,
             ccn,
-            is_generated,
-            is_vendored,
+            is_generated: class.is_generated,
+            is_vendored: class.is_vendored,
         },
         entry,
     ))
+}
+
+/// Reproduce a cache hit as the report record it stood for.
+fn file_loc_from_entry(path: String, entry: &crate::cache::Entry) -> FileLoc {
+    FileLoc {
+        path,
+        lang: entry.lang.clone(),
+        loc_total: entry.loc_total,
+        loc: entry.loc,
+        comments: entry.comments,
+        blanks: entry.blanks,
+        ccn: entry.ccn.clone(),
+        is_generated: entry.is_generated,
+        is_vendored: entry.is_vendored,
+    }
+}
+
+/// The byte view tokei's own `LanguageType::parse` would have counted.
+///
+/// `parse` streams a file through BOM-sniffing decoding; the scanner now reads
+/// once and calls `parse_from_slice`, so the two encodings that can be
+/// recognised without a guess are handled here: a UTF-8 BOM is stripped and a
+/// UTF-16 BOM is transcoded to UTF-8. Unmarked bytes are passed through exactly
+/// as tree-sitter will see them; legacy single-byte encodings remain a
+/// documented limit of the scanner, not something this function guesses at.
+fn tokei_slice(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return Cow::Borrowed(rest);
+    }
+    let (rest, little_endian) = if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        (rest, true)
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        (rest, false)
+    } else {
+        return Cow::Borrowed(bytes);
+    };
+    let units: Vec<u16> = rest
+        .chunks_exact(2)
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect();
+    Cow::Owned(String::from_utf16_lossy(&units).into_bytes())
 }
 
 /// Render the scan root with forward slashes and without Windows' verbatim
@@ -649,6 +717,192 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// The scan root as [`scan`] reports it.
+    fn root_of(fixture: &Fixture) -> String {
+        display_root(&fixture.dir.canonicalize().expect("canonical fixture root"))
+    }
+
+    /// This test run's cache file for `root`, with the cache directory pinned.
+    fn cache_file(root: &str) -> PathBuf {
+        crate::cache::test_cache_dir();
+        crate::cache::cache_path(root).expect("cache path")
+    }
+
+    /// Start every cache test from a cold cache, whatever earlier runs left.
+    fn forget_cache(root: &str) -> PathBuf {
+        let path = cache_file(root);
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn cached_entries(root: &str) -> usize {
+        crate::cache::Cache::load(root).len()
+    }
+
+    fn file_ccn_max(result: &ScanResult, name: &str) -> u32 {
+        result
+            .files
+            .iter()
+            .find(|f| f.path == name)
+            .unwrap_or_else(|| panic!("missing {name} in {:?}", result.files))
+            .ccn
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} has no CCN summary"))
+            .max
+    }
+
+    /// The reported 2/0/2/0 oscillation: a hit used to return no entry, so a
+    /// warm scan wrote an empty cache. Entry count must now be stable, and a
+    /// fully warm scan must not rewrite the file at all.
+    #[test]
+    fn four_identical_scans_keep_every_cache_entry() {
+        let fixture = Fixture::new("carry-forward");
+        std::fs::write(
+            fixture.dir.join("second.rs"),
+            "fn second() {\n    if true {\n        return;\n    }\n}\n",
+        )
+        .expect("write second fixture");
+
+        let opts = fixture.options(false);
+        let root = root_of(&fixture);
+        let path = forget_cache(&root);
+
+        let first = scan(&opts).expect("cold scan");
+        assert_eq!(first.files_analyzed, 2);
+        assert_eq!(cached_entries(&root), 2, "a cold scan caches every file");
+        let written = std::fs::metadata(&path)
+            .expect("cache file exists")
+            .modified()
+            .expect("cache mtime");
+
+        for run in 1..4 {
+            let result = scan(&opts).expect("warm scan");
+            assert_eq!(result.files_analyzed, 2);
+            assert_eq!(
+                cached_entries(&root),
+                2,
+                "warm run {run} must carry both hits forward, not empty the cache"
+            );
+        }
+
+        let after = std::fs::metadata(&path)
+            .expect("cache file exists")
+            .modified()
+            .expect("cache mtime");
+        assert_eq!(
+            written, after,
+            "a fully warm scan must not rewrite the cache"
+        );
+    }
+
+    /// The cache describes the files that were just measured, so a deletion
+    /// removes its entry instead of leaving a ghost behind.
+    #[test]
+    fn deleting_a_file_drops_its_cache_entry() {
+        let fixture = Fixture::new("delete-entry");
+        std::fs::write(fixture.dir.join("second.rs"), "fn gone() {}\n")
+            .expect("write second fixture");
+
+        let opts = fixture.options(false);
+        let root = root_of(&fixture);
+        forget_cache(&root);
+
+        assert_eq!(scan(&opts).expect("cold scan").files_analyzed, 2);
+        assert_eq!(cached_entries(&root), 2);
+
+        std::fs::remove_file(fixture.dir.join("second.rs")).expect("delete fixture");
+        assert_eq!(scan(&opts).expect("scan after delete").files_analyzed, 1);
+
+        let cache = crate::cache::Cache::load(&root);
+        assert_eq!(cache.len(), 1);
+        assert!(
+            !cache.entries.contains_key("second.rs"),
+            "deleted files must not keep an entry: {:?}",
+            cache.entries
+        );
+    }
+
+    /// The stale-content probe: same byte length, restored nanosecond mtime.
+    /// Without `--verify-cache` the fast key is unchanged and the old number may
+    /// be reused (documented); with it, the file is re-parsed.
+    #[test]
+    fn verify_cache_detects_a_same_size_same_mtime_rewrite() {
+        let fixture = Fixture::new("verify-cache");
+        let file = fixture.dir.join("unit.c");
+        let before = "int f(void) { if(x) { return 1; } return 0; }\n";
+        let after = "int f(void) { /*x*/ { return 1; } return 0; }\n";
+        assert_eq!(before.len(), after.len(), "the probe needs equal sizes");
+        std::fs::write(&file, before).expect("write C fixture");
+
+        let opts = fixture.options(false);
+        let root = root_of(&fixture);
+        forget_cache(&root);
+
+        let cold = scan(&opts).expect("cold scan");
+        assert_eq!(file_ccn_max(&cold, "unit.c"), 2);
+
+        let original = crate::cache::Fingerprint::of(&file).expect("fingerprint");
+        let original_mtime = std::fs::metadata(&file)
+            .expect("stat fixture")
+            .modified()
+            .expect("fixture mtime");
+        std::fs::write(&file, after).expect("rewrite C fixture");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open to restore mtime")
+            .set_modified(original_mtime)
+            .expect("restore original mtime");
+        assert_eq!(
+            crate::cache::Fingerprint::of(&file),
+            Some(original),
+            "the fast key must look unchanged for this to be a stale-cache probe"
+        );
+
+        // Control: the default fast path may reuse the cached record.
+        let fast = scan(&opts).expect("warm scan");
+        assert_eq!(
+            file_ccn_max(&fast, "unit.c"),
+            2,
+            "without --verify-cache, mtime+size is still a hit (documented)"
+        );
+
+        // Verified: the digest decides, and the entry is replaced.
+        let verified_opts = ScanOptions {
+            verify_cache: true,
+            ..fixture.options(false)
+        };
+        let verified = scan(&verified_opts).expect("verified scan");
+        assert_eq!(file_ccn_max(&verified, "unit.c"), 1);
+
+        // The corrected entry is cached, so the fast path agrees afterwards.
+        let afterwards = scan(&opts).expect("warm scan after verification");
+        assert_eq!(file_ccn_max(&afterwards, "unit.c"), 1);
+    }
+
+    /// `--no-cache` proves the measurement and must not write (or reuse) the
+    /// persistent cache.
+    #[test]
+    fn no_cache_writes_no_cache_file() {
+        let fixture = Fixture::new("no-cache-writes");
+        let opts = ScanOptions {
+            no_cache: true,
+            ..fixture.options(false)
+        };
+        let root = root_of(&fixture);
+        let path = forget_cache(&root);
+
+        let result = scan(&opts).expect("scan without cache");
+        assert_eq!(result.files_analyzed, 1);
+        assert!(result.files[0].ccn.is_some(), "measurement still happens");
+        assert!(
+            !path.exists(),
+            "--no-cache must not create {}",
+            path.display()
+        );
+        assert_eq!(cached_entries(&root), 0);
     }
 
     #[test]
@@ -769,22 +1023,21 @@ mod tests {
     }
 
     #[test]
-    fn no_ccn_still_excludes_vendored_trees_by_path() {
-        // Without the CCN pass the file is never read, so markers are invisible;
-        // path rules must still apply or `--no-ccn` would change the LOC
-        // histogram depending on an unrelated flag.
+    fn no_ccn_excludes_generated_and_vendored_files_the_same_way() {
+        // LOC needs the bytes anyway, so `--no-ccn` sees generator markers too:
+        // the flag must not change which files the histogram describes.
         let fixture = fixture_with_exclusions("no-ccn-exclusions");
         let result = scan(&fixture.options(true)).expect("scan fixture");
 
         assert_eq!(result.files_excluded.vendored, 1);
         assert_eq!(
-            result.files_excluded.generated, 0,
-            "markers need the file's bytes; the extension alone is not enough"
+            result.files_excluded.generated, 1,
+            "the single read exposes the marker with or without the CCN pass"
         );
         let report = crate::metrics::build(&result);
         assert_eq!(
-            report.files_measured, 2,
-            "sample.rs and api.gen.ts are measured"
+            report.files_measured, 1,
+            "only sample.rs is first-party source"
         );
     }
 

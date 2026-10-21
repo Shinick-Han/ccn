@@ -5,13 +5,20 @@
 //! *delta*: a function that crossed the threshold, an already-complex function
 //! that got worse, or a brand-new function that is already over it.
 //!
-//! Two rules keep the result honest:
+//! Three rules keep the result honest:
 //!
-//! - A file with no baseline version is treated as **new**: its baseline is
-//!   empty, so its complex functions are reported as added. `files_skipped`
-//!   only counts files whose baseline copy could not be *analysed*.
-//! - Matching is by **name**, consuming duplicates in source order, because a
-//!   `FunctionRef` has no stable identity across revisions.
+//! - A file that is [`crate::vcs::FileAt::Absent`] at `rev` is treated as
+//!   **new**: its baseline is empty, so its complex functions are reported as
+//!   added.
+//! - A file that is [`crate::vcs::FileAt::Unavailable`] (permission, timeout,
+//!   unknown revision, VCS error) is **not** treated as new. It is counted in
+//!   [`Baseline::files_unavailable`], stays out of `files_compared`, and
+//!   produces no findings: unreadable history must never fabricate `Added`.
+//! - `files_skipped` only counts files whose baseline copy *was* read but could
+//!   not be analysed.
+//!
+//! Matching is by **name**, consuming duplicates in source order, because a
+//! `FunctionRef` has no stable identity across revisions.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -21,7 +28,7 @@ use serde::Serialize;
 
 use crate::ccn::types::{CcnSummary, CcnTier, FunctionCcn};
 use crate::model::{FileLoc, ScanResult};
-use crate::vcs::Backend;
+use crate::vcs::{Backend, FileAt};
 
 /// One function in a snapshot, kept minimal so the comparison is cheap.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +38,8 @@ pub struct FunctionRef {
     pub line: usize,
     pub nloc: usize,
     pub max_nesting: u32,
+    /// Parse confidence of the measurement that produced this reference.
+    pub tier: CcnTier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -55,6 +64,9 @@ pub struct Change {
     pub kind: Kind,
     /// Human-readable reasons, e.g. `["ccn +3", "nesting +1", "nloc +42"]`.
     pub reasons: Vec<String>,
+    /// Confidence of the current measurement. `best-effort` means the parser
+    /// recovered from syntax errors; the finding is advisory.
+    pub tier: CcnTier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,6 +75,12 @@ pub struct Baseline {
     pub threshold: u32,
     pub files_compared: usize,
     pub files_skipped: usize,
+    /// Files whose baseline copy could not be read at all (permission, timeout,
+    /// unknown revision, VCS/transport error). They are excluded from
+    /// `files_compared` and produce no findings: an unreadable file is not a
+    /// new file.
+    #[serde(default)]
+    pub files_unavailable: usize,
     /// Sorted by `ccn` descending.
     pub changes: Vec<Change>,
 }
@@ -141,6 +159,7 @@ pub fn compare_file(
                     base_max_nesting: Some(matched.max_nesting),
                     kind: Kind::Worsened,
                     reasons,
+                    tier: function.tier,
                 });
             }
             None => {
@@ -157,6 +176,7 @@ pub fn compare_file(
                         base_max_nesting: None,
                         kind: Kind::Added,
                         reasons: vec!["new function".to_string()],
+                        tier: function.tier,
                     });
                 }
             }
@@ -171,8 +191,10 @@ pub fn compare_file(
 ///
 /// Only files that carry per-function CCN are compared: a missing summary, a
 /// heuristic file-level number or an empty function list has nothing to match
-/// against. Files whose baseline copy cannot be read (added after `rev`, or a
-/// rev the backend cannot answer) are counted in `files_skipped`.
+/// against. A file absent at `rev` is compared against an empty baseline (it is
+/// new). A file whose baseline copy is **unavailable** is counted in
+/// [`Baseline::files_unavailable`] and skipped entirely, so a VCS read failure
+/// can never be reported as added functions.
 ///
 /// The VCS reads dominate the cost and are independent per file, so they run on
 /// rayon's pool. The result is sorted afterwards, which makes the output
@@ -200,11 +222,13 @@ pub fn collect(result: &ScanResult, backend: Backend, rev: &str, threshold: u32)
 
     let mut files_compared = 0usize;
     let mut files_skipped = 0usize;
+    let mut files_unavailable = 0usize;
     let mut changes = Vec::new();
 
     for outcome in outcomes {
         match outcome {
             FileOutcome::Skipped => files_skipped += 1,
+            FileOutcome::Unavailable => files_unavailable += 1,
             FileOutcome::Compared {
                 path,
                 base,
@@ -222,6 +246,7 @@ pub fn collect(result: &ScanResult, backend: Backend, rev: &str, threshold: u32)
         threshold,
         files_compared,
         files_skipped,
+        files_unavailable,
         changes,
     }
 }
@@ -233,8 +258,10 @@ pub fn has_changes(baseline: &Baseline) -> bool {
 
 /// Per-file result of the (I/O bound) baseline read.
 enum FileOutcome {
-    /// No readable baseline for this file; never invented as `Added`.
+    /// The baseline copy was read but cannot be analysed (no grammar).
     Skipped,
+    /// The baseline read could not be answered; never invented as `Added`.
+    Unavailable,
     Compared {
         path: String,
         base: Vec<FunctionRef>,
@@ -244,8 +271,11 @@ enum FileOutcome {
 
 /// Read and analyse one file at `rev`.
 ///
-/// Every failure mode — unreadable revision, unparseable baseline copy — folds
-/// into [`FileOutcome::Skipped`] rather than a panic or a fabricated `Added`.
+/// Every failure mode is kept distinct: a file that does not exist at `rev` is
+/// new (empty baseline), a read the backend could not answer is
+/// [`FileOutcome::Unavailable`], and an unparseable baseline copy is
+/// [`FileOutcome::Skipped`]. None of them panics or fabricates `Added` from a
+/// failed read.
 fn measure_baseline(
     root: &Path,
     backend: Backend,
@@ -254,20 +284,20 @@ fn measure_baseline(
     summary: &CcnSummary,
     renamed: &HashMap<String, String>,
 ) -> FileOutcome {
-    // `None` means "this path has no version at `rev`". Before calling the
-    // file new, ask whether it is the new name of a file that did exist: a
-    // pure rename would otherwise report every function as added.
-    let baseline_bytes = crate::vcs::file_at(root, backend, rev, &file.path).or_else(|| {
-        let old = renamed.get(&file.path)?;
-        crate::vcs::file_at(root, backend, rev, old)
-    });
+    let baseline = read_baseline(root, backend, rev, &file.path, renamed);
 
-    let Some(bytes) = baseline_bytes else {
-        return FileOutcome::Compared {
-            path: file.path.clone(),
-            base: Vec::new(),
-            current: summary.detail.iter().map(to_ref).collect(),
-        };
+    let bytes = match baseline {
+        FileAt::Found(bytes) => bytes,
+        FileAt::Absent => {
+            // The path genuinely has no revision at `rev`: the file is new, so
+            // its complex functions are reported as added against empty.
+            return FileOutcome::Compared {
+                path: file.path.clone(),
+                base: Vec::new(),
+                current: summary.detail.iter().map(to_ref(summary.tier)).collect(),
+            };
+        }
+        FileAt::Unavailable => return FileOutcome::Unavailable,
     };
 
     let base = crate::ccn::analyze_file(Path::new(&file.path), &bytes, &file.lang);
@@ -279,18 +309,43 @@ fn measure_baseline(
 
     FileOutcome::Compared {
         path: file.path.clone(),
-        base: base.detail.iter().map(to_ref).collect(),
-        current: summary.detail.iter().map(to_ref).collect(),
+        base: base.detail.iter().map(to_ref(base.tier)).collect(),
+        current: summary.detail.iter().map(to_ref(summary.tier)).collect(),
     }
 }
 
-fn to_ref(function: &FunctionCcn) -> FunctionRef {
-    FunctionRef {
+/// Read the baseline copy of `path`, following a rename when the path is new.
+///
+/// The rename fallback is only tried for [`FileAt::Absent`]: an unavailable read
+/// says nothing about whether the old path would have answered, and retrying
+/// there would only risk turning a failure into a fabricated baseline. An
+/// unavailable read of the old path stays unavailable rather than defaulting to
+/// "new".
+fn read_baseline(
+    root: &Path,
+    backend: Backend,
+    rev: &str,
+    path: &str,
+    renamed: &HashMap<String, String>,
+) -> FileAt {
+    let found = crate::vcs::file_at(root, backend, rev, path);
+    if found != FileAt::Absent {
+        return found;
+    }
+    match renamed.get(path) {
+        Some(old) => crate::vcs::file_at(root, backend, rev, old),
+        None => found,
+    }
+}
+
+fn to_ref(tier: CcnTier) -> impl Fn(&FunctionCcn) -> FunctionRef {
+    move |function| FunctionRef {
         name: function.name.clone(),
         ccn: function.ccn,
         line: function.line,
         nloc: function.nloc,
         max_nesting: function.max_nesting,
+        tier,
     }
 }
 
@@ -321,6 +376,7 @@ mod tests {
             line,
             nloc,
             max_nesting,
+            tier: CcnTier::Exact,
         }
     }
 
@@ -370,8 +426,9 @@ mod tests {
         }
     }
 
-    /// A root that does not exist, so every VCS read must answer `None`
-    /// regardless of which backend implementation is wired in.
+    /// A root that does not exist, so every VCS read must answer
+    /// [`FileAt::Unavailable`] regardless of which backend implementation is
+    /// wired in.
     const MISSING_ROOT: &str = "ccn-baseline-root-that-does-not-exist";
 
     fn git_works() -> bool {
@@ -826,20 +883,30 @@ mod tests {
 
     #[test]
     fn a_missing_baseline_means_the_file_is_new() {
-        // The revision is validated by the caller; inside `collect` a missing
-        // baseline copy is a file added by the change, so all of its complex
-        // functions are reported as added.
-        let files = vec![
-            file("a.rs", &[("foo", 30)]),
-            file("b.rs", &[("bar", 40), ("baz", 12)]),
-        ];
-        let result = scan_result(MISSING_ROOT, files);
+        // The revision is validated by the caller; inside `collect` a file that
+        // is genuinely absent at `rev` (here: never committed) is new, so all of
+        // its complex functions are reported as added.
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("absent-new");
+        let repo = tmp.path();
+        init_repo(repo);
+        std::fs::write(repo.join("kept.rs"), rust_source(1)).expect("write kept.rs");
+        commit(repo, "first");
+        std::fs::write(repo.join("a.rs"), rust_source(11)).expect("write a.rs");
+        std::fs::write(repo.join("b.rs"), rust_source(12)).expect("write b.rs");
 
-        let baseline = collect(&result, Backend::Git, "HEAD~1", 10);
+        let result = scan_result(
+            repo.to_str().expect("utf-8 root"),
+            vec![scanned(repo, "a.rs"), scanned(repo, "b.rs")],
+        );
+        let baseline = collect(&result, Backend::Git, "HEAD", 10);
 
-        assert_eq!(baseline.files_compared, 2);
+        assert_eq!(baseline.files_compared, 2, "both files are genuinely new");
         assert_eq!(baseline.files_skipped, 0);
-        assert_eq!(baseline.changes.len(), 3, "foo, bar, baz are all new");
+        assert_eq!(baseline.files_unavailable, 0);
+        assert_eq!(baseline.changes.len(), 2, "foo in a.rs and foo in b.rs");
         assert!(baseline.changes.iter().all(|c| c.kind == Kind::Added));
         assert!(baseline
             .changes
@@ -852,12 +919,66 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_baseline_files_never_become_added_findings() {
+        // Every read fails: the result must be an explicitly incomplete
+        // baseline, not a pile of fabricated `Added` functions.
+        let files = vec![
+            file("a.rs", &[("foo", 30)]),
+            file("b.rs", &[("bar", 40), ("baz", 12)]),
+        ];
+        let result = scan_result(MISSING_ROOT, files);
+
+        let baseline = collect(&result, Backend::Git, "HEAD~1", 10);
+
+        assert!(
+            baseline.changes.is_empty(),
+            "an unavailable read is not a new function: {:?}",
+            baseline.changes
+        );
+        assert_eq!(baseline.files_unavailable, 2);
+        assert_eq!(
+            baseline.files_compared, 0,
+            "unreadable files are not compared"
+        );
+        assert_eq!(
+            baseline.files_skipped, 0,
+            "skipped means read but unparseable"
+        );
+        assert!(!has_changes(&baseline));
+    }
+
+    #[test]
+    fn an_unknown_revision_is_unavailable_not_a_new_file() {
+        // A real repository, but a revision git cannot resolve: nothing can be
+        // said about the baseline, so no `Added` findings are invented.
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("bad-rev");
+        let repo = tmp.path();
+        init_repo(repo);
+        std::fs::write(repo.join("a.rs"), rust_source(11)).expect("write a.rs");
+        commit(repo, "first");
+
+        let result = scan_result(
+            repo.to_str().expect("utf-8 root"),
+            vec![scanned(repo, "a.rs")],
+        );
+        let baseline = collect(&result, Backend::Git, "no-such-rev-77bd", 10);
+
+        assert!(baseline.changes.is_empty());
+        assert_eq!(baseline.files_unavailable, 1);
+        assert_eq!(baseline.files_compared, 0);
+    }
+
+    #[test]
     fn has_changes_tracks_the_change_vector() {
         let empty = Baseline {
             rev: "HEAD".to_string(),
             threshold: 10,
             files_compared: 0,
             files_skipped: 0,
+            files_unavailable: 0,
             changes: Vec::new(),
         };
         assert!(!has_changes(&empty));

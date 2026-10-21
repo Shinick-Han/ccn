@@ -1645,6 +1645,7 @@ mod tests {
             functions: 10,
             lines: 100,
             over_10: 1,
+            best_effort_functions: 0,
             over_20: 0,
             over_50: 0,
             pct_over_10: 10.0,

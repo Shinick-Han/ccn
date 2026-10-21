@@ -63,6 +63,15 @@ pub struct Cli {
     #[arg(long)]
     pub no_cache: bool,
 
+    /// Re-read every cache hit and re-parse it if its content changed.
+    ///
+    /// The default warm path trusts modification time plus size, so a writer
+    /// that preserves both can leave stale numbers in the cache. This mode
+    /// costs one read per file but never serves bytes it did not verify; use
+    /// it for gates and NFS checkouts.
+    #[arg(long)]
+    pub verify_cache: bool,
+
     /// Collect git churn and rank hotspots.
     ///
     /// Runs `git log --numstat` for the last year (typically 0.5-2 s on a busy
@@ -162,6 +171,7 @@ impl Cli {
             no_ccn: self.no_ccn,
             include_generated: self.include_generated,
             no_cache: self.no_cache,
+            verify_cache: self.verify_cache,
             since: self.since.clone(),
         }
     }
@@ -260,6 +270,19 @@ mod tests {
     fn ci_flag_parses() {
         let cli = Cli::parse_from(["ccn", "--ci"]);
         assert!(cli.ci);
+    }
+
+    #[test]
+    fn verify_cache_reaches_scan_options() {
+        let cli = Cli::parse_from(["ccn"]);
+        assert!(!cli.verify_cache, "the fast path is the default");
+        assert!(!cli.scan_options().verify_cache);
+
+        let cli = Cli::parse_from(["ccn", "--verify-cache"]);
+        assert!(cli.verify_cache);
+        assert!(cli.scan_options().verify_cache);
+        // It does not disable the cache itself; it only distrusts the key.
+        assert!(!cli.scan_options().no_cache);
     }
 
     #[test]

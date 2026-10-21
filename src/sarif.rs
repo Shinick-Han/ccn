@@ -144,11 +144,23 @@ fn delta_result(change: &Change, rule: &'static str, threshold: u32, root: &str)
         ),
     };
 
+    let confidence = match change.tier {
+        crate::ccn::types::CcnTier::Exact => "exact",
+        crate::ccn::types::CcnTier::BestEffort => "best-effort",
+        crate::ccn::types::CcnTier::Heuristic => "heuristic",
+    };
+    let message = if change.tier == crate::ccn::types::CcnTier::BestEffort {
+        format!("{message} (best-effort parse: the file has syntax errors)")
+    } else {
+        message
+    };
+
     json!({
         "ruleId": rule,
         "level": level,
         "message": { "text": message },
-        "locations": [location(&path, change.line, 0)]
+        "locations": [location(&path, change.line, 0)],
+        "properties": { "confidence": confidence }
     })
 }
 
@@ -436,6 +448,7 @@ mod tests {
             threshold: 10,
             files_compared: 1,
             files_skipped: 0,
+            files_unavailable: 0,
             changes: vec![
                 Change {
                     path: "src/a.rs".to_string(),
@@ -449,6 +462,7 @@ mod tests {
                     base_max_nesting: Some(1),
                     kind: Kind::Worsened,
                     reasons: vec!["ccn +21".to_string()],
+                    tier: crate::ccn::types::CcnTier::Exact,
                 },
                 Change {
                     path: "src/a.rs".to_string(),
@@ -462,6 +476,7 @@ mod tests {
                     base_max_nesting: None,
                     kind: Kind::Added,
                     reasons: vec!["new function".to_string()],
+                    tier: crate::ccn::types::CcnTier::Exact,
                 },
             ],
         });

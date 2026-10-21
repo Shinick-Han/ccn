@@ -192,10 +192,26 @@ fn baseline_block(report: &Report, sep: &str) -> String {
         .count();
     let worsened = baseline.changes.len() - added;
 
+    let best_effort = baseline
+        .changes
+        .iter()
+        .filter(|c| c.tier == crate::ccn::types::CcnTier::BestEffort)
+        .count();
+
     let mut out = format!(
-        "  Since {}  {added} new >{} {sep} {worsened} worsened   ({} files compared, {} skipped)\n",
+        "  Since {}  {added} new >{} {sep} {worsened} worsened   ({} files compared, {} skipped",
         baseline.rev, baseline.threshold, baseline.files_compared, baseline.files_skipped,
     );
+    if baseline.files_unavailable > 0 {
+        out.push_str(&format!(", {} unavailable", baseline.files_unavailable));
+    }
+    out.push_str(")\n");
+    if best_effort > 0 {
+        out.push_str(&format!(
+            "  {} finding(s) come from best-effort parses (syntax errors) and are advisory\n",
+            best_effort
+        ));
+    }
     for change in baseline.changes.iter().take(5) {
         let marker = match change.kind {
             crate::baseline::Kind::Added => '+',
@@ -211,9 +227,14 @@ fn baseline_block(report: &Report, sep: &str) -> String {
         } else {
             format!("  [{}]", change.reasons.join(", "))
         };
+        let tier_tag = if change.tier == crate::ccn::types::CcnTier::BestEffort {
+            " (best-effort)"
+        } else {
+            ""
+        };
         let mut line = format!(
-            "    {marker} {:<4} {:<24} {}:{}{}",
-            change.ccn, change.name, change.path, change.line, why
+            "    {marker} {:<4} {:<24} {}:{}{}{}",
+            change.ccn, change.name, change.path, change.line, tier_tag, why
         );
         if line.chars().count() > 100 {
             line = line.chars().take(97).collect::<String>();
@@ -251,6 +272,13 @@ fn health_block(report: &Report, sep: &str) -> String {
         health.debt,
         thousands(health.functions),
     ));
+    if health.best_effort_functions > 0 {
+        out.push_str(&format!(
+            "  {} functions in best-effort files excluded from the score \
+             (syntax errors)\n",
+            thousands(health.best_effort_functions),
+        ));
+    }
     out.push_str(&format!(
         "  {} functions > 10 ({:.1}%) {sep} {} > 20 {sep} {} > 50\n",
         thousands(health.over_10),
@@ -283,12 +311,13 @@ fn stats_block(report: &Report, sep: &str) -> String {
     } else {
         out.push_str(&format!(
             "  CCN   median {} {sep} p90 {} {sep} p99 {} {sep} max {}   \
-             ({} parsed / {} heuristic files)\n",
+             ({} exact / {} best-effort / {} heuristic files)\n",
             thousands(stats.ccn_median as usize),
             thousands(stats.ccn_p90 as usize),
             thousands(stats.ccn_p99 as usize),
             thousands(stats.ccn_max as usize),
             thousands(stats.files_exact),
+            thousands(stats.files_best_effort),
             thousands(stats.files_heuristic),
         ));
     }
@@ -765,7 +794,10 @@ mod tests {
         let result = sample_scan();
         let report = build(&result);
         let out = render(&result, &report, &TerminalOptions::default());
-        assert!(out.contains("parsed / 1 heuristic files"), "{out}");
+        assert!(
+            out.contains("exact / 0 best-effort / 1 heuristic files"),
+            "{out}"
+        );
     }
 
     #[test]

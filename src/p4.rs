@@ -17,8 +17,23 @@
 //! p4 opened                                     # pending local edits
 //! p4 changes -m <n> -s submitted -ztag <depot_prefix>...
 //! p4 describe -s -ztag <cl>                     # one per changelist, in parallel
-//! p4 -q print -q <depot>@=<cl>                   # raw contents of one file
+//! p4 files <depot>@<cl>                         # revision in effect at <cl>?
+//! p4 print -q <depot>@<cl>                      # raw contents as of <cl>
 //! ```
+//!
+//! # `@<cl>` is an as-of **tree**, `@=<cl>` is not
+//!
+//! Perforce file specifications (see the Helix Core file-spec reference):
+//!
+//! - `@<cl>` selects the revision **in effect at** that changelist: the newest
+//!   revision at or before it. That is what a tree baseline means — a file last
+//!   edited in CL10 still exists at CL20 when CL20 only touched another file;
+//! - `@=<cl>` selects only the revision **created by** that exact change. A file
+//!   whose last edit was CL10 therefore looks absent at CL20, which is how a
+//!   baseline reported unchanged old functions as `Added` before this fix.
+//!
+//! [`file_at`] uses `@<cl>` for both the existence probe and the print, so it
+//! answers "the submitted depot tree as of that changelist".
 //!
 //! # Line counts are unavailable
 //!
@@ -46,6 +61,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::git::{Churn, UNKNOWN_AUTHOR};
+use crate::vcs::FileAt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct History {
@@ -157,18 +173,6 @@ pub fn changed_since(dir: &Path, rev: &str) -> Option<HashSet<String>> {
     Some(changed)
 }
 
-/// Raw contents of the scan-root-relative `path` at changelist `rev`.
-///
-/// Only submitted changelists are addressable: `123`, `#123` and `@123` are
-/// accepted, while `opened`, `pending` and `default` return `None` because a
-/// pending edit has no stored revision the server could print. A `path` that is
-/// empty, absolute, contains a NUL, or contains a `..` segment is rejected
-/// before `p4` is spawned, so the request can never name a file outside the
-/// mapped workspace.
-///
-/// The bytes are returned exactly as `p4 print -q` wrote them to stdout, without
-/// decoding or newline translation. Returns `None` when `dir` is not mapped by
-/// `p4 where`, or when `p4` fails or exceeds [`TIMEOUT`].
 /// True when `rev` is a changelist the server knows about.
 pub fn rev_exists(dir: &Path, rev: &str) -> bool {
     let Some(Rev::Since(cl)) = parse_rev(rev) else {
@@ -180,21 +184,129 @@ pub fn rev_exists(dir: &Path, rev: &str) -> bool {
         .is_some_and(|out| out.contains(&format!("Change {cl} ")))
 }
 
-pub fn file_at(dir: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
-    let Rev::Since(cl) = parse_rev(rev)? else {
+/// Raw contents of the scan-root-relative `path` as of changelist `rev`.
+///
+/// Only submitted changelists are addressable: `123`, `#123` and `@123` are
+/// accepted, while `opened`, `pending` and `default` return
+/// [`FileAt::Unavailable`] because a pending edit has no stored revision the
+/// server could print. A `path` that is empty, absolute, contains a NUL, or
+/// contains a `..` segment is likewise `Unavailable` before `p4` is spawned, so
+/// the request can never name a file outside the mapped workspace.
+///
+/// Selection is the **as-of tree** `@<cl>`, not `@=<cl>` (see the module docs):
+/// the file's revision in effect at that changelist, whatever change created it.
+///
+/// Existence is decided first, with `p4 files <depot>@<cl>`:
+///
+/// - a revision line -> the file exists, so `print` supplies
+///   [`FileAt::Found`];
+/// - "no such file(s)" (the server's answer for a well-formed spec that matches
+///   nothing) -> [`FileAt::Absent`], i.e. an empty baseline;
+/// - anything else — an unreadable/expired ticket, a timeout, an unmapped
+///   workspace, an unparseable response — -> [`FileAt::Unavailable`].
+///
+/// The bytes are returned exactly as `p4 print -q` wrote them to stdout, without
+/// decoding or newline translation.
+pub fn file_at(dir: &Path, rev: &str, path: &str) -> FileAt {
+    let Some(Rev::Since(cl)) = parse_rev(rev) else {
         // Pending local edits are not revisions on the server.
-        return None;
+        return FileAt::Unavailable;
     };
     // Validate the path before `p4 where`: a bad argument must not cost a spawn.
-    let rel = relative_file_path(path)?;
-    let mapping = mapping_for(dir)?;
-    let depot = mapping.depot_file(&rel)?;
-    let spec = format!("{depot}@={cl}");
-    // The leading `-q` is the global quiet flag (informational messages on
-    // stderr, which parsing ignores); `print -q` is the command option that
-    // suppresses the `//depot/...#rev - ...` header line, which would otherwise
-    // be prepended to the captured bytes.
-    run_p4_bytes(dir, &["print", "-q", &spec])
+    let Some(rel) = relative_file_path(path) else {
+        return FileAt::Unavailable;
+    };
+    let Some(mapping) = mapping_for(dir) else {
+        return FileAt::Unavailable;
+    };
+    let Some(depot) = mapping.depot_file(&rel) else {
+        return FileAt::Unavailable;
+    };
+    let spec = as_of_spec(&depot, cl);
+
+    match run_p4_outcome(dir, &["files", &spec]) {
+        Some(outcome) => {
+            let stdout = String::from_utf8_lossy(&outcome.stdout);
+            let stderr = String::from_utf8_lossy(&outcome.stderr);
+            match classify_probe(outcome.success, &stdout, &stderr) {
+                Existence::Absent => return FileAt::Absent,
+                Existence::Unavailable => return FileAt::Unavailable,
+                Existence::Present => {}
+            }
+        }
+        None => return FileAt::Unavailable,
+    }
+
+    // `print -q` suppresses the `//depot/...#rev - ...` header line, which would
+    // otherwise be prepended to the captured bytes.
+    match run_p4_bytes(dir, &["print", "-q", &spec]) {
+        Some(bytes) => FileAt::Found(bytes),
+        // The probe said the file is there, so a failed print is a read
+        // failure (permission, timeout, transport), never "the file is new".
+        None => FileAt::Unavailable,
+    }
+}
+
+/// File spec for "the revision of `depot` in effect at changelist `cl`".
+///
+/// `@<cl>`, never `@=<cl>`: `@=` selects only the revision *created by* that
+/// exact change, so a file last edited in an earlier changelist would look
+/// absent. `@<cl>` is the as-of tree a baseline means. Kept as a function so the
+/// selector is asserted directly in tests instead of being inferred from a
+/// server call.
+fn as_of_spec(depot: &str, cl: u64) -> String {
+    format!("{depot}@{cl}")
+}
+
+/// What an existence probe (`p4 files <depot>@<cl>`) established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Existence {
+    Present,
+    Absent,
+    Unavailable,
+}
+
+/// Classify a `p4 files <depot>@<cl>` probe from its exit status and streams.
+///
+/// Kept pure so the absence/failure split is tested without a server. P4 answers
+/// a valid spec that matches nothing with a diagnostic on **stderr** and — for a
+/// single file spec — a **zero exit status**, so the message, not the status, is
+/// what identifies absence:
+///
+/// ```text
+/// //depot/x@=2 - no such file(s).
+/// //depot/x@1 - no file(s) at that changelist number.
+/// no files to display
+/// ```
+///
+/// A successful probe with no revision line, or any other failure (expired
+/// ticket, unreachable server, unparseable response), proves nothing and is
+/// reported as [`Existence::Unavailable`] rather than inventing an empty
+/// baseline.
+fn classify_probe(success: bool, stdout: &str, stderr: &str) -> Existence {
+    if is_absence_diagnostic(stdout) || is_absence_diagnostic(stderr) {
+        return Existence::Absent;
+    }
+    if !success {
+        return Existence::Unavailable;
+    }
+    if parse_files(stdout).is_empty() {
+        // Success without a revision line is not evidence of absence.
+        return Existence::Unavailable;
+    }
+    Existence::Present
+}
+
+/// True when `text` is one of P4's "this spec matched nothing" diagnostics.
+///
+/// These are negative answers, not failures: the file existed neither as of that
+/// changelist nor at all. Everything else on stderr (authentication, `$P4PORT`,
+/// permission) is a failure the caller must report as unavailable.
+fn is_absence_diagnostic(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no such file")
+        || lower.contains("no file(s) at that changelist")
+        || lower.contains("no files to display")
 }
 
 /// Churn and authorship for the last `max_changes` submitted changelists.
@@ -695,6 +807,14 @@ fn run_p4(dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out).into_owned())
 }
 
+/// [`run_p4`] including the exit status and stderr, for callers that must tell
+/// "ran and answered negatively" from "could not ask" (see [`classify_probe`]).
+fn run_p4_outcome(dir: &Path, args: &[&str]) -> Option<RunOutcome> {
+    let mut cmd = Command::new("p4");
+    cmd.current_dir(dir).args(args);
+    run_outcome(cmd)
+}
+
 /// [`run_p4`] without the UTF-8 lossy conversion, for callers that need the
 /// exact bytes (`p4 print` may return binary files).
 fn run_p4_bytes(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -703,15 +823,30 @@ fn run_p4_bytes(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
     run(cmd)
 }
 
+/// One finished `p4` invocation: whether it exited zero plus both streams.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunOutcome {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 /// Spawn `cmd`, capture stdout and stderr to EOF, and give up after [`TIMEOUT`].
 ///
 /// `try_wait` polling (not `wait`) is what makes the deadline real: `p4` talks to
 /// a server over the network, and a scan that blocks on an unreachable one is
 /// worse than a scan without hotspots. Both pipes are drained on their own
 /// threads so a chatty child can never block on a full buffer, and stdout is
-/// capped at [`MAX_CAPTURE_BYTES`]. Stderr is captured (and discarded) for the
-/// same reason; parsing only ever looks at stdout.
-fn run(mut cmd: Command) -> Option<Vec<u8>> {
+/// capped at [`MAX_CAPTURE_BYTES`]. Stderr is captured too: diagnostics such as
+/// `no such file(s)` are what separate a negative answer from a failure.
+fn run(cmd: Command) -> Option<Vec<u8>> {
+    let outcome = run_outcome(cmd)?;
+    outcome.success.then_some(outcome.stdout)
+}
+
+/// [`run`] that keeps the exit status and stderr. `None` means the command
+/// could not run at all (spawn failure, I/O error or [`TIMEOUT`]).
+fn run_outcome(mut cmd: Command) -> Option<RunOutcome> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -726,9 +861,13 @@ fn run(mut cmd: Command) -> Option<Vec<u8>> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let out = out_reader.join().ok()?;
-                err_reader.join().ok()?;
-                return status.success().then_some(out);
+                let stdout = out_reader.join().ok()?;
+                let stderr = err_reader.join().ok()?;
+                return Some(RunOutcome {
+                    success: status.success(),
+                    stdout,
+                    stderr,
+                });
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -981,8 +1120,9 @@ no files to display
         for bad in [
             "", "opened", "OPENED", "pending", "default", "-x", "12 3", "#", "@", "12a",
         ] {
-            assert!(
-                file_at(tmp.path(), bad, "src/a.rs").is_none(),
+            assert_eq!(
+                file_at(tmp.path(), bad, "src/a.rs"),
+                FileAt::Unavailable,
                 "{bad:?} must be rejected"
             );
         }
@@ -999,8 +1139,9 @@ no files to display
             "",
             "/etc/passwd",
         ] {
-            assert!(
-                file_at(tmp.path(), "123", bad).is_none(),
+            assert_eq!(
+                file_at(tmp.path(), "123", bad),
+                FileAt::Unavailable,
                 "{bad:?} must be rejected"
             );
         }
@@ -1049,11 +1190,93 @@ no files to display
     }
 
     #[test]
-    fn file_at_returns_none_without_a_server_and_never_panics() {
+    fn file_at_is_unavailable_without_a_server_and_never_panics() {
         let tmp = TempDir::new("file-at");
         // With no workspace (and possibly no `p4` on PATH) the lookup fails; the
         // only hard requirement is that it does not panic or hang.
-        assert!(file_at(tmp.path(), "123", "src/a.rs").is_none());
-        assert!(file_at(&tmp.path().join("missing"), "123", "src/a.rs").is_none());
+        assert_eq!(file_at(tmp.path(), "123", "src/a.rs"), FileAt::Unavailable);
+        assert_eq!(
+            file_at(&tmp.path().join("missing"), "123", "src/a.rs"),
+            FileAt::Unavailable
+        );
+    }
+
+    #[test]
+    fn the_baseline_spec_is_as_of_the_changelist_not_at_it() {
+        // `@<cl>` = the revision in effect at that changelist. `@=<cl>` would
+        // only match a revision created by that exact change, so an unchanged
+        // file last edited earlier would look absent.
+        let spec = as_of_spec("//depot/proj/src/a.rs", 120);
+        assert_eq!(spec, "//depot/proj/src/a.rs@120");
+        assert!(
+            !spec.contains("@="),
+            "the exact-revision selector is not an as-of tree"
+        );
+    }
+
+    #[test]
+    fn probe_classification_separates_absence_from_failure() {
+        // A well-formed spec that matched nothing: absent, not an error. These
+        // strings are the exact stderr text of a live p4d 2024.2.
+        assert_eq!(
+            classify_probe(false, "", "//depot/proj/src/a.rs@120 - no such file(s).\n"),
+            Existence::Absent
+        );
+        assert_eq!(
+            classify_probe(
+                // A single-file spec exits 0 even when nothing matched, so the
+                // message must carry the answer.
+                true,
+                "",
+                "//depot/proj/src/b.rs@119 - no file(s) at that changelist number.\n"
+            ),
+            Existence::Absent
+        );
+        assert_eq!(
+            classify_probe(false, "no files to display\n", ""),
+            Existence::Absent
+        );
+        // A real answer: the file exists as of that changelist.
+        assert_eq!(
+            classify_probe(
+                true,
+                "//depot/proj/src/a.rs#1 - add change 120 (text)\n",
+                ""
+            ),
+            Existence::Present
+        );
+        // A deleted file still has a revision line as of the deletion; the
+        // print then yields empty content, which is a valid empty baseline.
+        assert_eq!(
+            classify_probe(
+                true,
+                "//depot/proj/src/b.rs#2 - delete change 124 (text)\n",
+                ""
+            ),
+            Existence::Present
+        );
+        // Everything else could not be determined and must never be "absent".
+        assert_eq!(
+            classify_probe(
+                false,
+                "",
+                "Perforce password (P4PASSWD) invalid or unset.\n"
+            ),
+            Existence::Unavailable
+        );
+        assert_eq!(
+            classify_probe(false, "", "Connect to server failed; check $P4PORT.\n"),
+            Existence::Unavailable
+        );
+        assert_eq!(
+            classify_probe(false, "", "//depot/proj/src/a.rs - access denied.\n"),
+            Existence::Unavailable,
+            "a permission error is not a missing file"
+        );
+        assert_eq!(
+            classify_probe(true, "", ""),
+            Existence::Unavailable,
+            "success without a revision line proves nothing"
+        );
     }
 }
