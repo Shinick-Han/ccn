@@ -60,15 +60,23 @@ pub struct Cli {
     #[arg(long)]
     pub hotspots: bool,
 
+    /// How many commits/changelists the history pass considers.
+    ///
+    /// Git can scan a year cheaply; Perforce needs one `p4 describe` per
+    /// changelist, so keeping this small is what keeps `--hotspots` usable.
+    #[arg(long, value_name = "N", default_value_t = crate::vcs::DEFAULT_HISTORY_LIMIT)]
+    pub history_limit: u32,
+
     /// Record this scan in `<repo>/.ccn/history.json` and show the delta from
     /// the previous one.
     #[arg(long, conflicts_with = "since")]
     pub trend: bool,
 
-    /// Only analyse files changed since this git revision (e.g. HEAD~1).
+    /// Only analyse files changed since this revision.
     ///
-    /// Useful in CI and code review: the report then describes the change, not
-    /// the whole repository.
+    /// Git: `HEAD~1`, a branch, or a commit. Perforce: a changelist number
+    /// (`123456`) or `opened` for pending local edits. Useful in CI and code
+    /// review: the report then describes the change, not the whole repository.
     #[arg(long, value_name = "REV", conflicts_with = "trend")]
     pub since: Option<String>,
 

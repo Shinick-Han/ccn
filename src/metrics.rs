@@ -20,8 +20,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::ccn::types::CcnTier;
-use crate::git::{self, Churn};
+use crate::git::Churn;
 use crate::model::{percentile, FileLoc, ScanResult};
+use crate::vcs;
 
 /// Fixed edges plus human labels. `edges.len() == labels.len()`: the last bin
 /// is open-ended.
@@ -364,9 +365,11 @@ pub struct Report {
     pub health: Option<Health>,
     pub stats: RepoStats,
     pub top: Vec<RankedFile>,
-    /// `true` when git history was collected; the hotspot fields below are only
+    /// `true` when VCS history was collected; the hotspot fields below are only
     /// meaningful when it is.
     pub git_available: bool,
+    /// Which backend produced the history (`git` / `p4`), for labels.
+    pub vcs: Option<String>,
     /// Commit records seen in the 365-day window (`--no-merges`).
     pub commits_scanned: u32,
     /// `Σ LOC(top decile by hotspot) / Σ LOC(measured) * 100`, 0.0 when nothing
@@ -480,11 +483,11 @@ fn hotspot_decile_share(rows: &[HotspotRow], measured_loc: u64) -> f64 {
 /// seconds), so it is opt-in via [`build_with`]; a scan should feel instant by
 /// default.
 pub fn build(result: &ScanResult) -> Report {
-    build_with(result, false)
+    build_with(result, false, crate::vcs::DEFAULT_HISTORY_LIMIT)
 }
 
 /// Build a report, optionally collecting git churn for hotspot ranking.
-pub fn build_with(result: &ScanResult, enable_git: bool) -> Report {
+pub fn build_with(result: &ScanResult, enable_history: bool, history_limit: u32) -> Report {
     // The single exclusion point for the report. Everything below reads
     // `measured` and never `result.files`, so a generated file cannot leak into
     // a histogram, the concentration stat, the health score or the top table by
@@ -589,23 +592,21 @@ pub fn build_with(result: &ScanResult, enable_git: bool) -> Report {
     // work-tree keys onto the scan root, and a file that does not match simply
     // stays at zero churn.
     let root_path = Path::new(&result.root);
-    let history = if enable_git {
-        git::collect_history(root_path)
+    // The backend is detected once and every key it returns is already
+    // scan-root-relative, so this layer no longer knows git from Perforce.
+    let backend = if enable_history {
+        vcs::detect(root_path)
     } else {
         None
     };
+    let history =
+        backend.and_then(|backend| vcs::collect_history(root_path, backend, history_limit.max(1)));
     let mut commits_scanned = 0u32;
     let mut churn: HashMap<String, Churn> = HashMap::new();
-    // Rebase work-tree keys onto the scan root once; churn and authors share it.
-    let prefix = history
-        .as_ref()
-        .map(|h| git::prefix_relative_to(root_path, &h.work_tree))
-        .unwrap_or_default();
     if let Some(history) = &history {
         commits_scanned = history.commits;
         for file in &measured {
-            let key = format!("{prefix}{}", file.path);
-            if let Some(found) = history.churn.get(&key) {
+            if let Some(found) = history.churn.get(&file.path) {
                 churn.insert(file.path.clone(), *found);
             }
         }
@@ -620,12 +621,9 @@ pub fn build_with(result: &ScanResult, enable_git: bool) -> Report {
                 return None;
             }
             let change = churn.get(&f.path).copied().unwrap_or_default();
-            // Author attribution is keyed like churn (work-tree relative), so
-            // it needs the same prefix rebase.
-            let author_key = format!("{prefix}{}", f.path);
             let (top_author, authors) = history
                 .as_ref()
-                .and_then(|h| h.authors.get(&author_key))
+                .and_then(|h| h.authors.get(&f.path))
                 .filter(|map| !map.is_empty())
                 .map(|map| {
                     let mut entries: Vec<(&String, &u32)> = map.iter().collect();
@@ -669,6 +667,7 @@ pub fn build_with(result: &ScanResult, enable_git: bool) -> Report {
         stats,
         top,
         git_available,
+        vcs: history.as_ref().and(backend).map(|b| b.name().to_string()),
         commits_scanned,
         hotspot_debt_share,
         hotspots,

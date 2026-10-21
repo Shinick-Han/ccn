@@ -819,5 +819,63 @@ Trend  health 97.0 → 97.0 (+0.1) · >10 1.8% → 1.8% (0.0pp)
 - 스냅샷에 git HEAD를 넣으면 "어느 커밋에서 측정했는지"까지 추적할 수 있다.
 - `--since` 결과는 여전히 트렌드에 기록하지 않는다(의도).
 
+---
+
+## 22. Perforce 지원 (2026-10-21, 0.4.0)
+
+코어는 원래 VCS와 무관했다. git 결합은 5개 호출 지점뿐이었고, 그 뒤에 `Vcs` 계층을 넣어 P4 백엔드를 추가했다.
+
+### 구조
+
+```
+src/vcs.rs   detect -> Git | P4 | None, collect_history, changed_since
+src/git.rs   기존 구현 (work-tree 상대 키)
+src/p4.rs    Helix Core 백엔드 (scan-root 상대 키)
+```
+
+`vcs`가 양쪽 키를 **scan root 상대 경로로 정규화**하므로 `metrics.rs`/`loc.rs`는 더 이상 git을 모른다(prefix 보정 코드 삭제).
+
+### P4 명령
+
+| 용도 | 명령 |
+|---|---|
+| 감지 | `p4 info` (hint가 있을 때만 실행) |
+| 경로 매핑 | `p4 where <root>` |
+| 변경 파일 | `p4 files <depot>/...@=<CL>,@now` ∪ `p4 opened` |
+| 이력 | `p4 changes -m N -s submitted -ztag` + CL별 `p4 describe -s -ztag` |
+
+- CL별 describe는 rayon으로 병렬화, **기본 300개 상한**(`--history-limit`), 명령당 20초 타임아웃.
+- 작성자 상한 20명/파일, 경로 중복 제거.
+- `--since opened`는 로컬 pending 변경만.
+
+### P4에서 불가능한 것 (정직하게)
+
+- **변경 줄 수 없음**: `describe -s`는 diff를 주지 않고, CL마다 diff를 받으면 서버 왕복이 폭발한다. `lines_changed`는 0으로 두고, 핫스팟은 커밋 수 기반이라 랭킹은 유지된다. 리포트의 "lines changed" 열만 비어 보인다.
+- **365일 창이 아니라 CL 개수 창**: P4는 시간 기반 조회가 비싸서 최근 N CL로 자른다.
+
+### P4 현실 문제 대응
+
+- **read-only 워크스페이스**: `p4 sync` 파일은 읽기 전용이라 `.ccn/history.json` 쓰기가 실패한다. → 실패 시 `%LOCALAPPDATA%\ccn\history-<hash>.json`으로 자동 폴백. (`load`도 양쪽을 본다)
+- **`.p4ignore`**: `ignore` 크레이트의 `add_custom_ignore_filename(".p4ignore")`로 지원.
+- **라벨**: 터미널/HTML이 더 이상 "Git"을 하드코딩하지 않고 `p4: N changelists`로 표시.
+
+### 검증
+
+```
+260 lib + 2 integration tests, 0 failed
+clippy -D warnings, fmt clean
+```
+
+- 파서 단위 테스트 10개(`p4.rs`) + 정규화 테스트 6개(`vcs.rs`)
+- git 경로 회귀: `--hotspots`, `--since HEAD~1` 실저장소에서 동일 동작 확인
+- `.p4ignore`: 임시 디렉토리에서 2개 중 1개만 스캔되는 것 확인
+- read-only 폴백: `.ccn`을 파일로 만들어 쓰기 실패 → 사이드카 생성 확인
+
+### 남은 리스크
+
+- **실제 P4 서버로 검증하지 못했다.** 파서는 canned output으로만 테스트했다. 첫 실사용은 `p4 info` + 작은 `--history-limit 20`으로 확인할 것.
+- P4 streams/branches 간 이력, rename 추적은 범위 밖.
+- 대규모 서버(수천 CL)에서 `--hotspots`는 여전히 수십 초가 걸릴 수 있다.
+
 
 

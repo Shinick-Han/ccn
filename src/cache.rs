@@ -152,6 +152,21 @@ pub fn cache_path(root: &str) -> Option<PathBuf> {
     )
 }
 
+/// A sidecar file next to the scan cache (e.g. `history` for trend snapshots).
+///
+/// Used when the repository itself is not writable — Perforce syncs files
+/// read-only, so `--trend` cannot create `<repo>/.ccn/history.json` until the
+/// file is opened for edit.
+pub fn sidecar_path(root: &str, kind: &str) -> Option<PathBuf> {
+    let base = cache_dir()?;
+    let mut hasher = DefaultHasher::new();
+    root.hash(&mut hasher);
+    Some(
+        base.join("ccn")
+            .join(format!("{kind}-{:016x}.json", hasher.finish())),
+    )
+}
+
 fn cache_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CCN_CACHE_DIR") {
         return Some(PathBuf::from(dir));

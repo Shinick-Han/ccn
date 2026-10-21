@@ -12,7 +12,8 @@ $ ccn . --json                # machine-readable contract (no report)
 $ ccn . --ci                  # ASCII-only, with terminal histograms
 $ ccn . --hotspots            # + git churn ranking and ownership (runs git log)
 $ ccn . --trend               # compare with the previous scan, and record this one
-$ ccn . --since HEAD~1        # only files changed since a revision
+$ ccn . --since HEAD~1        # only files changed since a revision (git)
+$ ccn . --since 123456        # ...or a Perforce changelist (or `opened`)
 $ ccn . --no-cache            # ignore the per-file cache
 $ ccn . --fail-over 2.0       # exit 1 if >2% of functions exceed CCN 10
 $ ccn . --lang rust,python    # restrict to languages
@@ -119,6 +120,30 @@ semantic colour, the CCN bar ramp, and risk-coloured `max CCN` values.
   full-repo score. Deleted files are skipped; untracked files are not included.
 - **`--hotspots`** now also reports the top author per hotspot (`alice +2`) from
   the same single `git log` pass.
+
+## Perforce
+
+The scan itself is VCS-agnostic; git and Perforce differ only in the history
+features, which are auto-detected (`.git` wins, otherwise `p4 info`):
+
+| Feature | Git | Perforce |
+|---|---|---|
+| scan / CCN / report / TUI / cache | same | same |
+| `--since` | `HEAD~1`, branch, commit | changelist number, or `opened` |
+| `--hotspots` | `git log --numstat` | `p4 changes` + `p4 describe` |
+| ignore rules | `.gitignore` | `.gitignore` + `.p4ignore` |
+| trend snapshots | `<repo>/.ccn/history.json` | same, or the user cache when the workspace is read-only |
+
+P4 limits, by design:
+
+- **`lines changed` is 0.** `p4 describe -s` does not report diffs, and asking
+  for them per changelist is too expensive. Hotspot ranking is driven by
+  commits, so it still works; the column is simply empty for P4.
+- **300 changelists by default** (`--history-limit`). Each one is a server
+  round-trip, so a year of history would take minutes.
+- **Read-only workspaces**: `p4 sync` writes files read-only, so
+  `--trend` falls back to `%LOCALAPPDATA%\ccn\history-<hash>.json` when the
+  repository path cannot be written.
 
 ## Cache
 

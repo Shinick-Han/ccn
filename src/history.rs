@@ -194,10 +194,29 @@ impl HistoryFile {
 /// Entries sharing an `at_unix` are kept as-is: a rerun is a data point, not a
 /// duplicate to collapse.
 pub fn load(root: &str) -> Vec<Snapshot> {
-    history_path(root)
-        .and_then(|path| HistoryFile::read(&path))
+    read_paths(root)
+        .iter()
+        .find_map(|path| HistoryFile::read(path))
         .map(|file| file.snapshots)
         .unwrap_or_default()
+}
+
+/// Where to look, most specific first: the repository, then the user-cache
+/// sidecar used when the workspace is read-only (Perforce syncs files
+/// read-only until they are opened for edit).
+fn read_paths(root: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = history_path(root) {
+        if path.exists() {
+            paths.push(path);
+        }
+    }
+    if let Some(path) = crate::cache::sidecar_path(root, "history") {
+        if path.exists() {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 /// Append `snap` to the history for `root` and return the comparison with the
@@ -220,7 +239,14 @@ pub fn record(root: &str, snap: Snapshot) -> std::io::Result<Option<Trend>> {
         snapshots.drain(..excess);
     }
 
-    HistoryFile::new(snapshots).write(&path)?;
+    let file = HistoryFile::new(snapshots);
+    // Perforce workspaces reject the write (read-only files). Falling back to
+    // the user cache keeps `--trend` working there instead of failing.
+    if file.write(&path).is_err() {
+        if let Some(fallback) = crate::cache::sidecar_path(root, "history") {
+            file.write(&fallback)?;
+        }
+    }
     Ok(previous.map(|previous| Trend {
         previous,
         current: snap,

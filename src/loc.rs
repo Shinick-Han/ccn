@@ -99,7 +99,7 @@ impl std::fmt::Display for ScanError {
             ScanError::NotADirectory(p) => write!(f, "not a directory: {}", p.display()),
             ScanError::InvalidSince(rev) => write!(
                 f,
-                "cannot resolve --since {rev}: not a git work tree, or unknown revision"
+                "cannot resolve --since {rev}: no git or Perforce workspace, or unknown revision"
             ),
         }
     }
@@ -173,14 +173,10 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
     // Diff mode: keep only files this change touched. Deleted files are not in
     // the set, which is correct — there is no LOC to measure for them.
     if let Some(rev) = &opts.since {
-        let changed = crate::git::changed_since(&root, rev)
+        let changed = crate::vcs::detect(&root)
+            .and_then(|backend| crate::vcs::changed_since(&root, backend, rev))
             .ok_or_else(|| ScanError::InvalidSince(rev.clone()))?;
-        let prefix = crate::git::work_tree(&root)
-            .map(|top| crate::git::prefix_relative_to(&root, &top))
-            .unwrap_or_default();
-        candidates.retain(|(abs, _)| {
-            changed.contains(&format!("{prefix}{}", relative_display(&root, abs)))
-        });
+        candidates.retain(|(abs, _)| changed.contains(&relative_display(&root, abs)));
     }
 
     let resolve_started = std::time::Instant::now();
@@ -318,6 +314,9 @@ fn walk_source_files(
         .git_exclude(!opts.no_ignore)
         .ignore(!opts.no_ignore)
         .parents(!opts.no_ignore)
+        // Perforce workspaces ignore build output through .p4ignore, not
+        // .gitignore; honour it with the same syntax.
+        .add_custom_ignore_filename(".p4ignore")
         .follow_links(false);
 
     let allow_defaults = opts.no_default_excludes;

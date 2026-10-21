@@ -251,8 +251,18 @@ fn stats_block(report: &Report, sep: &str) -> String {
     // History is opt-in by presence: no repository, no line. The share is the
     // same number the HTML report calls the hotspot debt share.
     if report.git_available {
+        // Label the backend instead of saying "Git" for a Perforce workspace.
+        let label = match report.vcs.as_deref() {
+            Some("p4") => "P4",
+            _ => "Git",
+        };
+        let unit = if report.vcs.as_deref() == Some("p4") {
+            "changelists"
+        } else {
+            "commits"
+        };
         out.push_str(&format!(
-            "  Git     {} commits/365d {sep} hotspots: top 10% of files = {:.1}% of lines\n",
+            "  {label:<8}{} {unit}/365d {sep} hotspots: top 10% of files = {:.1}% of lines\n",
             thousands(report.commits_scanned as usize),
             report.hotspot_debt_share,
         ));

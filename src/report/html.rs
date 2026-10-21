@@ -216,8 +216,14 @@ pub fn render(report: &Report) -> String {
     if report.git_available {
         let _ = writeln!(
             out,
-            "<p>git: {} commits in the last 365 days.</p>",
-            int(u64::from(report.commits_scanned))
+            "<p>{}: {} {} in the last 365 days.</p>",
+            escape_html(report.vcs.as_deref().unwrap_or("git")),
+            int(u64::from(report.commits_scanned)),
+            if report.vcs.as_deref() == Some("p4") {
+                "changelists"
+            } else {
+                "commits"
+            }
         );
     }
     let _ = writeln!(
@@ -983,6 +989,7 @@ mod tests {
             stats: stats(),
             top: vec![row("src/parser/grammar.ts", 0.62)],
             git_available: false,
+            vcs: None,
             commits_scanned: 0,
             hotspot_debt_share: 0.0,
             hotspots: Vec::new(),

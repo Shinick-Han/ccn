@@ -14,7 +14,7 @@ fn main() {
         }
     };
 
-    let mut report = ccn::metrics::build_with(&result, cli.hotspots);
+    let mut report = ccn::metrics::build_with(&result, cli.hotspots, cli.history_limit);
 
     // Record the snapshot only after the report exists: the trend compares
     // reports, not scans. A failed write must not fail the command.
