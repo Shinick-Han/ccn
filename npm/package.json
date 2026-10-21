@@ -1,0 +1,40 @@
+{
+  "name": "@shinick/ccn",
+  "version": "0.7.2",
+  "description": "Repository code-health scanner: per-file LOC, per-function CCN, histograms, trend and hotspot ranking",
+  "keywords": [
+    "cyclomatic-complexity",
+    "code-health",
+    "code-metrics",
+    "loc",
+    "ccn",
+    "cli",
+    "perforce",
+    "git"
+  ],
+  "homepage": "https://github.com/Shinick-Han/ccn",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shinick-Han/ccn.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Shinick-Han/ccn/issues"
+  },
+  "license": "MIT",
+  "author": "Shinick-Han",
+  "bin": {
+    "ccn": "bin/ccn.js"
+  },
+  "files": [
+    "bin/ccn.js",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@shinick/ccn-linux-x64": "0.7.2",
+    "@shinick/ccn-darwin-arm64": "0.7.2",
+    "@shinick/ccn-win32-x64": "0.7.2"
+  },
+  "engines": {
+    "node": ">=14"
+  }
+}

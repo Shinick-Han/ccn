@@ -58,3 +58,29 @@ single asset, so on an Intel runner the downloaded binary is the wrong
 architecture and will not run. Intel users should build from source (the action
 falls back automatically only when the download itself fails). The asset name is
 kept stable so action downloads do not depend on the runner image of the day.
+
+## npm
+
+`npm/` contains four packages:
+
+| package | contents |
+|---|---|
+| `@shinick/ccn` | 2 KB launcher (`bin/ccn.js`), `optionalDependencies` on the three platform packages |
+| `@shinick/ccn-linux-x64` | `ccn-linux-x64` (glibc 2.28) |
+| `@shinick/ccn-darwin-arm64` | `ccn-macos-x64` (arm64) |
+| `@shinick/ccn-win32-x64` | `ccn-windows-x64.exe` |
+
+No install script runs: npm picks the platform package through its `os`/`cpu`
+fields (the esbuild pattern), so `npm install --ignore-scripts` works.
+
+Publish flow:
+
+```powershell
+npm login
+node npm/prepare.js          # downloads the release binaries into platforms/*/vendor
+pwsh -File npm/publish.ps1   # publishes the three platform packages, then the main one
+```
+
+The binaries are gitignored (`npm/platforms/*/vendor/`) so the repository does
+not grow by 60 MB per release. `prepare.js` fetches exactly the version in
+`npm/package.json`; bump both `Cargo.toml` and `npm/package.json` together.

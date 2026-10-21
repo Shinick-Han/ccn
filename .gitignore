@@ -3,3 +3,8 @@
 
 .ccn/
 *.sarif
+
+/npm/vendor/
+*.tgz
+
+/npm/platforms/*/vendor/

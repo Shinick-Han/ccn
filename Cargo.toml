@@ -2,6 +2,7 @@
 name = "ccn"
 version = "0.7.2"
 edition = "2021"
+license = "MIT"
 rust-version = "1.80"
 description = "Repository code-health scanner: per-file LOC, per-function CCN, distribution histograms"
 
