@@ -12,14 +12,34 @@
 //!
 //! ```text
 //! p4 info                                       # detect
-//! p4 where <dir>                                # depot/client/local mapping
-//! p4 files <depot_prefix>...@=<cl>,@now         # revisions submitted after <cl>
+//! p4 client -o <client>                         # the client view lines
+//! p4 where <dir>                                # fallback: one depot/client/local triple
+//! p4 files <view-spec>@>N                       # revisions submitted after CL N
 //! p4 opened                                     # pending local edits
-//! p4 changes -m <n> -s submitted -ztag <depot_prefix>...
+//! p4 changes -m <n> -s submitted -ztag <view-spec>
 //! p4 describe -s -ztag <cl>                     # one per changelist, in parallel
 //! p4 files <depot>@<cl>                         # revision in effect at <cl>?
 //! p4 print -q <depot>@<cl>                      # raw contents as of <cl>
 //! ```
+//!
+//! # The client view, not one `p4 where` triple
+//!
+//! An EDA workspace rarely maps one depot directory onto one local directory.
+//! Its client view has several lines, remapped directories, exclusions and
+//! overlay lines, e.g.
+//!
+//! ```text
+//! View:
+//!     //depot/prj/main/... //ws/main/...
+//!     //depot/prj/lib/...  //ws/third_party/lib/...
+//!     -//depot/prj/main/secret/...
+//!     +//depot/prj/hotfix/... //ws/main/...
+//! ```
+//!
+//! [`mapping_for`] therefore reads the client spec and builds one [`Mapping`] of
+//! include/exclude view lines anchored at the scan root; `p4 where` is only the
+//! fallback when the spec cannot be read. See [`Mapping`] for the matching
+//! precedence, and [`FileAt::Unmapped`] for a path that the view excludes.
 //!
 //! # `@<cl>` is an as-of **tree**, `@=<cl>` is not
 //!
@@ -56,6 +76,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -146,17 +167,22 @@ pub fn detect(dir: &Path) -> bool {
 /// files is `Some(empty)`, which is different from "could not ask".
 pub fn changed_since(dir: &Path, rev: &str) -> Option<HashSet<String>> {
     let rev = parse_rev(rev)?;
-    let mapping = mapping_for(dir)?;
+    let mapping = mapping_cached(dir)?;
     let mut changed = HashSet::new();
 
     if let Rev::Since(cl) = rev {
         // `@>N` is "revisions after changelist N". `@=N,@now` includes the
         // files as they were *at* N, which would report untouched files too.
-        let spec = format!("{}...@>{cl}", depot_wildcard(&mapping.depot_prefix));
-        let out = run_p4(dir, &["files", &spec])?;
-        for depot in parse_files(&out) {
-            if let Some(path) = mapping.relative(&depot) {
-                changed.insert(path);
+        // Every include view line is queried: a remapped view can put changed
+        // files under several depot roots, and querying only one would silently
+        // drop the others.
+        for spec in mapping.depot_specs() {
+            let filespec = format!("{spec}@>{cl}");
+            let out = run_p4(dir, &["files", &filespec])?;
+            for depot in parse_files(&out) {
+                if let Some(path) = mapping.relative(&depot) {
+                    changed.insert(path);
+                }
             }
         }
     }
@@ -193,6 +219,12 @@ pub fn rev_exists(dir: &Path, rev: &str) -> bool {
 /// contains a `..` segment is likewise `Unavailable` before `p4` is spawned, so
 /// the request can never name a file outside the mapped workspace.
 ///
+/// A path that no include view line maps (or that an exclusion line removes)
+/// is [`FileAt::Unmapped`]: it has no depot history at all, which is neither a
+/// new file nor a read failure. A workspace whose client spec and `p4 where`
+/// mapping both fail is still `Unavailable`, because there the view is unknown
+/// rather than empty.
+///
 /// Selection is the **as-of tree** `@<cl>`, not `@=<cl>` (see the module docs):
 /// the file's revision in effect at that changelist, whatever change created it.
 ///
@@ -216,11 +248,13 @@ pub fn file_at(dir: &Path, rev: &str, path: &str) -> FileAt {
     let Some(rel) = relative_file_path(path) else {
         return FileAt::Unavailable;
     };
-    let Some(mapping) = mapping_for(dir) else {
+    let Some(mapping) = mapping_cached(dir) else {
         return FileAt::Unavailable;
     };
     let Some(depot) = mapping.depot_file(&rel) else {
-        return FileAt::Unavailable;
+        // The view does not contain this path: it has no depot history, so a
+        // baseline must skip it instead of inventing an empty one or a failure.
+        return FileAt::Unmapped;
     };
     let spec = as_of_spec(&depot, cl);
 
@@ -319,27 +353,35 @@ fn is_absence_diagnostic(text: &str) -> bool {
 /// fails are skipped individually; [`History::changelists`] counts the ones that
 /// succeeded.
 pub fn collect_history(dir: &Path, max_changes: u32) -> Option<History> {
-    let mapping = mapping_for(dir)?;
+    let mapping = mapping_cached(dir)?;
     let max = max_changes.max(1);
     let max_arg = max.to_string();
-    let depot_spec = format!("{}...", depot_wildcard(&mapping.depot_prefix));
 
-    let out = run_p4(
-        dir,
-        &[
-            // `-ztag` is a global p4 flag: it must precede the command, or p4
-            // rejects it with "Invalid option" and the whole history is lost.
-            "-ztag",
-            "changes",
-            "-m",
-            &max_arg,
-            "-s",
-            "submitted",
-            &depot_spec,
-        ],
-    )?;
+    // One query per include view line: a remapped client view spans more than
+    // one depot root, and a changelist that touches two of them is returned
+    // twice. It is deduplicated below by changelist number, so the window stays
+    // "the last `max` changelists", not "the last `max` per view line".
+    let mut changes: Vec<Change> = Vec::new();
+    for spec in mapping.depot_specs() {
+        let out = run_p4(
+            dir,
+            &[
+                // `-ztag` is a global p4 flag: it must precede the command, or p4
+                // rejects it with "Invalid option" and the whole history is lost.
+                "-ztag",
+                "changes",
+                "-m",
+                &max_arg,
+                "-s",
+                "submitted",
+                &spec,
+            ],
+        )?;
+        changes.extend(parse_changes(&out));
+    }
 
-    let mut changes = parse_changes(&out);
+    let mut seen_changes = HashSet::new();
+    changes.retain(|change| seen_changes.insert(change.change));
     changes.truncate(max as usize);
     if changes.is_empty() {
         return None;
@@ -413,61 +455,219 @@ pub fn collect_history(dir: &Path, max_changes: u32) -> Option<History> {
     })
 }
 
-/// Depot→local mapping of one workspace, plus the scan root's position inside
-/// that local root.
+/// One parsed line of a client spec's `View:` block, with both patterns kept
+/// as written (normalised to `/`, quotes and trailing `...` removed).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Mapping {
-    /// Depot path of the scan root's mapped directory, without a trailing `...`
-    /// and without a trailing separator (`//depot/proj`).
-    depot_prefix: String,
-    /// Local root `p4 where` reported, normalised. Kept for diagnostics; the
-    /// per-call work only needs the derived [`Mapping::scan_prefix`].
-    #[allow(dead_code)]
-    local_prefix: PathBuf,
-    /// Scan root relative to `local_prefix`, `/`-separated and trailing-slashed
-    /// (`"src/"`), or empty when the scan root *is* the local root.
-    scan_prefix: String,
+struct ViewLine {
+    /// Depot side (without the trailing `...`). Always present.
+    depot: String,
+    /// Directory subtree (`//a/b/...`) vs single file (`//a/b.c`).
+    is_dir: bool,
+    /// `+` overlay line.
+    overlay: bool,
+    /// Client side; `None` for an exclusion (`-`), which has no client side.
+    client: Option<String>,
 }
 
-impl Mapping {
-    /// Scan-root-relative path for a depot file, or `None` when the file is
-    /// outside the mapped local root (or is the root itself).
-    fn relative(&self, depot_path: &str) -> Option<String> {
-        let depot_path = depot_path.trim();
-        if self.depot_prefix.is_empty() {
+/// One include view line, anchored at the scan root.
+///
+/// The `client` pattern names a path below the client root, so a remapped line
+/// (`//depot/prj/lib/... //ws/third_party/lib/...`) is modelled exactly: the
+/// depot prefix and the local base are the two ends of the same line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncludeLine {
+    /// Depot directory prefix without a trailing `...` or separator
+    /// (`//depot/prj/main`), or the whole depot path for a single-file line.
+    depot: String,
+    /// `false` for a single-file line (`//depot/a.c //client/a.c`), which
+    /// matches only that exact path instead of a subtree.
+    is_dir: bool,
+    /// A `+` (overlay) line: it participates in include matching with priority
+    /// over a plain include of equal local depth. See [`Mapping`].
+    overlay: bool,
+    /// The line's local base: client root plus the client pattern's remainder.
+    local_base: PathBuf,
+    /// Scan root relative to `local_base`, `/`-separated with a trailing `/`
+    /// (`"src/"`), or empty when they coincide.
+    scan_prefix: String,
+    /// `local_base` relative to the scan root, `/`-separated with a trailing `/`
+    /// (`"main/"`), or empty. Non-empty only when `scan_prefix` is empty: the
+    /// scan root is then *above* this line's local base (the normal case when
+    /// scanning the client root of a remapped view).
+    base_prefix: String,
+    /// Scan-root-relative path of the single file a file view line maps.
+    single_file: Option<String>,
+}
+
+impl IncludeLine {
+    /// Match precedence, compared lexicographically: an exact single-file line
+    /// beats a subtree, then the deepest local base wins, then an overlay line
+    /// beats a plain include of the same depth.
+    fn rank(&self) -> (u8, usize, u8) {
+        (
+            u8::from(self.single_file.is_some()),
+            self.local_base.components().count(),
+            u8::from(self.overlay),
+        )
+    }
+
+    /// Depot path for the scan-root-relative `rel`, if this line maps it.
+    fn depot_for(&self, rel: &str) -> Option<String> {
+        if let Some(name) = &self.single_file {
+            return (name == rel).then(|| self.depot.clone());
+        }
+        let rest = if self.base_prefix.is_empty() {
+            // The scan root is inside (or is) this line's local base, so the key
+            // is already relative to the base once `scan_prefix` is re-applied.
+            rel
+        } else {
+            rel.strip_prefix(self.base_prefix.as_str())?
+        };
+        if rest.is_empty() {
             return None;
         }
-        let rest = depot_path.strip_prefix(&self.depot_prefix)?;
+        Some(format!("{}/{}{}", self.depot, self.scan_prefix, rest))
+    }
+
+    /// Scan-root-relative path for `depot_path`, if this line maps it.
+    fn scan_relative(&self, depot_path: &str) -> Option<String> {
+        if let Some(name) = &self.single_file {
+            return (depot_path == self.depot).then(|| name.clone());
+        }
+        let rest = depot_path.strip_prefix(&self.depot)?;
         // The prefix must end at a path boundary: `//depot/proj2/x` is not under
         // `//depot/proj`.
         let rest = rest.strip_prefix('/')?;
         if rest.is_empty() {
             return None;
         }
-        let rel = if self.scan_prefix.is_empty() {
-            rest
+        if !self.base_prefix.is_empty() {
+            Some(format!("{}{}", self.base_prefix, rest))
+        } else if self.scan_prefix.is_empty() {
+            Some(rest.to_string())
         } else {
-            rest.strip_prefix(self.scan_prefix.as_str())?
-        };
-        if rel.is_empty() {
+            rest.strip_prefix(self.scan_prefix.as_str())
+                .map(str::to_string)
+        }
+    }
+}
+
+/// Depot→local mapping of one workspace, plus the scan root's position inside
+/// that local root.
+///
+/// A mapping is the client **view** (not a single `p4 where` triple): every
+/// include line is kept, so remapped directories, exclusions and overlays are
+/// modelled. Matching rules, in order:
+///
+/// 1. **Includes**: [`Mapping::depot_file`] and [`Mapping::relative`] pick the
+///    include line with the longest matching local base (respectively depot
+///    prefix). A single-file line wins over a subtree line, and an overlay (`+`)
+///    line wins a tie against a plain include; any remaining tie goes to the
+///    **later** line in the spec, which is Perforce's "later mapping overrides
+///    an earlier one" rule. This is a deliberate simplification of overlay
+///    semantics: a `+` line is treated as an include with tie-breaking priority,
+///    not as a fallback that only applies where the plain include matched
+///    nothing.
+/// 2. **Exclusions**: after a candidate is chosen, any exclusion (`-`) line
+///    whose depot prefix covers it removes it, so an excluded path reports
+///    `None` even when an include or overlay line also covers it. Exclusion
+///    always wins, which is how `p4` treats `-` lines.
+///
+/// Only subtree (`...`) and exact-file patterns are modelled. `*` and `%%n`
+/// wildcards are not interpreted: such a view line is skipped, so its files are
+/// reported as unmapped instead of being mapped to a literal, nonexistent depot
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mapping {
+    /// Include view lines, in client-spec order.
+    includes: Vec<IncludeLine>,
+    /// Excluded depot prefixes, in client-spec order.
+    exclusions: Vec<String>,
+}
+
+impl Mapping {
+    /// Scan-root-relative path for a depot file, or `None` when no include line
+    /// maps it or an exclusion line removes it.
+    fn relative(&self, depot_path: &str) -> Option<String> {
+        let depot_path = depot_path.trim();
+        if depot_path.is_empty() || self.is_excluded(depot_path) {
             return None;
         }
+        let (_, rel) = self
+            .includes
+            .iter()
+            .filter_map(|line| {
+                line.scan_relative(depot_path)
+                    .map(|rel| ((line.depot.len(), line.overlay), rel))
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right))?;
         Some(rel.replace('\\', "/"))
     }
 
     /// Depot path for the scan-root-relative `path`, or `None` when the path is
-    /// not a plain relative path inside the workspace (see
-    /// [`relative_file_path`]).
+    /// not a plain relative path (see [`relative_file_path`]), no include line
+    /// maps it, or an exclusion removes it.
     ///
     /// This is the inverse of [`Mapping::relative`]: the scan root's own offset
-    /// inside the local root is re-applied, so a workspace whose scan root is
-    /// `proj/src` turns `a.rs` back into `//depot/proj/src/a.rs`.
+    /// inside each local base is re-applied, so a workspace whose scan root is
+    /// `proj/src` turns `a.rs` back into `//depot/proj/src/a.rs`, and a scan of
+    /// a remapped client root turns `third_party/lib/x.c` into
+    /// `//depot/prj/lib/x.c`.
     fn depot_file(&self, path: &str) -> Option<String> {
-        if self.depot_prefix.is_empty() {
-            return None;
-        }
         let rel = relative_file_path(path)?;
-        Some(format!("{}/{}{}", self.depot_prefix, self.scan_prefix, rel))
+        let (_, depot) = self
+            .includes
+            .iter()
+            .filter_map(|line| line.depot_for(&rel).map(|depot| (line.rank(), depot)))
+            .max_by(|(left, _), (right, _)| left.cmp(right))?;
+        (!self.is_excluded(&depot)).then_some(depot)
+    }
+
+    /// True when `depot_path` is one of the excluded depot paths (or below one).
+    fn is_excluded(&self, depot_path: &str) -> bool {
+        self.exclusions.iter().any(|excluded| {
+            depot_path
+                .strip_prefix(excluded.as_str())
+                .is_some_and(|rest| {
+                    rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')
+                })
+        })
+    }
+
+    /// Every include depot prefix, deduplicated and sorted.
+    fn depot_prefixes(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut prefixes: Vec<String> = self
+            .includes
+            .iter()
+            .filter(|line| seen.insert(line.depot.clone()))
+            .map(|line| line.depot.clone())
+            .collect();
+        prefixes.sort();
+        prefixes
+    }
+
+    /// Every include view line as a `p4 files`/`p4 changes` file spec: a
+    /// directory subtree as `//depot/x/...`, a single file as its exact path.
+    ///
+    /// Deduplicated and sorted, like [`Mapping::depot_prefixes`]. A remapped
+    /// view needs all of them: querying only the first would drop an entire
+    /// depot root from history and from the changed-file list.
+    fn depot_specs(&self) -> Vec<String> {
+        self.depot_prefixes()
+            .into_iter()
+            .map(|depot| {
+                let is_dir = self
+                    .includes
+                    .iter()
+                    .any(|line| line.depot == depot && line.is_dir);
+                if is_dir {
+                    format!("{}...", depot_wildcard(&depot))
+                } else {
+                    depot
+                }
+            })
+            .collect()
     }
 }
 
@@ -542,14 +742,353 @@ fn depot_wildcard(prefix: &str) -> String {
     }
 }
 
+/// Resolve `dir` from the client spec, falling back to `p4 where`.
+///
+/// The client spec is the only place that knows the whole view: multiple
+/// include lines, remapped directories, exclusions and overlays. `p4 where`
+/// answers for one path only, so it is kept as the fallback for a client spec
+/// that cannot be read (an old server, a denied `client -o`, an unparseable
+/// spec) and as the shape its tests already pin.
+/// Resolve the client view once per process for a given workspace and
+/// Perforce environment.
+///
+/// `file_at` is called once per file in a baseline comparison. Without this,
+/// every file pays `p4 info` plus `p4 client -o`; at 20k files that is 40k
+/// process spawns before the actual baseline read. The key includes the
+/// environment that selects the server/client, and the cache lives for the
+/// process (one CLI invocation, or one test binary).
+fn mapping_cached(dir: &Path) -> Option<Arc<Mapping>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Mapping>>>>> = OnceLock::new();
+
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let env = |name: &str| std::env::var(name).unwrap_or_default();
+    let key = format!(
+        "{}|{}|{}|{}|{}",
+        canonical.to_string_lossy(),
+        env("P4PORT"),
+        env("P4CLIENT"),
+        env("P4USER"),
+        env("P4CONFIG")
+    );
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hit) = guard.get(&key) {
+        return hit.clone();
+    }
+    // Hold the lock across the two `p4` calls: the first thread resolves the
+    // view while the others wait, instead of each spawning its own pair.
+    let value = mapping_for(dir).map(Arc::new);
+    guard.insert(key, value.clone());
+    value
+}
+
 fn mapping_for(dir: &Path) -> Option<Mapping> {
     if !dir.is_dir() {
         return None;
     }
     // The scanner canonicalises its root, which yields `\\?\C:\...` on Windows;
-    // `p4 where` does not understand the verbatim prefix.
+    // p4 does not understand the verbatim prefix.
     let plain = dir.to_string_lossy();
     let dir = Path::new(plain.trim_start_matches(r"\\?\"));
+    mapping_from_client_spec(dir).or_else(|| mapping_from_where(dir))
+}
+
+/// Build the mapping from `p4 client -o <client>`, or `None` when the spec
+/// cannot be read or contains no usable view line.
+///
+/// `p4 info` supplies the client name and root; `p4 client -o` only prints the
+/// spec (no editor, no mutation), so this costs one extra round-trip per scan
+/// and never blocks on input.
+fn mapping_from_client_spec(dir: &Path) -> Option<Mapping> {
+    let info = run_p4(dir, &["info"])?;
+    let client = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Client name: "))
+        .map(str::trim)
+        .unwrap_or("");
+    if client.is_empty() || client.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    let root = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Client root: "))
+        .map(str::trim)
+        .filter(|root| !root.is_empty() && !root.eq_ignore_ascii_case("unknown"))?;
+
+    let spec = run_p4(dir, &["client", "-o", client])?;
+    let view = parse_client_view(&spec);
+    if view.is_empty() {
+        return None;
+    }
+    mapping_from_view(&view, Path::new(root), dir)
+}
+
+/// Parse the `View:` block of `p4 client -o` output.
+///
+/// The block starts at the `View:` field and continues while the following
+/// lines are indented (P4 writes a tab before every view line) or blank; the
+/// first non-indented field ends it. A line that is not a valid view line is
+/// skipped rather than failing the whole spec, so one comment or unexpected
+/// field cannot hide the rest of the view.
+fn parse_client_view(text: &str) -> Vec<ViewLine> {
+    let mut view = Vec::new();
+    let mut in_view = false;
+    for line in text
+        .lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+    {
+        if !in_view {
+            if line.trim_end() == "View:" {
+                in_view = true;
+            }
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A view line is indented; the next field (`SubmitOptions:`, ...) is not.
+        if !(line.starts_with(' ') || line.starts_with('\t')) {
+            break;
+        }
+        view.extend(parse_view_line(line));
+    }
+    view
+}
+
+/// Parse one view line into a [`ViewLine`].
+///
+/// Grammar: `[+|-] <depot-pattern> [<client-pattern>]`, with either side
+/// optionally wrapped in double quotes (paths with spaces). `-` lines carry
+/// only a depot side; `+` lines are overlay includes. Separators are normalised
+/// to `/`, and a trailing `...` marks a directory pattern (a pattern without it
+/// maps one file). A plain include with no client side is not a valid P4 view
+/// line and is dropped rather than guessed at.
+fn parse_view_line(line: &str) -> Option<ViewLine> {
+    let tokens = split_view_tokens(line);
+    let first = tokens.first()?;
+
+    // Tolerate the spaced marker form (`- //depot/x`), which P4 itself writes
+    // without the space but which is otherwise unambiguous.
+    if first == "-" || first == "+" {
+        let depot_token = tokens.get(1)?;
+        let depot = normalize_pattern(depot_token)?;
+        let is_dir = is_directory_pattern(depot_token);
+        if first == "-" {
+            return Some(ViewLine {
+                depot,
+                is_dir,
+                overlay: false,
+                client: None,
+            });
+        }
+        let client = normalize_pattern(tokens.get(2)?)?;
+        return Some(ViewLine {
+            depot,
+            is_dir,
+            overlay: true,
+            client: Some(client),
+        });
+    }
+
+    let (overlay, exclusion, depot_token) = if let Some(path) = first.strip_prefix('+') {
+        (true, false, path)
+    } else if let Some(path) = first.strip_prefix('-') {
+        (false, true, path)
+    } else {
+        (false, false, first.as_str())
+    };
+    let depot = normalize_pattern(depot_token)?;
+    let is_dir = is_directory_pattern(depot_token);
+
+    if exclusion {
+        return Some(ViewLine {
+            depot,
+            is_dir,
+            overlay: false,
+            client: None,
+        });
+    }
+    let client = normalize_pattern(tokens.get(1)?)?;
+    Some(ViewLine {
+        depot,
+        is_dir,
+        overlay,
+        client: Some(client),
+    })
+}
+
+/// Split a view line into tokens, treating a double-quoted span as one token
+/// (P4 quotes paths that contain spaces) and dropping the quotes.
+fn split_view_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for ch in line.trim().chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Normalise one side of a view line: `\` becomes `/`, a trailing `...` and
+/// trailing separators are dropped (the caller tracks "directory" separately).
+///
+/// The result must be a depot/client path (`//a/b`); anything else is not a
+/// view path and the line is dropped. Only a trailing `...` subtree is
+/// modelled: `*`/`%%n` wildcards cannot be reduced to a prefix, so a line that
+/// uses them is skipped — its files are then unmapped rather than mapped to a
+/// literal path the depot does not contain.
+fn normalize_pattern(raw: &str) -> Option<String> {
+    let path = raw.replace('\\', "/");
+    let path = path.trim_end_matches("...");
+    let path = path.trim_end_matches('/');
+    if !path.starts_with("//") || path.len() <= 2 {
+        return None;
+    }
+    if path.contains('*') || path.contains('%') {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// True when a view pattern maps a directory subtree (`...` or a trailing `/`).
+fn is_directory_pattern(raw: &str) -> bool {
+    let path = raw.replace('\\', "/");
+    path.ends_with("...") || path.ends_with('/')
+}
+
+/// Build a [`Mapping`] from parsed view lines, the client root and the scan
+/// root.
+///
+/// Each include line contributes a local base (`client_root` + the client
+/// pattern below `//<client>/`) and the scan-relative prefix of that base. A
+/// line whose local base is neither above nor below the scan root is dropped:
+/// it cannot name anything under the scan root in either direction.
+fn mapping_from_view(view: &[ViewLine], client_root: &Path, scan_root: &Path) -> Option<Mapping> {
+    let mut includes = Vec::new();
+    let mut exclusions = Vec::new();
+
+    for line in view {
+        let Some(client_pattern) = &line.client else {
+            exclusions.push(line.depot.clone());
+            continue;
+        };
+        let Some(local_base) = client_local_base(client_root, client_pattern) else {
+            continue;
+        };
+
+        if line.is_dir {
+            let Some((scan_prefix, base_prefix)) = anchor(scan_root, &local_base) else {
+                continue;
+            };
+            includes.push(IncludeLine {
+                depot: line.depot.clone(),
+                is_dir: true,
+                overlay: line.overlay,
+                local_base,
+                scan_prefix,
+                base_prefix,
+                single_file: None,
+            });
+        } else {
+            // A single-file line maps that one file, not a subtree: its name is
+            // the path of the local file relative to the scan root.
+            let Some(parts) = relative_prefix(&local_base, scan_root) else {
+                continue;
+            };
+            if parts.is_empty() {
+                continue; // the "file" is the scan root itself
+            }
+            let name = parts.join("/");
+            includes.push(IncludeLine {
+                depot: line.depot.clone(),
+                is_dir: false,
+                overlay: line.overlay,
+                local_base,
+                scan_prefix: String::new(),
+                base_prefix: String::new(),
+                single_file: Some(name),
+            });
+        }
+    }
+
+    if includes.is_empty() {
+        return None;
+    }
+    Some(Mapping {
+        includes,
+        exclusions,
+    })
+}
+
+/// Local path of a client-side view pattern: the client root plus everything
+/// below the pattern's leading `//<client>/` component.
+///
+/// P4 requires that component to be the client name; it is not re-checked
+/// because the remainder under the client root is what defines the local base,
+/// and a mismatch would still produce the path P4 itself would use.
+fn client_local_base(client_root: &Path, pattern: &str) -> Option<PathBuf> {
+    let rest = pattern.strip_prefix("//")?;
+    let (_client, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut base = client_root.to_path_buf();
+    for part in tail.split('/') {
+        if !part.is_empty() && part != "." {
+            base.push(part);
+        }
+    }
+    Some(base)
+}
+
+/// The scan root's position relative to a local base, as
+/// `(scan_prefix, base_prefix)`.
+///
+/// - scan root inside the base: `("src/", "")` — the key is below the base, so
+///   the depot path re-applies `src/`;
+/// - base inside the scan root: `("", "main/")` — only keys below `main/` are
+///   mapped, and the depot path drops that prefix;
+/// - equal: `("", "")`;
+/// - unrelated (different drive, sibling trees): `None`, so the line is not
+///   visible from this scan root.
+fn anchor(scan_root: &Path, local_base: &Path) -> Option<(String, String)> {
+    if let Some(parts) = relative_prefix(scan_root, local_base) {
+        let prefix = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", parts.join("/"))
+        };
+        return Some((prefix, String::new()));
+    }
+    let parts = relative_prefix(local_base, scan_root)?;
+    if parts.is_empty() {
+        return Some((String::new(), String::new()));
+    }
+    Some((String::new(), format!("{}/", parts.join("/"))))
+}
+
+/// Fallback: resolve `dir` through `p4 where`, when the client spec could not
+/// be read.
+fn mapping_from_where(dir: &Path) -> Option<Mapping> {
     // `p4 where` needs a file spec, not a bare directory: without the wildcard
     // it fails with "must refer to client ... or a depot".
     let local = dir.to_string_lossy();
@@ -562,12 +1101,15 @@ fn mapping_for(dir: &Path) -> Option<Mapping> {
     parse_where(&out, dir)
 }
 
-/// Parse `p4 where <dir>` into a [`Mapping`] anchored at `scan_root`.
+/// Parse `p4 where <dir>` into a one-line [`Mapping`] anchored at `scan_root`.
 ///
 /// The normal form is one line with three whitespace-separated columns
 /// (depot / client / local). Some server/client combinations print the three
 /// values on separate lines, so both shapes are accepted. The local column may
 /// contain spaces; everything after the client column is taken verbatim.
+///
+/// This is the fallback path: it cannot see exclusions or other view lines, so
+/// the resulting mapping is a single include covering that one triple.
 fn parse_where(text: &str, scan_root: &Path) -> Option<Mapping> {
     let lines: Vec<&str> = text
         .lines()
@@ -595,6 +1137,9 @@ fn parse_where(text: &str, scan_root: &Path) -> Option<Mapping> {
         .trim_end_matches("...")
         .trim_end_matches(['/', '\\'])
         .to_string();
+    if depot_prefix.is_empty() {
+        return None;
+    }
 
     let local_root = local.trim_end_matches("...").trim_end_matches(['/', '\\']);
     if local_root.is_empty() {
@@ -604,17 +1149,19 @@ fn parse_where(text: &str, scan_root: &Path) -> Option<Mapping> {
 
     // The scan root must be inside the local root; otherwise the depot files
     // have no scan-relative name.
-    let scan_parts = relative_prefix(scan_root, &local_prefix)?;
-    let scan_prefix = if scan_parts.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", scan_parts.join("/"))
-    };
+    let (scan_prefix, base_prefix) = anchor(scan_root, &local_prefix)?;
 
     Some(Mapping {
-        depot_prefix,
-        local_prefix: normalize(&local_prefix),
-        scan_prefix,
+        includes: vec![IncludeLine {
+            depot: depot_prefix,
+            is_dir: true,
+            overlay: false,
+            local_base: normalize(&local_prefix),
+            scan_prefix,
+            base_prefix,
+            single_file: None,
+        }],
+        exclusions: Vec::new(),
     })
 }
 
@@ -950,7 +1497,8 @@ mod tests {
         let out = "//depot/proj/... //client/proj/... C:\\ws\\proj\\...\n";
         let mapping = parse_where(out, Path::new("C:\\ws\\proj")).expect("mapping");
 
-        assert_eq!(mapping.depot_prefix, "//depot/proj");
+        assert_eq!(mapping.depot_prefixes(), vec!["//depot/proj".to_string()]);
+        assert_eq!(mapping.depot_specs(), vec!["//depot/proj/...".to_string()]);
         assert_eq!(
             mapping.relative("//depot/proj/src/a.rs").as_deref(),
             Some("src/a.rs")
@@ -1108,6 +1656,250 @@ no files to display
             mapping.relative("//depot/proj2/x.rs"),
             None,
             "the depot prefix must end at a path boundary"
+        );
+    }
+
+    /// Platform-neutral workspace path: `C:\ws\...` on Windows, `/ws/...`
+    /// elsewhere, so the view tests exercise the same view text on both.
+    #[cfg(windows)]
+    fn ws_path(parts: &[&str]) -> PathBuf {
+        let mut path = PathBuf::from(r"C:\ws");
+        for part in parts {
+            path.push(part);
+        }
+        path
+    }
+
+    #[cfg(unix)]
+    fn ws_path(parts: &[&str]) -> PathBuf {
+        let mut path = PathBuf::from("/ws");
+        for part in parts {
+            path.push(part);
+        }
+        path
+    }
+
+    /// Build a mapping from a `View:` body, exactly as `mapping_for` does after
+    /// `p4 info` + `p4 client -o`.
+    fn view_mapping(body: &str, scan_root: &Path) -> Option<Mapping> {
+        let spec = format!(
+            "# A Perforce Client Specification.\n\
+             \n\
+             Client:\tccn_complex\n\
+             \n\
+             Root:\tC:\\ws\\ccn_complex\n\
+             \n\
+             View:\n\
+             {body}\n\
+             SubmitOptions:\tsubmitunchanged\n"
+        );
+        let client_root = ws_path(&["ccn_complex"]);
+        mapping_from_view(&parse_client_view(&spec), &client_root, scan_root)
+    }
+
+    #[test]
+    fn a_multi_line_view_maps_every_include_and_honours_exclusions() {
+        let body = "\
+\t//depot/prj/main/... //ccn_complex/main/...\n\
+\t//depot/prj/lib/... //ccn_complex/third_party/lib/...\n\
+\t-//depot/prj/main/secret/...\n\
+\t+//depot/prj/hotfix/... //ccn_complex/main/hotfix/...\n\
+\t\"//depot/prj/my tools/...\" \"//ccn_complex/tools dir/...\"";
+        let root = ws_path(&["ccn_complex"]);
+        let mapping = view_mapping(body, &root).expect("mapping from the client view");
+
+        // Plain include, remapped directory, overlay and a quoted path with
+        // spaces each map through their own line.
+        assert_eq!(
+            mapping.depot_file("main/a.c").as_deref(),
+            Some("//depot/prj/main/a.c")
+        );
+        assert_eq!(
+            mapping.depot_file("third_party/lib/x.c").as_deref(),
+            Some("//depot/prj/lib/x.c"),
+            "the remapped directory is not fabricated as //depot/prj/main/..."
+        );
+        assert_eq!(
+            mapping.depot_file("main/hotfix/h.c").as_deref(),
+            Some("//depot/prj/hotfix/h.c"),
+            "the overlay line wins over the shallower plain include"
+        );
+        assert_eq!(
+            mapping.depot_file("tools dir/notes.txt").as_deref(),
+            Some("//depot/prj/my tools/notes.txt"),
+            "quoted paths keep their spaces"
+        );
+
+        // The depot→scan-relative direction round-trips.
+        for (rel, depot) in [
+            ("main/a.c", "//depot/prj/main/a.c"),
+            ("third_party/lib/x.c", "//depot/prj/lib/x.c"),
+            ("main/hotfix/h.c", "//depot/prj/hotfix/h.c"),
+            ("tools dir/notes.txt", "//depot/prj/my tools/notes.txt"),
+        ] {
+            assert_eq!(mapping.relative(depot).as_deref(), Some(rel), "{depot}");
+        }
+
+        // The exclusion is depot-side only and beats the include that covers it.
+        assert_eq!(mapping.depot_file("main/secret/s.c"), None);
+        assert_eq!(mapping.relative("//depot/prj/main/secret/s.c"), None);
+
+        // A path outside every line is simply not mapped.
+        assert_eq!(mapping.depot_file("other/z.c"), None);
+    }
+
+    #[test]
+    fn an_overlay_line_wins_a_tie_against_a_plain_include() {
+        // Both lines have the same local base. Perforce gives the `+` line
+        // precedence, so the overlay's depot path is the one used; the plain
+        // include still answers the reverse direction for its own depot tree.
+        let body = "\
+\t//depot/prj/main/... //ccn_complex/main/...\n\
+\t+//depot/prj/hotfix/... //ccn_complex/main/...";
+        let root = ws_path(&["ccn_complex"]);
+        let mapping = view_mapping(body, &root).expect("mapping");
+
+        assert_eq!(
+            mapping.depot_file("main/a.c").as_deref(),
+            Some("//depot/prj/hotfix/a.c"),
+            "the overlay line wins the tie"
+        );
+        assert_eq!(
+            mapping.relative("//depot/prj/main/a.c").as_deref(),
+            Some("main/a.c")
+        );
+        assert_eq!(
+            mapping.relative("//depot/prj/hotfix/a.c").as_deref(),
+            Some("main/a.c")
+        );
+    }
+
+    #[test]
+    fn the_longest_local_base_wins() {
+        let body = "\
+\t//depot/prj/main/... //ccn_complex/main/...\n\
+\t//depot/prj/vendor/... //ccn_complex/main/vendor/...";
+        let root = ws_path(&["ccn_complex"]);
+        let mapping = view_mapping(body, &root).expect("mapping");
+
+        assert_eq!(
+            mapping.depot_file("main/vendor/v.c").as_deref(),
+            Some("//depot/prj/vendor/v.c"),
+            "the deeper client directory wins over the enclosing one"
+        );
+        assert_eq!(
+            mapping.depot_file("main/m.c").as_deref(),
+            Some("//depot/prj/main/m.c"),
+            "the enclosing line still maps everything else"
+        );
+        assert_eq!(
+            mapping.relative("//depot/prj/vendor/v.c").as_deref(),
+            Some("main/vendor/v.c")
+        );
+    }
+
+    #[test]
+    fn a_single_file_view_line_maps_only_that_file() {
+        let body = "\
+\t//depot/a.c //ccn_complex/a.c\n\
+\t//depot/prj/dir/... //ccn_complex/dir/...";
+        let root = ws_path(&["ccn_complex"]);
+        let mapping = view_mapping(body, &root).expect("mapping");
+
+        assert_eq!(mapping.depot_file("a.c").as_deref(), Some("//depot/a.c"));
+        assert_eq!(mapping.relative("//depot/a.c").as_deref(), Some("a.c"));
+        assert_eq!(
+            mapping.depot_file("dir/b.c").as_deref(),
+            Some("//depot/prj/dir/b.c")
+        );
+        assert_eq!(mapping.relative("//depot/a.h"), None);
+
+        assert_eq!(
+            mapping.depot_specs(),
+            vec!["//depot/a.c".to_string(), "//depot/prj/dir/...".to_string()],
+            "a single-file line is queried as its exact path, not as a subtree"
+        );
+    }
+
+    #[test]
+    fn wildcard_view_lines_are_not_guessed_at() {
+        // `*`/`%%n` cannot be reduced to a prefix. Skipping the line reports
+        // its files as unmapped instead of inventing a literal depot path.
+        let root = ws_path(&["ccn_complex"]);
+        assert_eq!(
+            view_mapping("\t//depot/prj/*.c //ccn_complex/src/*.c", &root),
+            None
+        );
+    }
+
+    #[test]
+    fn a_path_outside_every_view_line_is_unmapped() {
+        let body = "\
+\t//depot/prj/main/... //ccn_complex/main/...";
+        let root = ws_path(&["ccn_complex"]);
+        let mapping = view_mapping(body, &root).expect("mapping");
+
+        assert_eq!(mapping.depot_file("outside.c"), None);
+        assert_eq!(mapping.depot_file("main/../outside.c"), None);
+        assert!(!mapping.depot_prefixes().is_empty());
+    }
+
+    #[test]
+    fn depot_prefixes_are_deduped_and_include_overlay_lines() {
+        let body = "\
+\t//depot/prj/main/... //ccn_complex/main/...\n\
+\t//depot/prj/main/... //ccn_complex/main/dup/...\n\
+\t+//depot/prj/hotfix/... //ccn_complex/main/hotfix/...\n\
+\t-//depot/prj/main/secret/...";
+        let root = ws_path(&["ccn_complex"]);
+        let mapping = view_mapping(body, &root).expect("mapping");
+
+        assert_eq!(
+            mapping.depot_prefixes(),
+            vec![
+                "//depot/prj/hotfix".to_string(),
+                "//depot/prj/main".to_string(),
+            ],
+            "duplicates collapse, overlays are included and exclusions are not"
+        );
+        assert_eq!(
+            mapping.depot_specs(),
+            vec![
+                "//depot/prj/hotfix/...".to_string(),
+                "//depot/prj/main/...".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_view_with_only_exclusions_or_nothing_visible_has_no_mapping() {
+        let body = "\
+\t-//depot/prj/main/secret/...";
+        let root = ws_path(&["ccn_complex"]);
+        assert_eq!(view_mapping(body, &root), None);
+
+        // An include whose local base is a sibling of the scan root cannot name
+        // anything under it.
+        let sibling = "\
+\t//depot/prj/main/... //ccn_complex/main/...";
+        assert_eq!(view_mapping(sibling, &ws_path(&["elsewhere"])), None);
+    }
+
+    #[test]
+    fn view_lines_with_a_scan_root_inside_the_local_base_reapply_the_offset() {
+        // A scan of `<client>/main` still needs the `main/` segment in the depot
+        // path, exactly like the `p4 where` fallback's subdirectory case.
+        let body = "\
+\t//depot/prj/main/... //ccn_complex/main/...";
+        let mapping = view_mapping(body, &ws_path(&["ccn_complex", "main"])).expect("mapping");
+
+        assert_eq!(
+            mapping.depot_file("src/a.c").as_deref(),
+            Some("//depot/prj/main/src/a.c")
+        );
+        assert_eq!(
+            mapping.relative("//depot/prj/main/src/a.c").as_deref(),
+            Some("src/a.c")
         );
     }
 

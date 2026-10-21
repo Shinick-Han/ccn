@@ -14,6 +14,11 @@
 //!   unknown revision, VCS error) is **not** treated as new. It is counted in
 //!   [`Baseline::files_unavailable`], stays out of `files_compared`, and
 //!   produces no findings: unreadable history must never fabricate `Added`.
+//! - A file that is [`crate::vcs::FileAt::Unmapped`] (the Perforce client view
+//!   excludes it, or does not map it at all) has no depot history to compare
+//!   against. It is counted in [`Baseline::files_unmapped`], stays out of
+//!   `files_compared`, and produces no findings. It is not a read failure
+//!   either, so it never makes the baseline gate "incomplete".
 //! - `files_skipped` only counts files whose baseline copy *was* read but could
 //!   not be analysed.
 //!
@@ -88,6 +93,12 @@ pub struct Baseline {
     /// new file.
     #[serde(default)]
     pub files_unavailable: usize,
+    /// Files the version-control view does not contain (a Perforce exclusion or
+    /// an unmapped path). They have no depot history, so they are excluded from
+    /// `files_compared`, produce no findings, and are not an operational error:
+    /// there is nothing to compare, not something that failed to be read.
+    #[serde(default)]
+    pub files_unmapped: usize,
     /// Sorted by `ccn` descending.
     pub changes: Vec<Change>,
 }
@@ -255,7 +266,9 @@ fn match_name(
 /// against. A file absent at `rev` is compared against an empty baseline (it is
 /// new). A file whose baseline copy is **unavailable** is counted in
 /// [`Baseline::files_unavailable`] and skipped entirely, so a VCS read failure
-/// can never be reported as added functions.
+/// can never be reported as added functions. A file the version-control view
+/// does not contain is counted in [`Baseline::files_unmapped`] and skipped the
+/// same way — but it is not a failure, just a path with no history.
 ///
 /// The VCS reads dominate the cost and are independent per file, so they run on
 /// rayon's pool. The result is sorted afterwards, which makes the output
@@ -281,15 +294,27 @@ pub fn collect(result: &ScanResult, backend: Backend, rev: &str, threshold: u32)
         })
         .collect();
 
+    summarize(outcomes, rev, threshold)
+}
+
+/// Turn per-file outcomes into the reportable [`Baseline`].
+///
+/// Pulled out of [`collect`] so the counting rules — which outcome is compared,
+/// skipped, unavailable or unmapped — are testable without a VCS: an unmapped
+/// file must never appear as `Added`, and only `Unavailable` marks the baseline
+/// incomplete.
+fn summarize(outcomes: Vec<FileOutcome>, rev: &str, threshold: u32) -> Baseline {
     let mut files_compared = 0usize;
     let mut files_skipped = 0usize;
     let mut files_unavailable = 0usize;
+    let mut files_unmapped = 0usize;
     let mut changes = Vec::new();
 
     for outcome in outcomes {
         match outcome {
             FileOutcome::Skipped => files_skipped += 1,
             FileOutcome::Unavailable => files_unavailable += 1,
+            FileOutcome::Unmapped => files_unmapped += 1,
             FileOutcome::Compared {
                 path,
                 base,
@@ -308,6 +333,7 @@ pub fn collect(result: &ScanResult, backend: Backend, rev: &str, threshold: u32)
         files_compared,
         files_skipped,
         files_unavailable,
+        files_unmapped,
         changes,
     }
 }
@@ -323,6 +349,8 @@ enum FileOutcome {
     Skipped,
     /// The baseline read could not be answered; never invented as `Added`.
     Unavailable,
+    /// The path is not in the client's view: no depot history to compare.
+    Unmapped,
     Compared {
         path: String,
         base: Vec<FunctionRef>,
@@ -359,6 +387,7 @@ fn measure_baseline(
             };
         }
         FileAt::Unavailable => return FileOutcome::Unavailable,
+        FileAt::Unmapped => return FileOutcome::Unmapped,
     };
 
     let base = crate::ccn::analyze_file(Path::new(&file.path), &bytes, &file.lang);
@@ -381,7 +410,8 @@ fn measure_baseline(
 /// says nothing about whether the old path would have answered, and retrying
 /// there would only risk turning a failure into a fabricated baseline. An
 /// unavailable read of the old path stays unavailable rather than defaulting to
-/// "new".
+/// "new". An unmapped path is not retried either: it has no history of its own,
+/// and the view that hides it would hide its old name too.
 fn read_baseline(
     root: &Path,
     backend: Backend,
@@ -1160,6 +1190,67 @@ mod tests {
     }
 
     #[test]
+    fn an_unmapped_file_is_neither_new_nor_a_read_failure() {
+        // A path the view does not contain has no depot history: it must not be
+        // compared (which would have made its functions `Added`), and it must
+        // not be counted as a read failure either.
+        let outcomes = vec![
+            FileOutcome::Unmapped,
+            FileOutcome::Unavailable,
+            FileOutcome::Compared {
+                path: "kept.rs".to_string(),
+                base: vec![func("foo", 1, 1)],
+                current: vec![func("foo", 2, 20)],
+            },
+        ];
+
+        let baseline = summarize(outcomes, "123", 10);
+
+        assert_eq!(baseline.files_unmapped, 1);
+        assert_eq!(baseline.files_unavailable, 1);
+        assert_eq!(baseline.files_compared, 1);
+        assert_eq!(baseline.files_skipped, 0);
+        assert_eq!(
+            baseline
+                .changes
+                .iter()
+                .map(|change| (change.path.as_str(), change.kind))
+                .collect::<Vec<_>>(),
+            vec![("kept.rs", Kind::Worsened)],
+            "the unmapped path produced no Added finding"
+        );
+    }
+
+    #[test]
+    fn only_unmapped_files_leave_an_empty_but_complete_baseline() {
+        let baseline = summarize(
+            vec![FileOutcome::Unmapped, FileOutcome::Unmapped],
+            "456",
+            10,
+        );
+
+        assert_eq!(baseline.files_unmapped, 2);
+        assert_eq!(baseline.files_unavailable, 0, "not a failure");
+        assert_eq!(baseline.files_compared, 0);
+        assert!(baseline.changes.is_empty());
+        assert!(!has_changes(&baseline));
+    }
+
+    #[test]
+    fn the_unmapped_count_is_published_in_the_report_json() {
+        // Report JSON must carry the count so a reader can tell "no history"
+        // apart from "nothing to compare". `serde(default)` keeps older
+        // consumers that do not know the key working.
+        let baseline = summarize(Vec::new(), "123", 10);
+        let json = serde_json::to_string(&baseline).expect("serialize the baseline");
+
+        assert!(
+            json.contains("\"files_unmapped\":0"),
+            "the count is part of the schema: {json}"
+        );
+    }
+
+    #[test]
     fn has_changes_tracks_the_change_vector() {
         let empty = Baseline {
             rev: "HEAD".to_string(),
@@ -1167,6 +1258,7 @@ mod tests {
             files_compared: 0,
             files_skipped: 0,
             files_unavailable: 0,
+            files_unmapped: 0,
             changes: Vec::new(),
         };
         assert!(!has_changes(&empty));

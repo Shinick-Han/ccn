@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.7.7 (2026-10-21)
+
+Complex Perforce views and the first large-repository scale evidence.
+
+### Perforce client views
+
+- The client **view** is now read from `p4 client -o` instead of assuming one
+  `p4 where` triple. Supports:
+  - multiple include lines and remapped directories
+    (`//depot/prj/lib/... //ws/third_party/lib/...`),
+  - single-file mappings (`//depot/a.c //client/a.c`),
+  - exclusions (`-//depot/prj/secret/...`) and `+` overlay lines,
+  - quoted paths with spaces.
+- Mapping picks the **longest matching** local/depot prefix, with overlays
+  winning ties and exclusions always applied last.
+- History (`--since`, hotspots) queries every include depot prefix, so files
+  from a second view line are not silently dropped.
+- A file that is **not in the client view** is reported as
+  `files_unmapped` and skipped: it is neither `Added` nor a read failure, and it
+  does not make `--fail-on-new` exit 2. Real read failures still count in
+  `files_unavailable` and still fail the gate.
+- The view is resolved once per process and cached by workspace + Perforce
+  environment, instead of running `p4 info` and `p4 client -o` per file.
+
+Live `p4d` verification: a client with `main` + `third_party/lib` mappings and
+a `secret` exclusion produced `files_compared: 2`, `files_unmapped: 1`,
+`files_unavailable: 0`, with `main/main/a.c` compared against its as-of
+baseline and `third_party/lib/vendor.c` correctly attributed to
+`//depot/ccnlib/...`.
+
+### Scale benchmark
+
+- New `scripts/bench_scale.py`: deterministic 1k/5k/20k-file corpora, isolated
+  caches, cold/warm/`--verify-cache`/`--no-cache`/`--no-ccn`/CI/JSON/HTML
+  medians, peak working set, cache size, and scale-correctness checks.
+- New `docs/benchmarks/2026-10-21-scale.md`. Headline on this host (Ryzen 9
+  9950X, Windows/NTFS): 20,000 files / 1.41 M LOC in **0.63 s cold**, **0.27 s
+  warm**, 32k files/s cold, 83 MB peak RSS, 13.45 MiB cache (load 43 ms,
+  write 24 ms). Scaling is linear (exponent 0.84-0.96).
+- No Rust performance change was needed at this size. The report documents the
+  remaining risks: the serial directory walk on NFS, cold-cache/100k
+  extrapolation, and that NFS/LSF/large-P4 baselines are still unmeasured.
+
 ## 0.7.6 (2026-10-21)
 
 The second batch from

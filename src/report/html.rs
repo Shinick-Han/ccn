@@ -400,6 +400,9 @@ fn baseline_section(baseline: &crate::baseline::Baseline) -> String {
     if baseline.files_unavailable > 0 {
         let _ = write!(sub, ", {} unavailable", baseline.files_unavailable);
     }
+    if baseline.files_unmapped > 0 {
+        let _ = write!(sub, ", {} unmapped", baseline.files_unmapped);
+    }
     sub.push_str(".</p>\n");
     s.push_str(&sub);
     if baseline

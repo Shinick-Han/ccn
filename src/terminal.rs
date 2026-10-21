@@ -205,6 +205,9 @@ fn baseline_block(report: &Report, sep: &str) -> String {
     if baseline.files_unavailable > 0 {
         out.push_str(&format!(", {} unavailable", baseline.files_unavailable));
     }
+    if baseline.files_unmapped > 0 {
+        out.push_str(&format!(", {} unmapped", baseline.files_unmapped));
+    }
     out.push_str(")\n");
     if best_effort > 0 {
         out.push_str(&format!(

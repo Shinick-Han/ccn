@@ -453,6 +453,7 @@ mod tests {
             files_compared: 1,
             files_skipped: 0,
             files_unavailable: 0,
+            files_unmapped: 0,
             changes: vec![
                 Change {
                     path: "src/a.rs".to_string(),
