@@ -1029,3 +1029,45 @@ Perforce + Linux 환경에서 `.c/.cc/.h`가 전부 heuristic으로 나오는 �
 - 테스트: C++ 템플릿 헤더(`.h`) → Exact + 함수 1개, 순수 C 헤더 → Exact.
 
 릴리스 v0.7.2부터 Linux 자산에도 반영된다.
+
+---
+
+## 27. C/C++ 실사용 수정 6건 (2026-10-21, 0.7.3)
+
+Perforce + Linux에서 C/C++ 저장소를 돌릴 때 드러난 문제들을 한 번에 정리했다.
+
+### 경로 / 언어
+
+1. **심볼릭 링크**: `WalkBuilder`가 `follow_links(false)`라 링크된 소스를 통째로 놓쳤다.
+   기본 추적(`follow_links(true)`)으로 바꾸고 `--no-follow-links`로 끌 수 있게 했다.
+   링크 경로가 그대로 상대 경로/ VCS 키가 된다.
+2. **`--lang cpp`**: tokei 표시명(`C++`)과 문자열 비교해서 별칭이 전부 실패했다.
+   `cpp/cxx/cc/c++ → C++`, `cs/csharp → C#`, `js/ts/py/rs/go` 별칭 테이블 추가.
+   정확 매칭이라 `--lang c`가 `C++`를 끌어오지 않는다.
+3. **단일 파일**: `ccn src/foo.c`가 "not a directory"로 실패했다.
+   파일 경로를 허용하고, 그 파일 하나만 측정한다. 루트는 부모 디렉터리로 표시된다
+   (VCS·캐시 키가 디렉터리 스캔과 동일해지도록).
+
+### 파싱 견고성
+
+4. **부분 파싱**: `has_error()`면 파일 전체를 버리던 로직을 제거했다.
+   tree-sitter가 복구한 함수는 모두 측정하고, 오류가 있으면 `BestEffort` 티어로 표시한다.
+   함수를 하나도 못 건지면 그때만 `Err` → 형제 문법(C↔C++) 재시도 → heuristic.
+5. **매크로**: ERROR 노드 안의 함수는 발견에서 제외하되, 함수 내부의 정상 노드는 CCN에 포함한다.
+   매크로가 많은 프리앰블이 있어도 실제 함수와 분기 수가 유지된다.
+6. **`#if 0`**: `preproc_if`/`preproc_elif`의 조건이 `0`/`false`면 본문을 건너뛰고
+   `#else`/`#elif` 가지만 처리한다. `#if 1`은 반대. `#ifdef`/`#ifndef`는 양쪽 유지.
+   C/C++에만 적용된다.
+
+### 검증
+
+```
+315 lib + 2 integration tests, 0 failed
+clippy -D warnings, fmt clean
+```
+
+- 단일 파일: `ccn src/cli.rs` → files=1
+- `--lang cpp`가 `.cpp`만 유지
+- C++ 템플릿 헤더(`.h`) Exact
+- 매크로 파일 BestEffort + 함수 유지
+- `#if 0` 함수 제외, `#else` 함수 포함

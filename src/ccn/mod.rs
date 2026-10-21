@@ -17,9 +17,11 @@ pub use types::{CcnSummary, CcnTier, FileCcn, FunctionCcn, Lang};
 ///
 /// Tier selection:
 /// 1. extension wins over tokei's name (`.tsx` needs the TSX grammar),
-/// 2. a wired grammar + successful parse -> `Exact`,
-/// 3. a compatible grammar (C <-> C++) if the first one rejects the file,
-/// 4. anything else -> keyword heuristic, `Heuristic`.
+/// 2. a wired grammar + clean parse -> `Exact`,
+/// 3. a wired grammar + parse errors but recovered functions -> `BestEffort`
+///    (the functions tree-sitter found are reported, not thrown away),
+/// 4. a compatible grammar (C <-> C++) if the first one recovers nothing,
+/// 5. anything else -> keyword heuristic, `Heuristic`.
 pub fn analyze_file(path: &Path, source: &[u8], tokei_lang: &str) -> CcnSummary {
     let lang =
         Lang::from_path(&path.to_string_lossy()).or_else(|| Lang::from_tokei_name(tokei_lang));
@@ -30,7 +32,9 @@ pub fn analyze_file(path: &Path, source: &[u8], tokei_lang: &str) -> CcnSummary 
         }
         // A `.h` header is commonly C++ (templates, classes, namespaces) even
         // when the extension looks like C. Retry with the sibling grammar
-        // instead of degrading the whole file to a keyword count.
+        // instead of degrading the whole file to a keyword count. Only a tree
+        // that recovered no function at all reaches this point: a partial parse
+        // is `BestEffort` and returns early, so its functions are never lost.
         for alternative in fallbacks(lang) {
             if let Ok(file) = engine::analyze_file(path, source, *alternative) {
                 return CcnSummary::from_file(file);

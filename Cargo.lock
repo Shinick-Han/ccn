@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "ccn"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "clap",
  "crossterm",

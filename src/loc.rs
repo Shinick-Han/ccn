@@ -22,6 +22,40 @@ use crate::model::{ExcludedFiles, FileLoc, LangSummary, RepoCcn, ScanResult};
 /// the runtime and the histogram.
 const MAX_CCN_BYTES: u64 = 8 * 1024 * 1024;
 
+/// User-facing spellings for tokei's display names.
+///
+/// `--lang` is compared against [`tokei::LanguageType::name`], which is a
+/// display name (`C++`, `C#`, `JavaScript`). Nobody types those on a command
+/// line, so every alias resolves to the display name and *both* sides of the
+/// comparison go through [`canonical_lang`]. Anything not listed here falls
+/// back to the historical case-insensitive comparison, so a tokei name (or an
+/// exact case variant) still works.
+const LANG_ALIASES: &[(&str, &str)] = &[
+    ("cpp", "C++"),
+    ("c++", "C++"),
+    ("cxx", "C++"),
+    ("cc", "C++"),
+    ("c", "C"),
+    ("h", "C"),
+    ("header", "C"),
+    ("cs", "C#"),
+    ("csharp", "C#"),
+    ("c#", "C#"),
+    ("js", "JavaScript"),
+    ("javascript", "JavaScript"),
+    ("jsx", "JavaScript"),
+    ("ts", "TypeScript"),
+    ("typescript", "TypeScript"),
+    ("tsx", "TSX"),
+    ("py", "Python"),
+    ("python", "Python"),
+    ("rs", "Rust"),
+    ("rust", "Rust"),
+    ("go", "Go"),
+    ("golang", "Go"),
+    ("java", "Java"),
+];
+
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     /// Directory or file to scan.
@@ -30,9 +64,16 @@ pub struct ScanOptions {
     pub hidden: bool,
     /// Ignore `.gitignore`, `.ignore`, `.tokeignore`.
     pub no_ignore: bool,
+    /// Do not follow symbolic links.
+    ///
+    /// Links are followed by default: a workspace that symlinks its sources
+    /// would otherwise silently lose them. The `ignore` crate stops a link
+    /// cycle on its own.
+    pub no_follow_links: bool,
     /// Skip the built-in build-output excludes.
     pub no_default_excludes: bool,
-    /// Case-insensitive language allow-list. Empty means "everything".
+    /// Language allow-list. Empty means "everything". Aliases (see
+    /// [`LANG_ALIASES`]) and tokei display names are both accepted.
     pub langs: Vec<String>,
     /// Skip the CCN pass entirely (LOC only).
     pub no_ccn: bool,
@@ -55,6 +96,7 @@ impl Default for ScanOptions {
             root: PathBuf::from("."),
             hidden: false,
             no_ignore: false,
+            no_follow_links: false,
             no_default_excludes: false,
             langs: Vec::new(),
             no_ccn: false,
@@ -108,6 +150,9 @@ impl std::fmt::Display for ScanError {
 impl std::error::Error for ScanError {}
 
 /// Never rely on the caller's cwd for ignore semantics; resolve once.
+///
+/// A file is a valid scan target (`ccn src/foo.c`); anything that is neither a
+/// file nor a directory is still rejected.
 fn canonical_root(root: &Path) -> Result<PathBuf, ScanError> {
     let joined = if root.is_absolute() {
         root.to_path_buf()
@@ -119,10 +164,37 @@ fn canonical_root(root: &Path) -> Result<PathBuf, ScanError> {
     let canonical = joined
         .canonicalize()
         .map_err(|_| ScanError::NotFound(root.to_path_buf()))?;
-    if !canonical.is_dir() {
+    if !canonical.is_dir() && !canonical.is_file() {
         return Err(ScanError::NotADirectory(root.to_path_buf()));
     }
     Ok(canonical)
+}
+
+/// Resolve a `--lang` value to its tokei display name, if it is an alias.
+fn canonical_lang(name: &str) -> Option<&'static str> {
+    let key = name.trim().to_ascii_lowercase();
+    LANG_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == key)
+        .map(|(_, canonical)| *canonical)
+}
+
+/// Does the requested language (alias or display name) mean `actual`?
+fn lang_matches(wanted: &str, actual: &str) -> bool {
+    match canonical_lang(wanted) {
+        Some(canonical) => canonical.eq_ignore_ascii_case(actual),
+        // Unknown spellings keep the case-insensitive fallback, so a tokei
+        // display name (`C++`, `JavaScript`, ...) still works.
+        None => wanted.trim().eq_ignore_ascii_case(actual),
+    }
+}
+
+fn lang_allowed(opts: &ScanOptions, lang: tokei::LanguageType) -> bool {
+    opts.langs.is_empty()
+        || opts
+            .langs
+            .iter()
+            .any(|wanted| lang_matches(wanted, lang.name()))
 }
 
 /// Scan `opts.root`. Never fails on unreadable individual files: they are
@@ -133,7 +205,25 @@ fn canonical_root(root: &Path) -> Result<PathBuf, ScanError> {
 ///   CCN and generated-file markers, then store everything in the cache;
 /// - **warm**: a stat per file and one cache lookup. No read, no AST.
 pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
-    let root = canonical_root(&opts.root)?;
+    let target = canonical_root(&opts.root)?;
+
+    // Single-file mode (`ccn src/foo.c`). Everything downstream — cache keys,
+    // VCS lookup, `metrics::build` -> `vcs::detect`, `--baseline`, `--hotspots`
+    // — is written against a *directory* root, and a file path makes those
+    // calls fail. So the scan root becomes the file's parent and the file stays
+    // in `files[].path` relative to that parent (its VCS key, unchanged from a
+    // directory scan of the same tree).
+    //
+    // Trade-off, accepted: the report's `root` shows the containing directory
+    // rather than the file, and `ScanResult` needs no new field.
+    let (root, single_file) = if target.is_file() {
+        let parent = target
+            .parent()
+            .map_or_else(|| target.clone(), Path::to_path_buf);
+        (parent, Some(target))
+    } else {
+        (target, None)
+    };
     let root_display = display_root(&root);
 
     let config = tokei::Config {
@@ -167,7 +257,13 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
     let classify_exclusions = !opts.include_generated;
 
     let walk_started = std::time::Instant::now();
-    let mut candidates = walk_source_files(&root, opts, &config);
+    // A single file is never walked: the walker would descend the parent (or
+    // return the file only when it is the root, mixing the two modes), and
+    // "exactly one candidate" must hold even if the file is gitignored.
+    let mut candidates = match &single_file {
+        Some(file) => single_candidate(file, opts, &config).into_iter().collect(),
+        None => walk_source_files(&root, opts, &config),
+    };
     let walk_elapsed = walk_started.elapsed();
 
     // Diff mode: keep only files this change touched. Deleted files are not in
@@ -299,6 +395,23 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult, ScanError> {
     Ok(result)
 }
 
+/// The one candidate for a single-file scan, or `None` when tokei does not
+/// recognise the path (or `--lang` excludes it).
+fn single_candidate(
+    file: &Path,
+    opts: &ScanOptions,
+    config: &tokei::Config,
+) -> Option<(PathBuf, tokei::LanguageType)> {
+    let lang = tokei::LanguageType::from_path(file, config)?;
+    // tokei maps `.txt` to its `Text` language. A lone text file is not source
+    // code and carries no CCN, so a single-file request for one measures
+    // nothing rather than reporting a file with zero complexity.
+    if lang == tokei::LanguageType::Text {
+        return None;
+    }
+    lang_allowed(opts, lang).then(|| (file.to_path_buf(), lang))
+}
+
 /// Walk the tree the same way tokei's bulk scan did: gitignore-aware, hidden
 /// files optional, build output excluded by name.
 fn walk_source_files(
@@ -317,7 +430,11 @@ fn walk_source_files(
         // Perforce workspaces ignore build output through .p4ignore, not
         // .gitignore; honour it with the same syntax.
         .add_custom_ignore_filename(".p4ignore")
-        .follow_links(false);
+        // Symlinked sources and symlinked workspace roots are ordinary layouts.
+        // The walker keeps the link path (so relative keys and VCS keys stay
+        // the ones a user sees) while measuring the target; it also detects
+        // cycles itself. `--no-follow-links` restores the strict behaviour.
+        .follow_links(!opts.no_follow_links);
 
     let allow_defaults = opts.no_default_excludes;
     builder.filter_entry(move |entry| {
@@ -337,12 +454,7 @@ fn walk_source_files(
             continue;
         }
         if let Some(lang) = tokei::LanguageType::from_path(entry.path(), config) {
-            if opts.langs.is_empty()
-                || opts
-                    .langs
-                    .iter()
-                    .any(|wanted| wanted.eq_ignore_ascii_case(lang.name()))
-            {
+            if lang_allowed(opts, lang) {
                 out.push((entry.into_path(), lang));
             }
         }
@@ -674,5 +786,207 @@ mod tests {
             report.files_measured, 2,
             "sample.rs and api.gen.ts are measured"
         );
+    }
+
+    #[test]
+    fn lang_alias_cpp_keeps_cpp_and_drops_c() {
+        let fixture = Fixture::new("lang-alias-cpp");
+        std::fs::write(fixture.dir.join("unit.c"), "int f(void) { return 0; }\n")
+            .expect("write C fixture");
+        std::fs::write(fixture.dir.join("unit.cpp"), "int g() { return 0; }\n")
+            .expect("write C++ fixture");
+
+        let opts = ScanOptions {
+            langs: vec!["cpp".to_string()],
+            ..fixture.options(true)
+        };
+        let result = scan(&opts).expect("scan fixture");
+
+        assert_eq!(result.files_analyzed, 1, "{:?}", result.files);
+        assert_eq!(result.files[0].path, "unit.cpp");
+        assert_eq!(result.files[0].lang, "C++");
+        assert_eq!(result.languages.len(), 1);
+        assert_eq!(result.languages[0].lang, "C++");
+
+        // The canonical spelling and the other aliases agree with the alias.
+        for wanted in ["C++", "cxx", "cc"] {
+            let opts = ScanOptions {
+                langs: vec![wanted.to_string()],
+                ..fixture.options(true)
+            };
+            let result = scan(&opts).expect("scan fixture");
+            assert_eq!(result.files_analyzed, 1, "--lang {wanted}");
+        }
+        // `c` must not match C++.
+        let opts = ScanOptions {
+            langs: vec!["c".to_string()],
+            ..fixture.options(true)
+        };
+        let result = scan(&opts).expect("scan fixture");
+        assert_eq!(result.files_analyzed, 1);
+        assert_eq!(result.files[0].path, "unit.c");
+    }
+
+    #[test]
+    fn scanning_a_single_file_measures_only_that_file() {
+        let fixture = Fixture::new("single-file");
+        std::fs::write(fixture.dir.join("other.rs"), "fn other() {}\n")
+            .expect("write second fixture");
+
+        let file = fixture.dir.join("sample.rs");
+        let canonical = file.canonicalize().expect("canonical file");
+        let parent = canonical.parent().expect("parent").to_path_buf();
+
+        let opts = ScanOptions {
+            root: file,
+            ..Default::default()
+        };
+        let result = scan(&opts).expect("scan a single file");
+
+        assert_eq!(result.files_analyzed, 1, "{:?}", result.files);
+        assert_eq!(result.files[0].path, "sample.rs");
+        assert!(
+            result.files[0].ccn.is_some(),
+            "the CCN pass runs for a single file"
+        );
+        assert!(result.ccn.is_some(), "the repo summary is still produced");
+        assert!(result.loc_total > 0);
+        // Documented choice: the scan root is the file's parent so every
+        // downstream VCS call (metrics::build -> vcs::detect) has a directory.
+        assert_eq!(result.root, display_root(&parent));
+    }
+
+    #[test]
+    fn scanning_a_single_text_file_is_empty_not_an_error() {
+        let fixture = Fixture::new("single-text");
+        let file = fixture.dir.join("notes.txt");
+        std::fs::write(&file, "just prose\n").expect("write text fixture");
+
+        let opts = ScanOptions {
+            root: file,
+            ..Default::default()
+        };
+        let result = scan(&opts).expect("a .txt file is not an error");
+
+        assert_eq!(result.files_analyzed, 0);
+        assert!(result.files.is_empty());
+        assert!(result.languages.is_empty());
+        assert!(result.ccn.is_none());
+        assert_eq!(result.loc_total, 0);
+    }
+
+    #[test]
+    fn a_single_file_respects_the_lang_filter() {
+        let fixture = Fixture::new("single-file-lang");
+        let file = fixture.dir.join("sample.rs");
+        let opts = ScanOptions {
+            root: file,
+            langs: vec!["cpp".to_string()],
+            ..Default::default()
+        };
+        let result = scan(&opts).expect("scan a single file");
+        assert_eq!(result.files_analyzed, 0, "{:?}", result.files);
+    }
+
+    #[test]
+    fn missing_paths_are_reported_not_silently_empty() {
+        let fixture = Fixture::new("missing");
+        let opts = ScanOptions {
+            root: fixture.dir.join("nope.rs"),
+            ..Default::default()
+        };
+        assert!(matches!(scan(&opts), Err(ScanError::NotFound(_))));
+    }
+
+    /// Best-effort file symlink; Windows needs Developer Mode or elevation, so
+    /// every symlink test skips its assertion when this returns `Err`.
+    #[cfg(windows)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn symlink_file(_target: &Path, _link: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no symlink support",
+        ))
+    }
+
+    #[test]
+    fn a_symlinked_file_outside_the_root_is_measured_under_its_link_path() {
+        let fixture = Fixture::new("symlink");
+        // Target lives in a sibling directory, i.e. outside the scan root.
+        let outside =
+            std::env::temp_dir().join(format!("ccn-loc-{}-symlink-target", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        let target = outside.join("real.rs");
+        std::fs::write(
+            &target,
+            "fn linked() {\n    if true {\n        return;\n    }\n}\n",
+        )
+        .expect("write symlink target");
+        let link = fixture.dir.join("linked.rs");
+
+        if symlink_file(&target, &link).is_err() {
+            // Unprivileged Windows cannot create symlinks; the behaviour is
+            // still covered on platforms that can.
+            eprintln!("skipping symlink assertion: cannot create a file symlink");
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let result = scan(&fixture.options(false)).expect("scan fixture");
+        let _ = std::fs::remove_dir_all(&outside);
+
+        let linked = result
+            .files
+            .iter()
+            .find(|f| f.path == "linked.rs")
+            .unwrap_or_else(|| panic!("symlinked file missing from {:?}", result.files));
+        assert_eq!(linked.lang, "Rust");
+        assert!(linked.loc_total > 0);
+        // The key is the link path, never the resolved target.
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|f| !f.path.contains("symlink-target")),
+            "{:?}",
+            result.files
+        );
+        assert_eq!(result.files_analyzed, 2, "sample.rs plus the link");
+    }
+
+    #[test]
+    fn no_follow_links_skips_symlinked_files() {
+        let fixture = Fixture::new("no-follow-links");
+        let target = fixture.dir.join("real.rs");
+        std::fs::write(&target, "fn real() {}\n").expect("write target");
+        let link = fixture.dir.join("linked.rs");
+
+        if symlink_file(&target, &link).is_err() {
+            eprintln!("skipping symlink assertion: cannot create a file symlink");
+            return;
+        }
+
+        let opts = ScanOptions {
+            no_follow_links: true,
+            ..fixture.options(false)
+        };
+        let result = scan(&opts).expect("scan fixture");
+        assert!(
+            result.files.iter().all(|f| f.path != "linked.rs"),
+            "links are not followed with --no-follow-links: {:?}",
+            result.files
+        );
+        assert!(result.files.iter().any(|f| f.path == "real.rs"));
+        assert!(result.files.iter().any(|f| f.path == "sample.rs"));
     }
 }

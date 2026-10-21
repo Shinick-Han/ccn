@@ -18,7 +18,12 @@ pub struct Cli {
     #[arg(long)]
     pub report_json: bool,
 
-    /// Restrict to these languages (comma separated, case-insensitive).
+    /// Restrict to these languages (comma separated).
+    ///
+    /// Aliases and tokei display names both work, case-insensitively:
+    /// `cpp`, `c++`, `cxx`, `cc` -> C++; `c`, `h`, `header` -> C; `cs`,
+    /// `csharp` -> C#; `js`, `jsx` -> JavaScript; `ts` -> TypeScript; `tsx`;
+    /// `py`, `rs`, `go`, `java`.
     #[arg(long, value_delimiter = ',')]
     pub lang: Vec<String>,
 
@@ -29,6 +34,11 @@ pub struct Cli {
     /// Ignore .gitignore / .ignore / .tokeignore.
     #[arg(long)]
     pub no_ignore: bool,
+
+    /// Do not follow symbolic links (links are followed by default, so a
+    /// workspace that symlinks its sources is still measured).
+    #[arg(long)]
+    pub no_follow_links: bool,
 
     /// Also scan build-output directories (target, node_modules, dist, ...).
     #[arg(long)]
@@ -146,6 +156,7 @@ impl Cli {
             root: self.path.clone(),
             hidden: self.hidden,
             no_ignore: self.no_ignore,
+            no_follow_links: self.no_follow_links,
             no_default_excludes: self.no_default_excludes,
             langs: self.lang.clone(),
             no_ccn: self.no_ccn,
@@ -249,6 +260,27 @@ mod tests {
     fn ci_flag_parses() {
         let cli = Cli::parse_from(["ccn", "--ci"]);
         assert!(cli.ci);
+    }
+
+    #[test]
+    fn no_follow_links_defaults_off_and_reaches_scan_options() {
+        let cli = Cli::parse_from(["ccn"]);
+        assert!(!cli.no_follow_links, "symlinks are followed by default");
+        assert!(!cli.scan_options().no_follow_links);
+
+        let cli = Cli::parse_from(["ccn", "--no-follow-links"]);
+        assert!(cli.no_follow_links);
+        assert!(cli.scan_options().no_follow_links);
+        // Unrelated flags keep their meaning.
+        assert!(!cli.scan_options().no_ignore);
+    }
+
+    #[test]
+    fn a_file_is_an_accepted_path() {
+        // The parser must not assume a directory; the scanner decides.
+        let cli = Cli::parse_from(["ccn", "src/main.rs", "--lang", "cpp"]);
+        assert_eq!(cli.path, PathBuf::from("src/main.rs"));
+        assert_eq!(cli.scan_options().langs, vec!["cpp".to_string()]);
     }
 
     #[test]

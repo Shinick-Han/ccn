@@ -7,8 +7,13 @@
 //! - Nested functions are measured separately and **excluded** from the
 //!   enclosing function's count (otherwise a single factory function swallows
 //!   all its callbacks and the histogram becomes a lie).
-//! - A parse failure returns `Err`; the caller degrades that file to the
-//!   heuristic tier. It must never panic on malformed input.
+//! - A parse *failure* (no function recovered at all) returns `Err`; the
+//!   caller degrades that file to the heuristic tier. It must never panic on
+//!   malformed input.
+//! - A parse with errors that still yields functions returns `Ok` at
+//!   `CcnTier::BestEffort`: tree-sitter's recovery keeps the intact functions,
+//!   and throwing them away because one line of the file is broken is worse
+//!   than reporting them with a lower trust tier.
 //!
 //! The node tables live in `rules.rs`; do not hard-code node kinds here.
 
@@ -20,7 +25,7 @@ use std::path::Path;
 use tree_sitter::{Language, Node, Parser, Tree};
 
 use crate::ccn::rules::{self, LanguageRules};
-use crate::ccn::types::{FileCcn, FunctionCcn, Lang};
+use crate::ccn::types::{CcnTier, FileCcn, FunctionCcn, Lang};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CcnError {
@@ -62,6 +67,17 @@ const NAMING_PARENTS: &[&str] = &[
 /// assignments name their function through `key`/`left`. Trying those too keeps
 /// `{ handler: function () {} }` from degrading to `(anonymous)`.
 const NAMING_FIELDS: &[&str] = &["name", "left", "key"];
+
+/// Preprocessor nodes whose `condition` can be decided statically.
+///
+/// In both tree-sitter-c and tree-sitter-cpp an `#if`/`#elif` node carries the
+/// following `#else`/`#elif` chain in its `alternative` field, so a dead branch
+/// can be dropped by keeping only that one child. `#ifdef`/`#ifndef` are
+/// deliberately absent: the flags are unknown, so both branches stay live.
+const PREPROC_CONDITIONALS: &[&str] = &["preproc_if", "preproc_elif"];
+
+/// Child kinds that begin an `#else`/`#elif` chain.
+const PREPROC_ALTERNATIVES: &[&str] = &["preproc_else", "preproc_elif", "preproc_elifdef"];
 
 /// Compiled grammar for `lang`, if one is wired.
 fn grammar(lang: Lang) -> Option<Language> {
@@ -108,6 +124,12 @@ fn with_parser<R>(lang: Lang, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
 }
 
 /// Parse `source` and return every function with its CCN.
+///
+/// A tree that contains `ERROR`/`MISSING` nodes is still walked: whatever
+/// functions tree-sitter recovered are reported at `CcnTier::BestEffort`. Only
+/// a tree that recovered *no* function at all is an error, so the dispatcher
+/// can try a sibling grammar (or the heuristic) without losing a whole file to
+/// one broken line.
 pub fn analyze_file(_path: &Path, source: &[u8], lang: Lang) -> Result<FileCcn, CcnError> {
     let table = rules::rules(lang);
     let tier = rules::tier(lang);
@@ -129,17 +151,20 @@ pub fn analyze_file(_path: &Path, source: &[u8], lang: Lang) -> Result<FileCcn, 
     })?;
 
     let root = tree.root_node();
-    if root.has_error() {
+    let walker = Walker::new(lang, table, source);
+
+    let mut functions: Vec<FunctionCcn> = collect_function_nodes(root, &walker)
+        .into_iter()
+        .map(|node| measure(node, &walker))
+        .collect();
+
+    let has_error = root.has_error();
+    if has_error && functions.is_empty() {
         return Err(CcnError::ParseFailed {
             lang,
             detail: first_syntax_error(root),
         });
     }
-
-    let mut functions: Vec<FunctionCcn> = collect_function_nodes(root, table)
-        .into_iter()
-        .map(|node| measure(node, table, source))
-        .collect();
 
     // Outer before inner when both start on the same line.
     functions.sort_by(|a, b| {
@@ -148,69 +173,197 @@ pub fn analyze_file(_path: &Path, source: &[u8], lang: Lang) -> Result<FileCcn, 
             .then_with(|| b.end_line.cmp(&a.end_line))
     });
 
-    Ok(FileCcn { tier, functions })
+    Ok(FileCcn {
+        tier: if has_error { CcnTier::BestEffort } else { tier },
+        functions,
+    })
+}
+
+/// Read-only context shared by the two iterative walkers.
+struct Walker<'a> {
+    table: &'a LanguageRules,
+    source: &'a [u8],
+    /// Only C/C++ understand `#if 0`: their preprocessor nodes are real nodes,
+    /// whereas other grammars either lack them or model them differently.
+    preproc: bool,
+}
+
+impl<'a> Walker<'a> {
+    fn new(lang: Lang, table: &'a LanguageRules, source: &'a [u8]) -> Self {
+        Self {
+            table,
+            source,
+            preproc: matches!(lang, Lang::C | Lang::Cpp),
+        }
+    }
+
+    /// Push the children of `node` that are actually compiled.
+    ///
+    /// Iterative on purpose: tree depth is attacker-controlled and a recursive
+    /// walker would blow the stack on a deeply nested file. The allocation for
+    /// the filtered case only happens on `#if`/`#elif` nodes, which are rare
+    /// compared to the nodes visited in a function body.
+    fn push_children<'tree>(&self, stack: &mut Vec<Node<'tree>>, node: Node<'tree>) {
+        let filtered = if self.preproc && PREPROC_CONDITIONALS.contains(&node.kind()) {
+            live_preproc_children(node, self.source)
+        } else {
+            None
+        };
+        match filtered {
+            Some(children) => stack.extend(children),
+            None => {
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+            }
+        }
+    }
+}
+
+/// Children of an `#if`/`#elif` that survive constant folding, or `None` when
+/// the condition is unknown and everything has to be kept.
+fn live_preproc_children<'tree>(node: Node<'tree>, source: &[u8]) -> Option<Vec<Node<'tree>>> {
+    let take_branch = condition_truth(node, source)?;
+    let alternative = node.child_by_field_name("alternative");
+
+    let mut cursor = node.walk();
+    let children: Vec<Node<'tree>> = node.children(&mut cursor).collect();
+    Some(
+        children
+            .into_iter()
+            .filter(|child| {
+                let is_alternative = alternative.is_some_and(|alt| alt == *child)
+                    || PREPROC_ALTERNATIVES.contains(&child.kind());
+                if is_alternative {
+                    // `#if 0 ... #else` / `#elif`: the alternative is the live
+                    // branch. `#if 1 ... #else` / `#elif`: it is dead.
+                    !take_branch
+                } else {
+                    take_branch
+                }
+            })
+            .collect(),
+    )
+}
+
+/// `Some(true)` for `#if 1`/`#if true`, `Some(false)` for `#if 0`/`#if false`,
+/// `None` when the condition depends on a macro or expression we cannot
+/// evaluate.
+fn condition_truth(node: Node<'_>, source: &[u8]) -> Option<bool> {
+    let condition = node.child_by_field_name("condition")?;
+    let text = condition.utf8_text(source).ok()?;
+    match strip_outer_parens(text.trim()) {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Strip redundant outer parentheses from a preprocessor condition.
+///
+/// `#if (0)` is as dead as `#if 0`; a plain `trim` would miss it. Only pairs
+/// that wrap the whole condition are removed, so `#if (1) && (0)` is left
+/// alone (and then reads as unknown).
+fn strip_outer_parens(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim();
+        if !(trimmed.starts_with('(') && trimmed.ends_with(')')) {
+            return trimmed;
+        }
+        let mut depth = 0i32;
+        let mut wraps = true;
+        for (index, ch) in trimmed.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // The first paren closes before the end: not a wrapper.
+                        wraps = index + 1 == trimmed.len();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !wraps || depth != 0 {
+            return trimmed;
+        }
+        text = &trimmed[1..trimmed.len() - 1];
+    }
 }
 
 /// All nodes whose kind opens a function scope, in no particular order.
-fn collect_function_nodes<'tree>(root: Node<'tree>, table: &LanguageRules) -> Vec<Node<'tree>> {
+///
+/// `ERROR` subtrees are not descended into: their shape is the parser's guess,
+/// and a "function" inside one is a phantom that would pad the histogram. The
+/// valid functions before and after the error are unaffected.
+fn collect_function_nodes<'tree>(root: Node<'tree>, walker: &Walker<'_>) -> Vec<Node<'tree>> {
     let mut found = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if node.is_error() {
+            continue;
+        }
         // `is_named` matters: Python's anonymous `lambda` *keyword token* has
         // kind `"lambda"` too, so a bare kind match turns every lambda into two
         // functions (one of them a zero-width phantom).
-        if node.is_named() && table.function_nodes.contains(&node.kind()) {
+        if node.is_named() && walker.table.function_nodes.contains(&node.kind()) {
             found.push(node);
         }
         // Descend into functions too: they can contain nested ones, which are
         // measured separately.
-        let mut cursor = node.walk();
-        stack.extend(node.children(&mut cursor));
+        walker.push_children(&mut stack, node);
     }
     found
 }
 
-fn measure(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> FunctionCcn {
+fn measure(node: Node<'_>, walker: &Walker<'_>) -> FunctionCcn {
     let start = node.start_position();
     let end = node.end_position();
-    let name = function_name(node, table, source);
+    let name = function_name(node, walker.table, walker.source);
 
     FunctionCcn {
         name,
         line: start.row + 1,
         end_line: end.row + 1,
         nloc: end.row - start.row + 1,
-        ccn: count_decisions(node, table, source).saturating_add(1),
-        params: param_count(node, table),
+        ccn: count_decisions(node, walker).saturating_add(1),
+        params: param_count(node, walker.table),
     }
 }
 
-/// Decisions in `func`'s subtree, excluding nested functions.
-fn count_decisions<'tree>(func: Node<'tree>, table: &LanguageRules, source: &[u8]) -> u32 {
+/// Decisions in `func`'s subtree, excluding nested functions and `ERROR`
+/// subtrees.
+///
+/// A function can contain an `ERROR` child without being unusable (a macro
+/// call in the middle of a statement, say). The decisions outside that error
+/// are real and are still counted; only the unreliable subtree is skipped.
+fn count_decisions<'tree>(func: Node<'tree>, walker: &Walker<'_>) -> u32 {
     let mut decisions = 0u32;
     let mut stack: Vec<Node<'tree>> = Vec::new();
-    let mut cursor = func.walk();
-    stack.extend(func.children(&mut cursor));
+    walker.push_children(&mut stack, func);
 
     while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            continue;
+        }
         let kind = node.kind();
-        if node.is_named() && table.function_nodes.contains(&kind) {
+        if node.is_named() && walker.table.function_nodes.contains(&kind) {
             // A nested function's decisions belong to that function.
             continue;
         }
-        if table.decision_nodes.contains(&kind) {
+        if walker.table.decision_nodes.contains(&kind) {
             decisions += 1;
         } else if kind == "binary_expression" {
             if let Some(operator) = node.child_by_field_name("operator") {
-                if let Ok(text) = operator.utf8_text(source) {
-                    if table.decision_operators.contains(&text) {
+                if let Ok(text) = operator.utf8_text(walker.source) {
+                    if walker.table.decision_operators.contains(&text) {
                         decisions += 1;
                     }
                 }
             }
         }
-        let mut cursor = node.walk();
-        stack.extend(node.children(&mut cursor));
+        walker.push_children(&mut stack, node);
     }
 
     decisions
@@ -1101,7 +1254,204 @@ mod tests {
         }
     }
 
-    // -- Every language ---------------------------------------------------
+    // -- Partial parsing (C/C++) ------------------------------------------
+
+    /// Analyze without asserting `Exact`: partial parses are `BestEffort`.
+    fn analyze_partial(src: &str, lang: Lang) -> FileCcn {
+        analyze_file(Path::new("fixture"), src.as_bytes(), lang)
+            .unwrap_or_else(|e| panic!("{} fixture must yield functions: {e}", lang.name()))
+    }
+
+    fn names(file: &FileCcn) -> Vec<&str> {
+        file.functions.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    #[test]
+    fn cpp_clean_file_is_exact() {
+        let file = analyze(
+            "int f(int x) { return x; }\nint g(int x) { if (x) { return 1; } return 0; }\n",
+            Lang::Cpp,
+        );
+        assert_eq!(file.tier, CcnTier::Exact);
+        assert_eq!(names(&file), vec!["f", "g"]);
+        assert_eq!(function_named(&file, "g").ccn, 2);
+
+        let c = analyze("int f(int x) { if (x) { return 1; } return 0; }\n", Lang::C);
+        assert_eq!(c.tier, CcnTier::Exact);
+        assert_eq!(ccn_of("int f(int x) { return x; }", Lang::C, "f"), 1);
+    }
+
+    #[test]
+    fn cpp_truncated_file_keeps_the_complete_functions() {
+        // The last function is cut in half: an unbalanced brace at EOF.
+        let src = "int a(void) { return 1; }\n\
+                   int b(int x) { if (x) { return 2; } return 3; }\n\
+                   int truncated(void) {\n";
+        let file = analyze_partial(src, Lang::Cpp);
+        assert_eq!(file.tier, CcnTier::BestEffort);
+        let found = names(&file);
+        assert!(found.contains(&"a"), "found: {found:?}");
+        assert!(found.contains(&"b"), "found: {found:?}");
+        assert_eq!(function_named(&file, "b").ccn, 2);
+    }
+
+    #[test]
+    fn c_macro_heavy_preamble_still_yields_functions() {
+        // `DECLARE_LIST(, int)` is not valid C; tree-sitter puts it in an
+        // ERROR node, but the function after it is intact.
+        let src = "#define BEGIN(x) do { x; } while (0)\n\
+                   #define LIKELY(x) __builtin_expect(!!(x), 1)\n\
+                   #define DECLARE_LIST(name, type) type name##_a; type name##_b\n\
+                   DECLARE_LIST(, int)\n\
+                   int first(int x) { BEGIN(x++); return x; }\n\
+                   int second(int x) { if (LIKELY(x > 0)) { return 1; } return 0; }\n";
+        let file = analyze_partial(src, Lang::C);
+        let found = names(&file);
+        assert!(found.contains(&"first"), "found: {found:?}");
+        assert!(found.contains(&"second"), "found: {found:?}");
+        assert_eq!(function_named(&file, "second").ccn, 2);
+        assert!(
+            matches!(file.tier, CcnTier::Exact | CcnTier::BestEffort),
+            "macro noise must not drop the file to the heuristic tier, got {:?}",
+            file.tier
+        );
+    }
+
+    #[test]
+    fn c_if_zero_body_is_not_counted_but_following_code_is() {
+        let src = "int kept(void) { return 1; }\n\
+                   #if 0\n\
+                   int dead(void) { return 2; }\n\
+                   #endif\n\
+                   int after(void) { return 3; }\n";
+        let file = analyze(src, Lang::C);
+        assert_eq!(file.tier, CcnTier::Exact);
+        let found = names(&file);
+        assert!(!found.contains(&"dead"), "found: {found:?}");
+        assert!(found.contains(&"kept"), "found: {found:?}");
+        assert!(found.contains(&"after"), "found: {found:?}");
+
+        // Nested inside a live branch: still dead.
+        let nested = "int live(void) {\n\
+                      #if 0\n\
+                      if (1) { return 2; }\n\
+                      #endif\n\
+                      return 0;\n\
+                      }\n";
+        assert_eq!(ccn_of(nested, Lang::C, "live"), 1);
+    }
+
+    #[test]
+    fn c_if_zero_else_branch_is_live() {
+        let src = "#if 0\n\
+                   int dead(void) { return 0; }\n\
+                   #else\n\
+                   int alive(void) { return 1; }\n\
+                   #endif\n";
+        let file = analyze(src, Lang::C);
+        let found = names(&file);
+        assert!(found.contains(&"alive"), "found: {found:?}");
+        assert!(!found.contains(&"dead"), "found: {found:?}");
+
+        // The same shape in C++, with an `#elif`.
+        let cpp = "#if 0\n\
+                   int dead(void) { return 0; }\n\
+                   #elif 1\n\
+                   int alive(void) { return 1; }\n\
+                   #else\n\
+                   int also_dead(void) { return 2; }\n\
+                   #endif\n";
+        let file = analyze(cpp, Lang::Cpp);
+        let found = names(&file);
+        assert!(found.contains(&"alive"), "found: {found:?}");
+        assert!(!found.contains(&"dead"), "found: {found:?}");
+        assert!(!found.contains(&"also_dead"), "found: {found:?}");
+    }
+
+    #[test]
+    fn c_if_one_else_branch_is_dead() {
+        let src = "#if 1\n\
+                   int alive(void) { return 1; }\n\
+                   #else\n\
+                   int dead(void) { return 2; }\n\
+                   #endif\n";
+        let file = analyze(src, Lang::C);
+        let found = names(&file);
+        assert!(found.contains(&"alive"), "found: {found:?}");
+        assert!(!found.contains(&"dead"), "found: {found:?}");
+
+        // `#if false` is the spelled-out form.
+        let spelled = "#if false\n\
+                       int dead(void) { return 2; }\n\
+                       #else\n\
+                       int alive(void) { return 1; }\n\
+                       #endif\n";
+        assert!(names(&analyze(spelled, Lang::C)).contains(&"alive"));
+    }
+
+    #[test]
+    fn c_ifdef_keeps_both_branches() {
+        let src = "#ifdef FEATURE\n\
+                   int when_defined(void) { return 1; }\n\
+                   #else\n\
+                   int when_undefined(void) { return 2; }\n\
+                   #endif\n";
+        let file = analyze(src, Lang::C);
+        let found = names(&file);
+        assert!(found.contains(&"when_defined"), "found: {found:?}");
+        assert!(found.contains(&"when_undefined"), "found: {found:?}");
+
+        let cpp = "#ifndef FEATURE\n\
+                   int when_undefined(void) { return 2; }\n\
+                   #else\n\
+                   int when_defined(void) { return 1; }\n\
+                   #endif\n";
+        let cpp_file = analyze(cpp, Lang::Cpp);
+        let found = names(&cpp_file);
+        assert!(found.contains(&"when_defined"), "found: {found:?}");
+        assert!(found.contains(&"when_undefined"), "found: {found:?}");
+    }
+
+    #[test]
+    fn cpp_error_only_input_is_an_error_not_a_panic() {
+        for src in ["}{ )(", "@@@ ###", "int f( {"] {
+            let err = analyze_file(Path::new("broken.cpp"), src.as_bytes(), Lang::Cpp)
+                .expect_err("no function recovered must be an error");
+            assert!(
+                matches!(
+                    err,
+                    CcnError::ParseFailed {
+                        lang: Lang::Cpp,
+                        ..
+                    }
+                ),
+                "{src:?}: unexpected error {err:?}"
+            );
+        }
+        let err = analyze_file(Path::new("broken.c"), b"}{ )(", Lang::C)
+            .expect_err("no function recovered must be an error");
+        assert!(matches!(err, CcnError::ParseFailed { lang: Lang::C, .. }));
+    }
+
+    #[test]
+    fn c_hybrid_partial_parse_is_best_effort_with_the_error_child_left_out() {
+        // `BROKEN();` cannot be parsed, but the surrounding decisions are real
+        // and must be counted; the ERROR subtree itself adds nothing.
+        let src = "int f(int x) {\n\
+                   if (x) { return 1; }\n\
+                   BROKEN_THING(;\n\
+                   if (x > 2) { return 2; }\n\
+                   return 0;\n\
+                   }\n";
+        let file = analyze_partial(src, Lang::C);
+        assert_eq!(file.tier, CcnTier::BestEffort);
+        assert_eq!(names(&file), vec!["f"]);
+        assert_eq!(
+            function_named(&file, "f").ccn,
+            3,
+            "both `if`s outside the ERROR node still count"
+        );
+    }
 
     /// A future `Lang` variant cannot land without a grammar arm and a table:
     /// this walks `Lang::ALL` and requires that each one parses a minimal
