@@ -62,7 +62,8 @@ pub struct ScanOptions {
     pub root: PathBuf,
     /// Include dotfiles / dot-directories.
     pub hidden: bool,
-    /// Ignore `.gitignore`, `.ignore`, `.tokeignore`.
+    /// Ignore every ignore file: `.gitignore`, `.ignore`, `.tokeignore` and
+    /// `.p4ignore`.
     pub no_ignore: bool,
     /// Do not follow symbolic links.
     ///
@@ -435,14 +436,22 @@ fn walk_source_files(
         .git_exclude(!opts.no_ignore)
         .ignore(!opts.no_ignore)
         .parents(!opts.no_ignore)
-        // Perforce workspaces ignore build output through .p4ignore, not
-        // .gitignore; honour it with the same syntax.
-        .add_custom_ignore_filename(".p4ignore")
         // Symlinked sources and symlinked workspace roots are ordinary layouts.
         // The walker keeps the link path (so relative keys and VCS keys stay
         // the ones a user sees) while measuring the target; it also detects
         // cycles itself. `--no-follow-links` restores the strict behaviour.
         .follow_links(!opts.no_follow_links);
+
+    // Two extra ignore files, both with gitignore syntax and both honoured in
+    // every directory the way `.ignore` is: `.tokeignore` is our own knob, and
+    // `.p4ignore` is the Perforce equivalent (a P4 workspace usually has no
+    // `.gitignore`). `--no-ignore` turns them off with the other sources, so
+    // the flag means "no ignore rules at all" rather than "most of them".
+    if !opts.no_ignore {
+        builder
+            .add_custom_ignore_filename(".tokeignore")
+            .add_custom_ignore_filename(".p4ignore");
+    }
 
     let allow_defaults = opts.no_default_excludes;
     builder.filter_entry(move |entry| {
@@ -624,12 +633,14 @@ fn tokei_slice(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         return Cow::Borrowed(bytes);
     };
     let units: Vec<u16> = rest
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             if little_endian {
-                u16::from_le_bytes([pair[0], pair[1]])
+                u16::from_le_bytes(*pair)
             } else {
-                u16::from_be_bytes([pair[0], pair[1]])
+                u16::from_be_bytes(*pair)
             }
         })
         .collect();
@@ -1078,6 +1089,105 @@ mod tests {
         let result = scan(&opts).expect("scan fixture");
         assert_eq!(result.files_analyzed, 1);
         assert_eq!(result.files[0].path, "unit.c");
+    }
+
+    /// The reported paths, sorted: [`scan`] already sorts by path, so this is
+    /// exactly the order a caller sees.
+    fn scanned_paths(result: &ScanResult) -> Vec<String> {
+        result.files.iter().map(|f| f.path.clone()).collect()
+    }
+
+    fn write_c(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), "int f(void) { return 0; }\n").expect("write C fixture");
+    }
+
+    /// `.tokeignore` is advertised by the CLI, so it must actually be one of
+    /// the walker's ignore sources. The file itself is a dotfile with no known
+    /// extension and must never show up as measured source, not even with
+    /// `--hidden` (which makes the walker see it).
+    #[test]
+    fn tokeignore_excludes_a_matching_file() {
+        let fixture = Fixture::new("tokeignore-root");
+        write_c(&fixture.dir, "ignored.c");
+        std::fs::write(fixture.dir.join(".tokeignore"), "ignored.c\n").expect("write .tokeignore");
+
+        let result = scan(&fixture.options(false)).expect("scan fixture");
+        assert_eq!(result.files_analyzed, 1, "{:?}", result.files);
+        assert_eq!(scanned_paths(&result), vec!["sample.rs".to_string()]);
+
+        let opts = ScanOptions {
+            hidden: true,
+            ..fixture.options(false)
+        };
+        let hidden = scan(&opts).expect("scan fixture with hidden files");
+        assert_eq!(
+            scanned_paths(&hidden),
+            vec!["sample.rs".to_string()],
+            "the .tokeignore file is a rule source, not source code"
+        );
+    }
+
+    /// A nested `.tokeignore` owns its directory: it must not leak upward and
+    /// hide a sibling at the root.
+    #[test]
+    fn nested_tokeignore_applies_to_its_own_directory() {
+        let fixture = Fixture::new("tokeignore-nested");
+        let sub = fixture.dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("create sub dir");
+        write_c(&sub, "nested.c");
+        write_c(&fixture.dir, "other.c");
+        std::fs::write(sub.join(".tokeignore"), "nested.c\n").expect("write nested .tokeignore");
+
+        let result = scan(&fixture.options(false)).expect("scan fixture");
+        assert_eq!(
+            scanned_paths(&result),
+            vec!["other.c".to_string(), "sample.rs".to_string()],
+            "only sub/nested.c is excluded"
+        );
+    }
+
+    /// `--no-ignore` is all-or-nothing: both custom sources (`.tokeignore` and
+    /// `.p4ignore`) come back with the standard ones.
+    #[test]
+    fn no_ignore_disables_both_custom_ignore_files() {
+        let fixture = Fixture::new("no-ignore-custom");
+        write_c(&fixture.dir, "toke.c");
+        write_c(&fixture.dir, "p4.c");
+        std::fs::write(fixture.dir.join(".tokeignore"), "toke.c\n").expect("write .tokeignore");
+        std::fs::write(fixture.dir.join(".p4ignore"), "p4.c\n").expect("write .p4ignore");
+
+        let filtered = scan(&fixture.options(false)).expect("scan fixture");
+        assert_eq!(scanned_paths(&filtered), vec!["sample.rs".to_string()]);
+
+        let opts = ScanOptions {
+            no_ignore: true,
+            ..fixture.options(false)
+        };
+        let everything = scan(&opts).expect("scan fixture with --no-ignore");
+        assert_eq!(
+            scanned_paths(&everything),
+            vec![
+                "p4.c".to_string(),
+                "sample.rs".to_string(),
+                "toke.c".to_string()
+            ]
+        );
+    }
+
+    /// The negation syntax is gitignore's, which is what `.tokeignore` uses.
+    #[test]
+    fn tokeignore_negation_keeps_a_file() {
+        let fixture = Fixture::new("tokeignore-negation");
+        write_c(&fixture.dir, "keep.c");
+        write_c(&fixture.dir, "drop.c");
+        std::fs::write(fixture.dir.join(".tokeignore"), "*.c\n!keep.c\n")
+            .expect("write .tokeignore");
+
+        let result = scan(&fixture.options(false)).expect("scan fixture");
+        assert_eq!(
+            scanned_paths(&result),
+            vec!["keep.c".to_string(), "sample.rs".to_string()]
+        );
     }
 
     #[test]

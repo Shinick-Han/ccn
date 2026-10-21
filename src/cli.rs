@@ -31,7 +31,7 @@ pub struct Cli {
     #[arg(long)]
     pub hidden: bool,
 
-    /// Ignore .gitignore / .ignore / .tokeignore.
+    /// Ignore .gitignore / .ignore / .tokeignore / .p4ignore.
     #[arg(long)]
     pub no_ignore: bool,
 

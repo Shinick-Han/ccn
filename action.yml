@@ -31,6 +31,10 @@ inputs:
     description: Extra arguments appended verbatim to the ccn command line.
     required: false
     default: ""
+  version:
+    description: Release tag to download (e.g. v0.7.5). Defaults to latest.
+    required: false
+    default: "latest"
 
 outputs:
   sarif:
@@ -47,6 +51,7 @@ runs:
       shell: bash
       env:
         GITHUB_TOKEN: ${{ github.token }}
+        INPUT_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
 
@@ -83,7 +88,20 @@ runs:
             ;;
         esac
 
-        url_base="https://github.com/Shinick-Han/ccn/releases/latest/download"
+        # The `version` input pins which release the binary comes from. Without
+        # it the action follows releases/latest, which is convenient but means
+        # the scanner version can change under a consumer between runs.
+        version="${INPUT_VERSION:-latest}"
+        if [[ ! "$version" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          echo "::error::invalid version input '$version' (expected a release tag such as v0.7.5)"
+          exit 1
+        fi
+
+        if [[ "$version" == "latest" ]]; then
+          url_base="https://github.com/Shinick-Han/ccn/releases/latest/download"
+        else
+          url_base="https://github.com/Shinick-Han/ccn/releases/download/$version"
+        fi
         tmp="$RUNNER_TEMP/ccn-bin"
         path_taken="source"
 
@@ -111,9 +129,9 @@ runs:
           if [[ "$os" != MINGW* && "$os" != MSYS* && "$os" != CYGWIN* ]]; then
             chmod +x "$dest_dir/$bin_name"
           fi
-          echo "ccn binary: prebuilt ($asset)"
+          echo "ccn binary: prebuilt ($asset from $version)"
         else
-          echo "::warning::prebuilt ccn download unavailable; building from source"
+          echo "::warning::prebuilt ccn $version download unavailable; building from source"
           (cd "$action_path" && cargo build --release --locked)
           echo "ccn binary: source ($action_path/target/release/$bin_name)"
         fi

@@ -63,8 +63,9 @@ use crate::ccn::types::CcnSummary;
 /// Bump when a cached field changes meaning. `CARGO_PKG_VERSION` covers code
 /// changes; this covers rule-table changes that do not move the crate version.
 ///
-/// Version 3 added `tool_version` and `Entry::content_hash`.
-pub const CACHE_VERSION: u32 = 3;
+/// Version 3 added `tool_version` and `Entry::content_hash`. Version 4 added
+/// `FunctionCcn::identity` (the serialized shape changed).
+pub const CACHE_VERSION: u32 = 4;
 
 /// What identifies a file's content without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +314,7 @@ mod tests {
                 tier: CcnTier::Exact,
                 functions: vec![FunctionCcn {
                     name: "f".into(),
+                    identity: "f()".into(),
                     line: 1,
                     end_line: 3,
                     nloc: 3,

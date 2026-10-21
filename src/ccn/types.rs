@@ -128,6 +128,15 @@ pub struct FunctionCcn {
     /// Best-effort name. Anonymous callbacks become `(anonymous)`; the engine
     /// may recover a name from `const x = () => {}` / object properties.
     pub name: String,
+    /// Stable match key: scope-qualified name plus normalized parameter list,
+    /// e.g. `Widget::draw(int, const char*)`. Used by baseline matching so
+    /// overload order cannot be mistaken for a change.
+    ///
+    /// Additive in the serialized shape: files written before this field
+    /// existed deserialize it as `""`, which baseline matching treats as
+    /// "no identity" (name-only fallback).
+    #[serde(default)]
+    pub identity: String,
     /// 1-based start line.
     pub line: usize,
     /// 1-based inclusive end line.
@@ -229,6 +238,7 @@ mod tests {
     fn f(name: &str, ccn: u32) -> FunctionCcn {
         FunctionCcn {
             name: name.to_string(),
+            identity: format!("{name}()"),
             line: 1,
             end_line: 1,
             nloc: 1,

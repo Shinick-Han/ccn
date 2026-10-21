@@ -500,6 +500,7 @@ mod tests {
 
         let function = FunctionCcn {
             name: "f".into(),
+            identity: "f()".into(),
             line: 1,
             end_line: 120,
             nloc: 120,

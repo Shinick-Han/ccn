@@ -17,8 +17,9 @@
 //! - `files_skipped` only counts files whose baseline copy *was* read but could
 //!   not be analysed.
 //!
-//! Matching is by **name**, consuming duplicates in source order, because a
-//! `FunctionRef` has no stable identity across revisions.
+//! Matching is **identity-first**: a `FunctionRef`'s `identity` (scope-qualified
+//! name plus a normalized parameter list) survives overload reordering, and a
+//! name-only fallback is used only when it is unambiguous. See [`compare_file`].
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -34,6 +35,9 @@ use crate::vcs::{Backend, FileAt};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionRef {
     pub name: String,
+    /// Stable match key from the engine (`scope::name(params)`). Empty means
+    /// "unknown" (old data or a hand-built test) and matches by name only.
+    pub identity: String,
     pub ccn: u32,
     pub line: usize,
     pub nloc: usize,
@@ -53,6 +57,9 @@ pub enum Kind {
 pub struct Change {
     pub path: String,
     pub name: String,
+    /// Scope-qualified identity used for matching, e.g. `Widget::draw(int)`.
+    #[serde(default)]
+    pub identity: String,
     pub line: usize,
     pub ccn: u32,
     /// `None` when the function did not exist in the baseline.
@@ -90,14 +97,22 @@ const NLOC_GROWTH: usize = 20;
 
 /// Compare one file's functions against its baseline.
 ///
-/// Functions are matched by name, consuming duplicates in source order: the
-/// first `foo` in `base` is the baseline of the first `foo` in `current`, and so
-/// on. A name can therefore match at most as many times as it occurs in the
-/// baseline; every further occurrence counts as [`Kind::Added`].
+/// Matching is identity-first:
+///
+/// 1. the same `identity` (scope-qualified name plus normalized parameters)
+///    matches, consuming duplicates in source order;
+/// 2. otherwise a name-only fallback matches when exactly one unmatched base
+///    function carries that name — a parameter-type edit stays attached to its
+///    old function instead of being invented as `Added`;
+/// 3. otherwise the current function is [`Kind::Added`].
+///
+/// An empty base identity is "no identity" (old data, hand-built tests) and
+/// falls straight through to rule 2. Because identities ignore overload order,
+/// swapping two same-bodied overloads is no longer a change.
 ///
 /// A finding needs the current function to be above the threshold, plus one of:
 ///
-/// - no baseline function with that name -> [`Kind::Added`];
+/// - no baseline function matched -> [`Kind::Added`];
 /// - more branches than the baseline (`ccn` grew) -> [`Kind::Worsened`];
 /// - deeper nesting than the baseline -> [`Kind::Worsened`];
 /// - at least [`NLOC_GROWTH`] more lines than the baseline -> [`Kind::Worsened`].
@@ -111,80 +126,126 @@ pub fn compare_file(
     current: &[FunctionRef],
     threshold: u32,
 ) -> Vec<Change> {
-    let mut by_name: HashMap<&str, VecDeque<&FunctionRef>> = HashMap::new();
-    for function in base {
+    let mut used = vec![false; base.len()];
+    let mut by_identity: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, function) in base.iter().enumerate() {
+        if !function.identity.is_empty() {
+            by_identity
+                .entry(function.identity.as_str())
+                .or_default()
+                .push_back(index);
+        }
         by_name
             .entry(function.name.as_str())
             .or_default()
-            .push_back(function);
+            .push(index);
     }
 
     let mut changes = Vec::new();
     for function in current {
-        match by_name
-            .get_mut(function.name.as_str())
-            .and_then(VecDeque::pop_front)
-        {
-            Some(matched) => {
-                if function.ccn <= threshold {
-                    continue;
-                }
+        let matched = match_identity(function, &mut by_identity, &used)
+            .or_else(|| match_name(function, &by_name, &used));
 
-                let mut reasons = Vec::new();
-                if function.ccn > matched.ccn {
-                    reasons.push(format!("ccn +{}", function.ccn - matched.ccn));
-                }
-                if function.max_nesting > matched.max_nesting {
-                    reasons.push(format!(
-                        "nesting +{}",
-                        function.max_nesting - matched.max_nesting
-                    ));
-                }
-                if function.nloc >= matched.nloc.saturating_add(NLOC_GROWTH) {
-                    reasons.push(format!("nloc +{}", function.nloc - matched.nloc));
-                }
-                if reasons.is_empty() {
-                    continue;
-                }
-
+        let Some(index) = matched else {
+            if function.ccn > threshold {
                 changes.push(Change {
                     path: path.to_string(),
                     name: function.name.clone(),
+                    identity: function.identity.clone(),
                     line: function.line,
                     ccn: function.ccn,
-                    base_ccn: Some(matched.ccn),
+                    base_ccn: None,
                     nloc: function.nloc,
-                    base_nloc: Some(matched.nloc),
+                    base_nloc: None,
                     max_nesting: function.max_nesting,
-                    base_max_nesting: Some(matched.max_nesting),
-                    kind: Kind::Worsened,
-                    reasons,
+                    base_max_nesting: None,
+                    kind: Kind::Added,
+                    reasons: vec!["new function".to_string()],
                     tier: function.tier,
                 });
             }
-            None => {
-                if function.ccn > threshold {
-                    changes.push(Change {
-                        path: path.to_string(),
-                        name: function.name.clone(),
-                        line: function.line,
-                        ccn: function.ccn,
-                        base_ccn: None,
-                        nloc: function.nloc,
-                        base_nloc: None,
-                        max_nesting: function.max_nesting,
-                        base_max_nesting: None,
-                        kind: Kind::Added,
-                        reasons: vec!["new function".to_string()],
-                        tier: function.tier,
-                    });
-                }
-            }
+            continue;
+        };
+
+        used[index] = true;
+        let matched = &base[index];
+        if function.ccn <= threshold {
+            continue;
         }
+
+        let mut reasons = Vec::new();
+        if function.ccn > matched.ccn {
+            reasons.push(format!("ccn +{}", function.ccn - matched.ccn));
+        }
+        if function.max_nesting > matched.max_nesting {
+            reasons.push(format!(
+                "nesting +{}",
+                function.max_nesting - matched.max_nesting
+            ));
+        }
+        if function.nloc >= matched.nloc.saturating_add(NLOC_GROWTH) {
+            reasons.push(format!("nloc +{}", function.nloc - matched.nloc));
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+
+        changes.push(Change {
+            path: path.to_string(),
+            name: function.name.clone(),
+            identity: function.identity.clone(),
+            line: function.line,
+            ccn: function.ccn,
+            base_ccn: Some(matched.ccn),
+            nloc: function.nloc,
+            base_nloc: Some(matched.nloc),
+            max_nesting: function.max_nesting,
+            base_max_nesting: Some(matched.max_nesting),
+            kind: Kind::Worsened,
+            reasons,
+            tier: function.tier,
+        });
     }
 
     sort_changes(&mut changes);
     changes
+}
+
+/// Rule 1: exact identity, consuming duplicates in source order.
+fn match_identity(
+    function: &FunctionRef,
+    by_identity: &mut HashMap<&str, VecDeque<usize>>,
+    used: &[bool],
+) -> Option<usize> {
+    if function.identity.is_empty() {
+        return None;
+    }
+    let queue = by_identity.get_mut(function.identity.as_str())?;
+    while let Some(index) = queue.pop_front() {
+        if !used[index] {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Rule 2: name-only fallback, only when the name identifies one function.
+fn match_name(
+    function: &FunctionRef,
+    by_name: &HashMap<&str, Vec<usize>>,
+    used: &[bool],
+) -> Option<usize> {
+    let candidates: Vec<usize> = by_name
+        .get(function.name.as_str())?
+        .iter()
+        .copied()
+        .filter(|&index| !used[index])
+        .collect();
+    match candidates.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
 }
 
 /// Build a baseline report from a completed scan.
@@ -341,6 +402,7 @@ fn read_baseline(
 fn to_ref(tier: CcnTier) -> impl Fn(&FunctionCcn) -> FunctionRef {
     move |function| FunctionRef {
         name: function.name.clone(),
+        identity: function.identity.clone(),
         ccn: function.ccn,
         line: function.line,
         nloc: function.nloc,
@@ -372,10 +434,37 @@ mod tests {
     fn func_full(name: &str, line: usize, ccn: u32, nloc: usize, max_nesting: u32) -> FunctionRef {
         FunctionRef {
             name: name.to_string(),
+            identity: format!("{name}()"),
             ccn,
             line,
             nloc,
             max_nesting,
+            tier: CcnTier::Exact,
+        }
+    }
+
+    /// A reference with an explicit identity, as the engine would produce it.
+    fn overload(identity: &str, name: &str, line: usize, ccn: u32) -> FunctionRef {
+        FunctionRef {
+            name: name.to_string(),
+            identity: identity.to_string(),
+            ccn,
+            line,
+            nloc: 1,
+            max_nesting: 0,
+            tier: CcnTier::Exact,
+        }
+    }
+
+    /// A reference whose identity is unknown (old data / hand-built fixture).
+    fn no_identity(name: &str, line: usize, ccn: u32) -> FunctionRef {
+        FunctionRef {
+            name: name.to_string(),
+            identity: String::new(),
+            ccn,
+            line,
+            nloc: 1,
+            max_nesting: 0,
             tier: CcnTier::Exact,
         }
     }
@@ -386,6 +475,7 @@ mod tests {
             .enumerate()
             .map(|(i, (name, ccn))| FunctionCcn {
                 name: (*name).to_string(),
+                identity: format!("{name}()"),
                 line: i + 1,
                 end_line: i + 1,
                 nloc: 1,
@@ -792,6 +882,104 @@ mod tests {
             "the baseline's single foo is spent by the first current foo"
         );
         assert_eq!(reasons(&changes[0]), vec!["new function"]);
+    }
+
+    #[test]
+    fn reordered_overloads_with_identical_bodies_are_not_a_change() {
+        // Same declarations, physically swapped. A name-only matcher would pair
+        // `f(int)` in base with `f(double)` in current because they share the
+        // name `f`; identities pair them with themselves.
+        let base = vec![
+            overload("f(int)", "f", 1, 1),
+            overload("f(double)", "f", 10, 1),
+        ];
+        let current = vec![
+            overload("f(double)", "f", 1, 1),
+            overload("f(int)", "f", 10, 1),
+        ];
+
+        assert!(
+            compare_file("a.rs", &base, &current, 10).is_empty(),
+            "reordering overloads is not a regression"
+        );
+    }
+
+    #[test]
+    fn a_complex_body_move_stays_on_the_identity_it_belongs_to() {
+        let base = vec![
+            overload("f(int)", "f", 1, 1),
+            overload("f(double)", "f", 10, 1),
+        ];
+        // `f(double)` moved above `f(int)`; only `f(int)` got complex.
+        let current = vec![
+            overload("f(double)", "f", 1, 1),
+            overload("f(int)", "f", 10, 20),
+        ];
+
+        let changes = compare_file("a.rs", &base, &current, 10);
+
+        assert_eq!(changes.len(), 1, "only the identity that grew is reported");
+        assert_eq!(changes[0].name, "f");
+        assert_eq!(changes[0].line, 10, "the complex body is `f(int)`");
+        assert_eq!(changes[0].base_ccn, Some(1));
+        assert_eq!(changes[0].ccn, 20);
+        assert_eq!(changes[0].kind, Kind::Worsened);
+        assert_eq!(reasons(&changes[0]), vec!["ccn +19"]);
+    }
+
+    #[test]
+    fn a_parameter_type_edit_is_not_a_new_function() {
+        // The identity changed (`int` -> `long`) but the name is unambiguous,
+        // so this is the same function edited, not an addition.
+        let base = vec![overload("f(int)", "f", 1, 20)];
+        let current = vec![overload("f(long)", "f", 1, 20)];
+
+        assert!(
+            compare_file("a.rs", &base, &current, 10).is_empty(),
+            "an unambiguous name fallback keeps the baseline attached"
+        );
+    }
+
+    #[test]
+    fn an_empty_base_identity_falls_back_to_the_unambiguous_name() {
+        let base = vec![no_identity("f", 1, 20)];
+        let current = vec![overload("f(long)", "f", 1, 20)];
+
+        assert!(compare_file("a.rs", &base, &current, 10).is_empty());
+    }
+
+    #[test]
+    fn a_genuinely_new_overload_is_added_once() {
+        let base = vec![overload("f(int)", "f", 1, 20)];
+        let current = vec![
+            overload("f(int)", "f", 1, 20),
+            overload("f(double)", "f", 2, 20),
+        ];
+
+        let changes = compare_file("a.rs", &base, &current, 10);
+
+        assert_eq!(changes.len(), 1, "the existing overload is not a finding");
+        assert_eq!(changes[0].name, "f");
+        assert_eq!(changes[0].line, 2);
+        assert_eq!(changes[0].base_ccn, None);
+        assert_eq!(changes[0].kind, Kind::Added);
+        assert_eq!(reasons(&changes[0]), vec!["new function"]);
+    }
+
+    #[test]
+    fn a_rename_with_an_unchanged_body_is_still_added() {
+        let base = vec![overload("old()", "old", 1, 20)];
+        let current = vec![overload("renamed()", "renamed", 1, 20)];
+
+        let changes = compare_file("a.rs", &base, &current, 10);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].name, "renamed");
+        assert_eq!(
+            changes[0].kind,
+            Kind::Added,
+            "no rename detection is invented"
+        );
     }
 
     #[test]

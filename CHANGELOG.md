@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.7.6 (2026-10-21)
+
+The second batch from
+[`docs/reviews/codex-commercial-review-2026-10-21.md`](docs/reviews/codex-commercial-review-2026-10-21.md):
+function identity, MSRV, `.tokeignore`, and release integrity.
+
+### Function identity and baseline matching
+
+- Every function now carries a stable `identity`:
+  `[scope::]name(normalized parameters)`, e.g. `N::X::m(int v)` or
+  `Widget::draw(&self, x: i32)`. Scope comes from the enclosing
+  namespace/class/struct/impl/trait/mod, so two classes with the same method
+  name no longer collide.
+- Baseline matching is identity-first. Reordering C++/Java/C# overloads is no
+  longer reported as `worsened` or `added`; moving the complex body between
+  overloads attributes the finding to the right function.
+- When the identity changed (for example a parameter type edit), matching falls
+  back to the name **only if it is unambiguous**, so a signature edit does not
+  look like a new function. Renames remain `Added`.
+- `Change` objects now include `identity`, and SARIF results expose it as
+  `properties.functionIdentity`.
+- Cache format 4 (function records changed).
+
+### Ignore files
+
+- `.tokeignore` is honored with gitignore syntax, at every directory level,
+  including negations. `.p4ignore` keeps working.
+- `--no-ignore` now disables **both** custom ignore files as well as
+  `.gitignore`/`.ignore` (previously `.p4ignore` leaked through).
+
+### Toolchain and releases
+
+- `rust-version` is now **1.90**, the real requirement of the locked
+  dependency set (tree-sitter 0.27 declares 1.90). Previously the manifest
+  claimed 1.80 and failed mid-build on older compilers. `docs/COMPATIBILITY.md`
+  now separates the source-build MSRV from the prebuilt-binary glibc contract.
+- Release tags run a required `checks` job (fmt, clippy `-D warnings`, full
+  test suite) before any asset is built.
+- Each release now publishes `SHA256SUMS` alongside the three binaries.
+- Every third-party action is pinned to a commit SHA (with a version comment).
+- `action.yml` gains a `version` input so a consumer can pin the scanner
+  release instead of following `latest`.
+
 ## 0.7.5 (2026-10-21)
 
 Fixes for the P0/P1 findings in

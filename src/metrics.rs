@@ -709,6 +709,7 @@ mod tests {
     fn func(ccn: u32, nloc: usize) -> FunctionCcn {
         FunctionCcn {
             name: "f".into(),
+            identity: "f()".into(),
             line: 1,
             end_line: nloc,
             nloc,

@@ -1,9 +1,9 @@
 [package]
 name = "ccn"
-version = "0.7.5"
+version = "0.7.6"
 edition = "2021"
 license = "MIT"
-rust-version = "1.80"
+rust-version = "1.90"
 description = "Repository code-health scanner: per-file LOC, per-function CCN, distribution histograms"
 
 [dependencies]

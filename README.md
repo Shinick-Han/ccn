@@ -232,7 +232,7 @@ features, which are auto-detected (`.git` wins, otherwise `p4 info`):
 | scan / CCN / report / TUI / cache | same | same |
 | `--since` | `HEAD~1`, branch, commit | changelist number, or `opened` |
 | `--hotspots` | `git log --numstat` | `p4 changes` + `p4 describe` |
-| ignore rules | `.gitignore` | `.gitignore` + `.p4ignore` |
+| ignore rules | `.gitignore` + `.tokeignore` | `.gitignore` + `.tokeignore` + `.p4ignore` |
 | trend snapshots | `<repo>/.ccn/history.json` | same, or the user cache when the workspace is read-only |
 
 P4 limits, by design:
@@ -279,8 +279,11 @@ a small repo; the variance is Windows Defender scanning the cache file.
 
 ## Build
 
+Requires stable Rust **1.90+** (`rust-version` in `Cargo.toml`); prebuilt
+binaries need no Rust at all. See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+
 ```console
-cargo build --release
+cargo build --release --locked
 cargo test
 ```
 

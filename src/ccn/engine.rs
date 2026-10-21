@@ -200,6 +200,7 @@ pub fn analyze_file_diagnostic(
 
 /// Read-only context shared by the two iterative walkers.
 struct Walker<'a> {
+    lang: Lang,
     table: &'a LanguageRules,
     source: &'a [u8],
     /// Only C/C++ understand `#if 0`: their preprocessor nodes are real nodes,
@@ -210,6 +211,7 @@ struct Walker<'a> {
 impl<'a> Walker<'a> {
     fn new(lang: Lang, table: &'a LanguageRules, source: &'a [u8]) -> Self {
         Self {
+            lang,
             table,
             source,
             preproc: matches!(lang, Lang::C | Lang::Cpp),
@@ -362,10 +364,12 @@ fn measure(node: Node<'_>, walker: &Walker<'_>) -> FunctionCcn {
     let start = node.start_position();
     let end = node.end_position();
     let name = function_name(node, walker.table, walker.source);
+    let identity = function_identity(node, walker, &name);
     let complexity = count_decisions(node, walker);
 
     FunctionCcn {
         name,
+        identity,
         line: start.row + 1,
         end_line: end.row + 1,
         nloc: end.row - start.row + 1,
@@ -477,6 +481,202 @@ fn function_name(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> String
     ANONYMOUS.to_string()
 }
 
+/// Node kinds that introduce a named scope. Never contains a function node: a
+/// nested function is part of its own identity, not its parent's.
+fn scope_nodes(lang: Lang) -> &'static [&'static str] {
+    match lang {
+        Lang::Cpp => &[
+            "namespace_definition",
+            "class_specifier",
+            "struct_specifier",
+            "union_specifier",
+        ],
+        Lang::C => &[],
+        Lang::Java => &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+        ],
+        Lang::CSharp => &[
+            "namespace_declaration",
+            "class_declaration",
+            "struct_declaration",
+            "interface_declaration",
+            "record_declaration",
+        ],
+        Lang::Rust => &["impl_item", "trait_item", "mod_item"],
+        Lang::Python => &["class_definition"],
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
+            &["class_declaration", "class", "interface_declaration"]
+        }
+        // Go methods already carry their receiver in the name; there is no
+        // extra scope to qualify with.
+        Lang::Go => &[],
+    }
+}
+
+/// Identity key for one measured function: `scope::name(params)`.
+///
+/// The scope is collected from the enclosing declarations so that overload
+/// reordering inside a class cannot look like a different function. The short
+/// `name` is deliberately left unqualified: the report still shows `m`, not
+/// `N::X::m`.
+fn function_identity(node: Node<'_>, walker: &Walker<'_>, name: &str) -> String {
+    let scope = scope_path(node, walker);
+    let params = normalized_params(node, walker.table, walker.source);
+    if scope.is_empty() {
+        format!("{name}{params}")
+    } else {
+        format!("{scope}::{name}{params}")
+    }
+}
+
+/// Outermost-first `::`-joined names of the enclosing declarations.
+///
+/// Bounded by a depth cap because tree depth is attacker-controlled; an
+/// anonymous scope (a lambda class, say) is simply skipped rather than
+/// producing an empty `::` segment.
+fn scope_path(node: Node<'_>, walker: &Walker<'_>) -> String {
+    let allowed = scope_nodes(walker.lang);
+    if allowed.is_empty() {
+        return String::new();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = node.parent();
+    for _ in 0..32 {
+        let Some(parent) = current else { break };
+        if allowed.contains(&parent.kind()) {
+            if let Some(name) = scope_name(parent, walker.source) {
+                parts.push(name);
+            }
+        }
+        current = parent.parent();
+    }
+    parts.reverse();
+    parts.join("::")
+}
+
+/// Name of a scope node. `name` covers every listed kind except Rust
+/// `impl_item`, which names its target through the `type` field.
+fn scope_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+    for field in ["name", "type"] {
+        if let Some(name) = node.child_by_field_name(field) {
+            if let Some(text) = field_text(name, source) {
+                return Some(squeeze_whitespace(&text));
+            }
+        }
+    }
+    None
+}
+
+/// The node carrying a function's parameter list, if the grammar has one.
+fn parameter_node<'tree>(node: Node<'tree>, table: &LanguageRules) -> Option<Node<'tree>> {
+    for field in table.params_fields {
+        if let Some(params) = node.child_by_field_name(field) {
+            return Some(params);
+        }
+    }
+    // C/C++: parameters live under the declarator, not on the function node.
+    declarator_params(node, table.declarator_field)
+}
+
+/// Normalized parameter list, parentheses included exactly once.
+///
+/// The raw text is kept (parameter names included): stripping them would need
+/// a real declaration parser, and a name is stable enough for matching.
+fn normalized_params(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> String {
+    let Some(params) = parameter_node(node, table) else {
+        return "()".to_string();
+    };
+    let Ok(raw) = params.utf8_text(source) else {
+        return "()".to_string();
+    };
+    let without_comments = strip_comments(raw);
+    let inner = strip_outer_parens(without_comments.trim());
+    format!("({})", squeeze_whitespace(inner))
+}
+
+/// Punctuation that never needs surrounding spaces in an identity.
+const IDENTITY_PUNCT: &[char] = &[',', '(', ')', '*', '&', '<', '>'];
+
+/// Collapse whitespace runs and drop spaces adjacent to [`IDENTITY_PUNCT`].
+///
+/// `f( int  x , const char * p )` and `f(int x, const char*p)` become the same
+/// string, which is what makes identity survive reformatting.
+fn squeeze_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if IDENTITY_PUNCT.contains(&ch) {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+            out.push(ch);
+            pending_space = false;
+            continue;
+        }
+        if pending_space
+            && out
+                .chars()
+                .last()
+                .is_some_and(|last| !IDENTITY_PUNCT.contains(&last))
+        {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(ch);
+    }
+    out
+}
+
+/// Remove `//...` and `/*...*/` comments from a parameter list.
+///
+/// Deliberately textual: a comment can sit between two parameters and would
+/// otherwise make the same signature compare unequal across revisions.
+fn strip_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            let len = utf8_char_len(bytes[i]);
+            let end = (i + len).min(bytes.len());
+            out.push_str(&text[i..end]);
+            i = end;
+        }
+    }
+    out
+}
+
+/// Length in bytes of the UTF-8 character starting with `first`.
+///
+/// `text` is a valid `&str`, so a leading byte fully determines the width.
+fn utf8_char_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
 /// Walk `node`'s `declarator` chain to its innermost declarator.
 ///
 /// `None` when the language has no declarator field or the node has none.
@@ -520,16 +720,7 @@ fn field_text(node: Node<'_>, source: &[u8]) -> Option<String> {
 }
 
 fn param_count(node: Node<'_>, table: &LanguageRules) -> usize {
-    for field in table.params_fields {
-        if let Some(params) = node.child_by_field_name(field) {
-            return count_params(params);
-        }
-    }
-    // C/C++: parameters live under the declarator, not on the function node.
-    if let Some(params) = declarator_params(node, table.declarator_field) {
-        return count_params(params);
-    }
-    0
+    parameter_node(node, table).map_or(0, count_params)
 }
 
 fn count_params(params: Node<'_>) -> usize {
@@ -1706,5 +1897,85 @@ mod tests {
                    return 0;\n\
                    }\n";
         assert_eq!(nesting_of(src, Lang::C, "f"), 0);
+    }
+
+    // -- Identities -------------------------------------------------------
+
+    #[test]
+    fn cpp_overloads_have_distinct_identities() {
+        let file = analyze(
+            "int f(int x) { return x; }\nint f(double x) { return 0; }\n",
+            Lang::Cpp,
+        );
+        assert_eq!(file.functions.len(), 2);
+        let identities: Vec<&str> = file.functions.iter().map(|f| f.identity.as_str()).collect();
+        assert_eq!(identities, vec!["f(int x)", "f(double x)"]);
+        assert_ne!(identities[0], identities[1]);
+        assert_eq!(
+            file.functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f", "f"],
+            "the reported short name stays unqualified and unchanged"
+        );
+    }
+
+    #[test]
+    fn cpp_identity_qualifies_namespace_and_class_but_the_name_does_not() {
+        let file = analyze(
+            "namespace N { class X { int m(int v) { return v; } }; }",
+            Lang::Cpp,
+        );
+        assert_eq!(file.functions.len(), 1);
+        let f = &file.functions[0];
+        assert_eq!(f.name, "m");
+        assert_eq!(f.identity, "N::X::m(int v)");
+        assert!(f.identity.starts_with("N::X::"));
+    }
+
+    #[test]
+    fn java_identity_includes_the_class() {
+        let f = only("class A { int f(int x) { return x; } }", Lang::Java);
+        assert_eq!(f.name, "f");
+        assert_eq!(f.identity, "A::f(int x)");
+    }
+
+    #[test]
+    fn rust_impl_identity_includes_the_type() {
+        let file = analyze(
+            "struct Widget;\nimpl Widget {\n    fn draw(&self, x: i32) { let _ = x; }\n}\n",
+            Lang::Rust,
+        );
+        let f = function_named(&file, "draw");
+        assert_eq!(f.name, "draw");
+        assert_eq!(f.identity, "Widget::draw(&self,x: i32)");
+    }
+
+    #[test]
+    fn anonymous_functions_share_an_identity_and_are_split_by_line() {
+        let file = analyze(
+            "const xs = [\n  function (x) { return x; },\n  function (x) { return x; },\n];\n",
+            Lang::JavaScript,
+        );
+        assert_eq!(file.functions.len(), 2);
+        assert_eq!(file.functions[0].name, "(anonymous)");
+        assert_eq!(file.functions[1].name, "(anonymous)");
+        assert_eq!(
+            file.functions[0].identity, file.functions[1].identity,
+            "identical signatures collide on purpose"
+        );
+        assert_ne!(
+            file.functions[0].line, file.functions[1].line,
+            "matching resolves the collision by source order"
+        );
+    }
+
+    #[test]
+    fn parameter_whitespace_and_comments_are_normalized_away() {
+        let a = only("int f( int  x , const char * p ) { return 0; }", Lang::Cpp);
+        let b = only("int f(int x, const char* p) { return 0; }", Lang::Cpp);
+        assert_eq!(a.identity, b.identity);
+        assert_eq!(a.identity, "f(int x,const char*p)");
     }
 }

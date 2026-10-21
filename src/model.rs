@@ -283,6 +283,7 @@ mod tests {
     fn function(ccn: u32) -> FunctionCcn {
         FunctionCcn {
             name: "f".to_string(),
+            identity: "f()".to_string(),
             line: 1,
             end_line: 1,
             nloc: 1,

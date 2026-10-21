@@ -160,7 +160,10 @@ fn delta_result(change: &Change, rule: &'static str, threshold: u32, root: &str)
         "level": level,
         "message": { "text": message },
         "locations": [location(&path, change.line, 0)],
-        "properties": { "confidence": confidence }
+        "properties": {
+            "confidence": confidence,
+            "functionIdentity": change.identity
+        }
     })
 }
 
@@ -296,6 +299,7 @@ mod tests {
     fn function(name: &str, line: usize, end_line: usize, ccn: u32) -> FunctionCcn {
         FunctionCcn {
             name: name.to_string(),
+            identity: format!("{name}()"),
             line,
             end_line,
             nloc: end_line.saturating_sub(line).max(1),
@@ -453,6 +457,7 @@ mod tests {
                 Change {
                     path: "src/a.rs".to_string(),
                     name: "grew".to_string(),
+                    identity: "grew()".to_string(),
                     line: 3,
                     ccn: 25,
                     base_ccn: Some(4),
@@ -467,6 +472,7 @@ mod tests {
                 Change {
                     path: "src/a.rs".to_string(),
                     name: "new".to_string(),
+                    identity: "new()".to_string(),
                     line: 12,
                     ccn: 15,
                     base_ccn: None,

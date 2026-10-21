@@ -1147,7 +1147,7 @@ fn thousands(value: usize) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -1253,6 +1253,7 @@ mod tests {
     fn function(name: &str, line: usize, ccn: u32, nloc: usize) -> FunctionCcn {
         FunctionCcn {
             name: name.to_string(),
+            identity: format!("{name}()"),
             line,
             end_line: line + nloc.saturating_sub(1),
             nloc,
