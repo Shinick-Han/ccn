@@ -1258,6 +1258,7 @@ mod tests {
             nloc,
             ccn,
             params: 0,
+            max_nesting: 0,
         }
     }
 

@@ -204,17 +204,39 @@ impl<'a> Walker<'a> {
     /// the filtered case only happens on `#if`/`#elif` nodes, which are rare
     /// compared to the nodes visited in a function body.
     fn push_children<'tree>(&self, stack: &mut Vec<Node<'tree>>, node: Node<'tree>) {
-        let filtered = if self.preproc && PREPROC_CONDITIONALS.contains(&node.kind()) {
-            live_preproc_children(node, self.source)
-        } else {
-            None
-        };
-        match filtered {
-            Some(children) => stack.extend(children),
-            None => {
-                let mut cursor = node.walk();
-                stack.extend(node.children(&mut cursor));
+        self.for_each_live_child(node, |child| stack.push(child));
+    }
+
+    /// Like [`Walker::push_children`], but tags every child with the nesting
+    /// depth it lives at. The caller decides what that depth is; this only
+    /// applies the same `#if 0` filtering as `push_children`.
+    fn push_children_at<'tree>(
+        &self,
+        stack: &mut Vec<(Node<'tree>, u32)>,
+        node: Node<'tree>,
+        depth: u32,
+    ) {
+        self.for_each_live_child(node, |child| stack.push((child, depth)));
+    }
+
+    /// Visit the children of `node` that are actually compiled, in source
+    /// order.
+    ///
+    /// Both walkers share this so `#if 0` handling can never drift between the
+    /// decision count and the nesting depth: a dead branch is invisible to
+    /// both.
+    fn for_each_live_child<'tree>(&self, node: Node<'tree>, mut f: impl FnMut(Node<'tree>)) {
+        if self.preproc && PREPROC_CONDITIONALS.contains(&node.kind()) {
+            if let Some(children) = live_preproc_children(node, self.source) {
+                for child in children {
+                    f(child);
+                }
+                return;
             }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            f(child);
         }
     }
 }
@@ -321,29 +343,52 @@ fn measure(node: Node<'_>, walker: &Walker<'_>) -> FunctionCcn {
     let start = node.start_position();
     let end = node.end_position();
     let name = function_name(node, walker.table, walker.source);
+    let complexity = count_decisions(node, walker);
 
     FunctionCcn {
         name,
         line: start.row + 1,
         end_line: end.row + 1,
         nloc: end.row - start.row + 1,
-        ccn: count_decisions(node, walker).saturating_add(1),
+        ccn: complexity.decisions.saturating_add(1),
         params: param_count(node, walker.table),
+        max_nesting: complexity.max_nesting,
     }
 }
 
-/// Decisions in `func`'s subtree, excluding nested functions and `ERROR`
-/// subtrees.
+/// Decisions and maximum control-flow nesting for one function body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Complexity {
+    /// One per decision node / decision operator. `ccn` is this plus one.
+    decisions: u32,
+    /// Deepest chain of enclosing decision constructs (0 for a flat body).
+    max_nesting: u32,
+}
+
+/// Decisions in `func`'s subtree and the deepest nesting among them,
+/// excluding nested functions and `ERROR` subtrees.
 ///
 /// A function can contain an `ERROR` child without being unusable (a macro
 /// call in the middle of a statement, say). The decisions outside that error
 /// are real and are still counted; only the unreliable subtree is skipped.
-fn count_decisions<'tree>(func: Node<'tree>, walker: &Walker<'_>) -> u32 {
+///
+/// Nesting is *structural*: a node starts one level deeper than its parent
+/// whenever the parent is a decision node from `rules.decision_nodes`. That
+/// gives the intended reading directly, because in every wired grammar the
+/// switch case node (which is what the table counts) wraps its own body:
+/// `switch { case 1: if (x) {} }` is 1 for the case and 2 for the `if`.
+/// Siblings never add up (`if {} if {}` is 1), and a nested function starts a
+/// fresh count of its own. The consequence is that an `else if` / `elif`
+/// chain reads one level deeper than a sibling `if` chain, because the grammar
+/// places the next branch inside the previous decision node.
+fn count_decisions<'tree>(func: Node<'tree>, walker: &Walker<'_>) -> Complexity {
     let mut decisions = 0u32;
-    let mut stack: Vec<Node<'tree>> = Vec::new();
-    walker.push_children(&mut stack, func);
+    let mut max_nesting = 0u32;
+    let mut stack: Vec<(Node<'tree>, u32)> = Vec::new();
+    // The function node itself is not a decision construct.
+    walker.push_children_at(&mut stack, func, 0);
 
-    while let Some(node) = stack.pop() {
+    while let Some((node, depth)) = stack.pop() {
         if node.is_error() || node.is_missing() {
             continue;
         }
@@ -352,21 +397,32 @@ fn count_decisions<'tree>(func: Node<'tree>, walker: &Walker<'_>) -> u32 {
             // A nested function's decisions belong to that function.
             continue;
         }
-        if walker.table.decision_nodes.contains(&kind) {
+        if is_decision(node, kind, walker) {
             decisions += 1;
-        } else if kind == "binary_expression" {
-            if let Some(operator) = node.child_by_field_name("operator") {
-                if let Ok(text) = operator.utf8_text(walker.source) {
-                    if walker.table.decision_operators.contains(&text) {
-                        decisions += 1;
-                    }
-                }
-            }
+            max_nesting = max_nesting.max(depth + 1);
+            walker.push_children_at(&mut stack, node, depth + 1);
+        } else {
+            walker.push_children_at(&mut stack, node, depth);
         }
-        walker.push_children(&mut stack, node);
     }
 
-    decisions
+    Complexity {
+        decisions,
+        max_nesting,
+    }
+}
+
+/// Whether `node` is one decision point under the table for this language.
+fn is_decision(node: Node<'_>, kind: &str, walker: &Walker<'_>) -> bool {
+    if walker.table.decision_nodes.contains(&kind) {
+        return true;
+    }
+    if kind != "binary_expression" {
+        return false;
+    }
+    node.child_by_field_name("operator")
+        .and_then(|operator| operator.utf8_text(walker.source).ok())
+        .is_some_and(|text| walker.table.decision_operators.contains(&text))
 }
 
 fn function_name(node: Node<'_>, table: &LanguageRules, source: &[u8]) -> String {
@@ -1497,5 +1553,139 @@ mod tests {
         for lang in Lang::ALL {
             assert!(!rules::rules(lang).function_nodes.is_empty());
         }
+    }
+
+    // -- Maximum nesting --------------------------------------------------
+
+    fn nesting_of(src: &str, lang: Lang, name: &str) -> u32 {
+        function_named(&analyze(src, lang), name).max_nesting
+    }
+
+    #[test]
+    fn nesting_flat_function_is_zero() {
+        assert_eq!(
+            nesting_of("int f(int x) { return x + 1; }", Lang::C, "f"),
+            0
+        );
+        assert_eq!(
+            nesting_of("function f() { return g(); }", Lang::JavaScript, "f"),
+            0
+        );
+    }
+
+    #[test]
+    fn nesting_single_if_is_one() {
+        assert_eq!(
+            nesting_of(
+                "int f(int x) { if (x) { return 1; } return 0; }",
+                Lang::C,
+                "f"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn nesting_if_containing_for_is_two() {
+        assert_eq!(
+            nesting_of(
+                "int f(int n) { int s = 0; if (n > 0) { for (int i = 0; i < n; i++) { s += i; } } return s; }",
+                Lang::C,
+                "f"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn nesting_three_ifs_is_three() {
+        assert_eq!(
+            nesting_of(
+                "int f(int a, int b, int c) { if (a) { if (b) { if (c) { return 1; } } } return 0; }",
+                Lang::C,
+                "f"
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn nesting_sibling_ifs_do_not_add_up() {
+        assert_eq!(
+            nesting_of(
+                "int f(int a, int b) { if (a) { g(); } if (b) { g(); } return 0; }",
+                Lang::C,
+                "f"
+            ),
+            1,
+            "two constructs at the same level are depth 1, not 2"
+        );
+    }
+
+    #[test]
+    fn nesting_switch_case_body_inherits_one_level() {
+        // The case is the switch's level (1); the `if` inside it makes it 2.
+        assert_eq!(
+            nesting_of(
+                "int f(int x, int y) { switch (x) { case 1: if (y) { return 2; } return 1; default: return 0; } }",
+                Lang::C,
+                "f"
+            ),
+            2
+        );
+        // Two flat cases stay at 1: a case never adds a level per sibling.
+        assert_eq!(
+            nesting_of(
+                "int f(int x) { switch (x) { case 1: return 1; case 2: return 2; } return 0; }",
+                Lang::C,
+                "f"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn nesting_nested_function_keeps_its_own_depth() {
+        let file = analyze(
+            "function outer() {\n  function inner() {\n    if (a) { if (b) { if (c) {} } }\n  }\n  if (d) { inner(); }\n}\n",
+            Lang::JavaScript,
+        );
+        assert_eq!(function_named(&file, "outer").max_nesting, 1);
+        assert_eq!(function_named(&file, "inner").max_nesting, 3);
+    }
+
+    #[test]
+    fn nesting_python_if_inside_for_is_two() {
+        assert_eq!(
+            nesting_of(
+                "def f(xs):\n    for x in xs:\n        if x:\n            return 1\n    return 0\n",
+                Lang::Python,
+                "f"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn nesting_rust_match_arm_with_if_is_two() {
+        assert_eq!(
+            nesting_of(
+                "fn f(x: Option<i32>) -> i32 { match x { Some(v) => { if v > 0 { 1 } else { 0 } }, None => 0 } }",
+                Lang::Rust,
+                "f"
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn nesting_if_zero_body_does_not_count() {
+        let src = "int f(void) {\n\
+                   #if 0\n\
+                   if (1) { for (;;) { while (1) { } } }\n\
+                   #endif\n\
+                   return 0;\n\
+                   }\n";
+        assert_eq!(nesting_of(src, Lang::C, "f"), 0);
     }
 }

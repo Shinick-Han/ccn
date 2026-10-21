@@ -289,6 +289,7 @@ mod tests {
             nloc: end_line.saturating_sub(line).max(1),
             ccn,
             params: 0,
+            max_nesting: 0,
         }
     }
 
@@ -442,7 +443,12 @@ mod tests {
                     line: 3,
                     ccn: 25,
                     base_ccn: Some(4),
+                    nloc: 40,
+                    base_nloc: Some(25),
+                    max_nesting: 2,
+                    base_max_nesting: Some(1),
                     kind: Kind::Worsened,
+                    reasons: vec!["ccn +21".to_string()],
                 },
                 Change {
                     path: "src/a.rs".to_string(),
@@ -450,7 +456,12 @@ mod tests {
                     line: 12,
                     ccn: 15,
                     base_ccn: None,
+                    nloc: 15,
+                    base_nloc: None,
+                    max_nesting: 1,
+                    base_max_nesting: None,
                     kind: Kind::Added,
+                    reasons: vec!["new function".to_string()],
                 },
             ],
         });

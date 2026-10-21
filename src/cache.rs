@@ -27,7 +27,7 @@ use crate::ccn::types::CcnSummary;
 
 /// Bump when a cached field changes meaning. `CARGO_PKG_VERSION` covers code
 /// changes; this covers rule-table changes that do not move the crate version.
-pub const CACHE_VERSION: u32 = 1;
+pub const CACHE_VERSION: u32 = 2;
 
 /// What identifies a file's content without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +208,7 @@ mod tests {
                     nloc: 3,
                     ccn: 2,
                     params: 0,
+                    max_nesting: 0,
                 }],
             })),
             is_generated: false,

@@ -505,6 +505,7 @@ mod tests {
             nloc: 120,
             ccn: 12,
             params: 0,
+            max_nesting: 0,
         };
         let file = FileLoc {
             path: "src/a.rs".into(),

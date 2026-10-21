@@ -201,13 +201,19 @@ fn baseline_block(report: &Report, sep: &str) -> String {
             crate::baseline::Kind::Added => '+',
             crate::baseline::Kind::Worsened => '~',
         };
-        let was = match change.base_ccn {
-            Some(previous) => format!(" (was {previous})"),
-            None => String::new(),
+        // The reasons are the actionable part: "ccn +3, nesting +1" tells the
+        // reviewer what grew, not just that something did.
+        let why = if change.reasons.is_empty() {
+            match change.base_ccn {
+                Some(previous) => format!(" (was {previous})"),
+                None => String::new(),
+            }
+        } else {
+            format!("  [{}]", change.reasons.join(", "))
         };
         let mut line = format!(
             "    {marker} {:<4} {:<24} {}:{}{}",
-            change.ccn, change.name, change.path, change.line, was
+            change.ccn, change.name, change.path, change.line, why
         );
         if line.chars().count() > 100 {
             line = line.chars().take(97).collect::<String>();
@@ -519,6 +525,7 @@ mod tests {
             nloc,
             ccn,
             params: 0,
+            max_nesting: 0,
         }
     }
 

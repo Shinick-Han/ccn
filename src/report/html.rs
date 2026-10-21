@@ -400,7 +400,7 @@ fn baseline_section(baseline: &crate::baseline::Baseline) -> String {
         s.push_str("<p class=\"empty\">no function became more complex</p>\n");
     } else {
         s.push_str("<div class=\"table-wrap\"><table>\n<thead><tr>");
-        for heading in ["change", "function", "CCN", "was", "location"] {
+        for heading in ["change", "function", "CCN", "was", "why", "location"] {
             let _ = write!(s, "<th scope=\"col\">{heading}</th>");
         }
         s.push_str("</tr></thead>\n<tbody>\n");
@@ -416,11 +416,12 @@ fn baseline_section(baseline: &crate::baseline::Baseline) -> String {
             let _ = writeln!(
                 s,
                 "<tr><td>{}</td><td><code>{}</code></td><td class=\"num\">{}</td>\
-                 <td class=\"num\">{}</td><td><code>{}:{}</code></td></tr>",
+                 <td class=\"num\">{}</td><td>{}</td><td><code>{}:{}</code></td></tr>",
                 kind,
                 escape_html(&change.name),
                 change.ccn,
                 was,
+                escape_html(&change.reasons.join(", ")),
                 escape_html(&change.path),
                 change.line
             );

@@ -2,8 +2,8 @@
 //!
 //! The current tree is already measured by the scan; this module re-measures
 //! the same files at `rev` through [`crate::vcs::file_at`] and reports only the
-//! *delta*: a function that crossed the threshold, or a brand-new function that
-//! is already over it.
+//! *delta*: a function that crossed the threshold, an already-complex function
+//! that got worse, or a brand-new function that is already over it.
 //!
 //! Two rules keep the result honest:
 //!
@@ -30,6 +30,7 @@ pub struct FunctionRef {
     pub ccn: u32,
     pub line: usize,
     pub nloc: usize,
+    pub max_nesting: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -47,7 +48,13 @@ pub struct Change {
     pub ccn: u32,
     /// `None` when the function did not exist in the baseline.
     pub base_ccn: Option<u32>,
+    pub nloc: usize,
+    pub base_nloc: Option<usize>,
+    pub max_nesting: u32,
+    pub base_max_nesting: Option<u32>,
     pub kind: Kind,
+    /// Human-readable reasons, e.g. `["ccn +3", "nesting +1", "nloc +42"]`.
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -60,6 +67,9 @@ pub struct Baseline {
     pub changes: Vec<Change>,
 }
 
+/// Extra lines a function may grow by before it counts as worsened on its own.
+const NLOC_GROWTH: usize = 20;
+
 /// Compare one file's functions against its baseline.
 ///
 /// Functions are matched by name, consuming duplicates in source order: the
@@ -67,14 +77,16 @@ pub struct Baseline {
 /// on. A name can therefore match at most as many times as it occurs in the
 /// baseline; every further occurrence counts as [`Kind::Added`].
 ///
-/// Only two transitions are interesting:
+/// A finding needs the current function to be above the threshold, plus one of:
 ///
-/// - no baseline function with that name, and `ccn > threshold` -> `Added`;
-/// - the baseline function was at or below the threshold and the current one is
-///   above it -> `Worsened`.
+/// - no baseline function with that name -> [`Kind::Added`];
+/// - more branches than the baseline (`ccn` grew) -> [`Kind::Worsened`];
+/// - deeper nesting than the baseline -> [`Kind::Worsened`];
+/// - at least [`NLOC_GROWTH`] more lines than the baseline -> [`Kind::Worsened`].
 ///
-/// A function that was already complex, or that got simpler, is not a finding:
-/// this report is about regressions, not about the existing backlog.
+/// This reports regressions, not the existing backlog: an already-complex
+/// function that stays the same or improves is not a finding, but an
+/// already-complex function that gets worse is.
 pub fn compare_file(
     path: &str,
     base: &[FunctionRef],
@@ -96,16 +108,40 @@ pub fn compare_file(
             .and_then(VecDeque::pop_front)
         {
             Some(matched) => {
-                if matched.ccn <= threshold && function.ccn > threshold {
-                    changes.push(Change {
-                        path: path.to_string(),
-                        name: function.name.clone(),
-                        line: function.line,
-                        ccn: function.ccn,
-                        base_ccn: Some(matched.ccn),
-                        kind: Kind::Worsened,
-                    });
+                if function.ccn <= threshold {
+                    continue;
                 }
+
+                let mut reasons = Vec::new();
+                if function.ccn > matched.ccn {
+                    reasons.push(format!("ccn +{}", function.ccn - matched.ccn));
+                }
+                if function.max_nesting > matched.max_nesting {
+                    reasons.push(format!(
+                        "nesting +{}",
+                        function.max_nesting - matched.max_nesting
+                    ));
+                }
+                if function.nloc >= matched.nloc.saturating_add(NLOC_GROWTH) {
+                    reasons.push(format!("nloc +{}", function.nloc - matched.nloc));
+                }
+                if reasons.is_empty() {
+                    continue;
+                }
+
+                changes.push(Change {
+                    path: path.to_string(),
+                    name: function.name.clone(),
+                    line: function.line,
+                    ccn: function.ccn,
+                    base_ccn: Some(matched.ccn),
+                    nloc: function.nloc,
+                    base_nloc: Some(matched.nloc),
+                    max_nesting: function.max_nesting,
+                    base_max_nesting: Some(matched.max_nesting),
+                    kind: Kind::Worsened,
+                    reasons,
+                });
             }
             None => {
                 if function.ccn > threshold {
@@ -115,7 +151,12 @@ pub fn compare_file(
                         line: function.line,
                         ccn: function.ccn,
                         base_ccn: None,
+                        nloc: function.nloc,
+                        base_nloc: None,
+                        max_nesting: function.max_nesting,
+                        base_max_nesting: None,
                         kind: Kind::Added,
+                        reasons: vec!["new function".to_string()],
                     });
                 }
             }
@@ -225,16 +266,7 @@ fn measure_baseline(
         return FileOutcome::Compared {
             path: file.path.clone(),
             base: Vec::new(),
-            current: summary
-                .detail
-                .iter()
-                .map(|f| FunctionRef {
-                    name: f.name.clone(),
-                    ccn: f.ccn,
-                    line: f.line,
-                    nloc: f.nloc,
-                })
-                .collect(),
+            current: summary.detail.iter().map(to_ref).collect(),
         };
     };
 
@@ -258,6 +290,7 @@ fn to_ref(function: &FunctionCcn) -> FunctionRef {
         ccn: function.ccn,
         line: function.line,
         nloc: function.nloc,
+        max_nesting: function.max_nesting,
     }
 }
 
@@ -278,29 +311,16 @@ mod tests {
     use crate::model::ExcludedFiles;
 
     fn func(name: &str, line: usize, ccn: u32) -> FunctionRef {
+        func_full(name, line, ccn, 1, 0)
+    }
+
+    fn func_full(name: &str, line: usize, ccn: u32, nloc: usize, max_nesting: u32) -> FunctionRef {
         FunctionRef {
             name: name.to_string(),
             ccn,
             line,
-            nloc: 1,
-        }
-    }
-
-    fn change(
-        path: &str,
-        name: &str,
-        line: usize,
-        ccn: u32,
-        base_ccn: Option<u32>,
-        kind: Kind,
-    ) -> Change {
-        Change {
-            path: path.to_string(),
-            name: name.to_string(),
-            line,
-            ccn,
-            base_ccn,
-            kind,
+            nloc,
+            max_nesting,
         }
     }
 
@@ -315,6 +335,7 @@ mod tests {
                 nloc: 1,
                 ccn: *ccn,
                 params: 0,
+                max_nesting: 0,
             })
             .collect();
         FileLoc {
@@ -431,6 +452,10 @@ mod tests {
         }
     }
 
+    fn reasons(change: &Change) -> Vec<&str> {
+        change.reasons.iter().map(String::as_str).collect()
+    }
+
     #[test]
     fn a_moved_file_with_identical_functions_has_no_changes() {
         if !git_works() {
@@ -487,11 +512,14 @@ mod tests {
         let baseline = collect(&result, Backend::Git, "HEAD~1", 10);
 
         assert_eq!(baseline.files_compared, 1);
-        assert_eq!(
-            baseline.changes,
-            vec![change("b.rs", "foo", 1, 12, Some(9), Kind::Worsened)],
-            "the baseline is a.rs at rev, so the delta is real"
-        );
+        assert_eq!(baseline.changes.len(), 1);
+        let change = &baseline.changes[0];
+        assert_eq!(change.path, "b.rs");
+        assert_eq!(change.name, "foo");
+        assert_eq!(change.ccn, 12);
+        assert_eq!(change.base_ccn, Some(9));
+        assert_eq!(change.kind, Kind::Worsened);
+        assert_eq!(reasons(change), vec!["ccn +3"]);
     }
 
     #[test]
@@ -514,10 +542,126 @@ mod tests {
         let baseline = collect(&result, Backend::Git, "HEAD", 10);
 
         assert_eq!(baseline.files_compared, 1);
+        assert_eq!(baseline.changes.len(), 1);
+        let change = &baseline.changes[0];
+        assert_eq!(change.path, "new.rs");
+        assert_eq!(change.name, "foo");
+        assert_eq!(change.ccn, 12);
+        assert_eq!(change.base_ccn, None);
+        assert_eq!(change.base_nloc, None);
+        assert_eq!(change.base_max_nesting, None);
+        assert_eq!(change.kind, Kind::Added);
+        assert_eq!(reasons(change), vec!["new function"]);
+    }
+
+    #[test]
+    fn already_over_the_threshold_and_worse_is_reported() {
+        // 30 was already over the limit; 33 is still a regression.
+        let changes = compare_file("a.rs", &[func("f", 1, 30)], &[func("f", 2, 33)], 10);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, Kind::Worsened);
+        assert_eq!(changes[0].base_ccn, Some(30));
+        assert_eq!(changes[0].ccn, 33);
+        assert_eq!(reasons(&changes[0]), vec!["ccn +3"]);
+    }
+
+    #[test]
+    fn crossing_the_threshold_is_worsened() {
+        let changes = compare_file("a.rs", &[func("f", 1, 9)], &[func("f", 2, 11)], 10);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, Kind::Worsened);
+        assert_eq!(changes[0].base_ccn, Some(9));
+        assert_eq!(reasons(&changes[0]), vec!["ccn +2"]);
+    }
+
+    #[test]
+    fn an_unchanged_over_threshold_function_is_not_reported() {
+        assert!(
+            compare_file("a.rs", &[func("f", 1, 11)], &[func("f", 2, 11)], 10).is_empty(),
+            "no delta, no finding"
+        );
+    }
+
+    #[test]
+    fn an_improved_over_threshold_function_is_not_reported() {
+        assert!(
+            compare_file("a.rs", &[func("f", 1, 30)], &[func("f", 2, 28)], 10).is_empty(),
+            "getting simpler is never a regression"
+        );
+    }
+
+    #[test]
+    fn a_growth_still_under_the_threshold_is_not_reported() {
+        assert!(
+            compare_file("a.rs", &[func("f", 1, 5)], &[func("f", 2, 6)], 10).is_empty(),
+            "the function is still below the limit"
+        );
+    }
+
+    #[test]
+    fn deeper_nesting_is_worsened_even_with_the_same_ccn() {
+        let base = vec![func_full("f", 1, 20, 40, 2)];
+        let current = vec![func_full("f", 2, 20, 40, 4)];
+
+        let changes = compare_file("a.rs", &base, &current, 10);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, Kind::Worsened);
+        assert_eq!(changes[0].base_max_nesting, Some(2));
+        assert_eq!(changes[0].max_nesting, 4);
+        assert_eq!(reasons(&changes[0]), vec!["nesting +2"]);
+    }
+
+    #[test]
+    fn large_nloc_growth_is_worsened_but_nineteen_lines_is_not() {
+        let base = vec![func_full("f", 1, 20, 40, 0)];
+        let grown = vec![func_full("f", 2, 20, 61, 0)];
+
+        let changes = compare_file("a.rs", &base, &grown, 10);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, Kind::Worsened);
+        assert_eq!(changes[0].base_nloc, Some(40));
+        assert_eq!(changes[0].nloc, 61);
+        assert_eq!(reasons(&changes[0]), vec!["nloc +21"]);
+
+        let just_under = vec![func_full("f", 2, 20, 59, 0)];
+        assert!(
+            compare_file("a.rs", &base, &just_under, 10).is_empty(),
+            "+19 lines is below the growth threshold"
+        );
+    }
+
+    #[test]
+    fn a_new_function_carries_no_baseline_metrics() {
+        let current = vec![func_full("f", 7, 12, 50, 3)];
+
+        let changes = compare_file("a.rs", &[], &current, 10);
+
+        assert_eq!(changes.len(), 1);
+        let change = &changes[0];
+        assert_eq!(change.kind, Kind::Added);
+        assert_eq!(change.base_ccn, None);
+        assert_eq!(change.base_nloc, None);
+        assert_eq!(change.base_max_nesting, None);
+        assert_eq!(change.nloc, 50);
+        assert_eq!(change.max_nesting, 3);
+        assert_eq!(reasons(change), vec!["new function"]);
+    }
+
+    #[test]
+    fn every_reason_is_reported_when_several_metrics_grow() {
+        let base = vec![func_full("f", 1, 30, 40, 2)];
+        let current = vec![func_full("f", 2, 34, 61, 4)];
+
+        let changes = compare_file("a.rs", &base, &current, 10);
+
+        assert_eq!(changes.len(), 1);
         assert_eq!(
-            baseline.changes,
-            vec![change("new.rs", "foo", 1, 12, None, Kind::Added)],
-            "no rename either, so the file really is new"
+            reasons(&changes[0]),
+            vec!["ccn +4", "nesting +2", "nloc +21"]
         );
     }
 
@@ -543,14 +687,19 @@ mod tests {
         let changes = compare_file("src/a.rs", &base, &current, 10);
 
         assert_eq!(
-            changes,
+            changes
+                .iter()
+                .map(|c| (c.name.as_str(), c.line, c.ccn, c.base_ccn, c.kind))
+                .collect::<Vec<_>>(),
             vec![
+                ("foo", 41, 40, Some(30), Kind::Worsened),
+                ("bar", 61, 40, Some(20), Kind::Worsened),
                 // 3 -> 25 crosses the limit.
-                change("src/a.rs", "foo", 2, 25, Some(3), Kind::Worsened),
+                ("foo", 2, 25, Some(3), Kind::Worsened),
                 // Absent from the baseline and already over the limit.
-                change("src/a.rs", "added", 95, 15, None, Kind::Added),
+                ("added", 95, 15, None, Kind::Added),
             ],
-            "already-complex (bar, qux), unchanged (baz) and simple new (simple) functions stay quiet"
+            "unchanged (baz, qux) and simple new (simple) functions stay quiet"
         );
     }
 
@@ -579,11 +728,13 @@ mod tests {
 
         let changes = compare_file("a.rs", &base, &current, 10);
 
+        assert_eq!(changes.len(), 1);
         assert_eq!(
-            changes,
-            vec![change("a.rs", "foo", 20, 30, None, Kind::Added)],
+            (changes[0].line, changes[0].base_ccn, changes[0].kind),
+            (20, None, Kind::Added),
             "the baseline's single foo is spent by the first current foo"
         );
+        assert_eq!(reasons(&changes[0]), vec!["new function"]);
     }
 
     #[test]
@@ -601,8 +752,8 @@ mod tests {
             "10 is not over the limit"
         );
         assert!(
-            compare_file("a", &base(11), &current(12), 10).is_empty(),
-            "already over the limit, so this is not a regression"
+            compare_file("a", &base(30), &current(31), 10).len() == 1,
+            "already over the limit, but this is still a regression"
         );
 
         // The same boundary applies to new functions.
@@ -690,6 +841,14 @@ mod tests {
         assert_eq!(baseline.files_skipped, 0);
         assert_eq!(baseline.changes.len(), 3, "foo, bar, baz are all new");
         assert!(baseline.changes.iter().all(|c| c.kind == Kind::Added));
+        assert!(baseline
+            .changes
+            .iter()
+            .all(|c| c.base_nloc.is_none() && c.base_max_nesting.is_none()));
+        assert!(baseline
+            .changes
+            .iter()
+            .all(|c| reasons(c) == vec!["new function"]));
     }
 
     #[test]

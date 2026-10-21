@@ -1071,3 +1071,50 @@ clippy -D warnings, fmt clean
 - C++ 템플릿 헤더(`.h`) Exact
 - 매크로 파일 BestEffort + 함수 유지
 - `#if 0` 함수 제외, `#else` 함수 포함
+
+---
+
+## 28. 함수별 delta 확장: 길이·중첩·기존 악화 (2026-10-21, 0.7.4)
+
+PT/EDA 방향 문서 §4.1의 요구를 반영했다.
+
+### 중첩 깊이 (`FunctionCcn.max_nesting`)
+
+- 함수 본문에서 결정 노드가 중첩된 최대 깊이. `if { for {} }` → 2, 형제 `if` 두 개 → 1.
+- 중첩 함수는 부모 깊이에 포함하지 않는다.
+- `#if 0` 비활성 분기와 ERROR 서브트리는 깊이에 포함하지 않는다.
+- 계산은 기존 단일 순회에 `depth`를 실어 처리한다(추가 트리 순회 없음).
+
+### Baseline delta 규칙
+
+| 상황 | 보고 |
+|---|---|
+| 새 함수, CCN > 10 | `Added` (`new function`) |
+| 기존 함수, CCN > 10, CCN 증가 | `Worsened` (`ccn +N`) |
+| 기존 함수, CCN > 10, 중첩 증가 | `Worsened` (`nesting +N`) |
+| 기존 함수, CCN > 10, 길이 +20줄 이상 | `Worsened` (`nloc +N`) |
+| 동일/개선/임계 이하 | 보고 안 함 |
+
+**핵심 변화: 이미 10을 넘은 함수도 악화되면 보고한다.** 기존에는 "10을 넘는 순간"만 잡았다.
+
+실측:
+```
+Since HEAD  0 new >10 · 1 worsened  (1 files compared, 0 skipped)
+  ~ 12  already_bad  a.rs:1  [ccn +1, nesting +1, nloc +23]
+```
+
+### 캐시
+
+`FunctionCcn`에 필드가 늘어 `CACHE_VERSION`을 2로 올렸다. 구 캐시는 자동으로 miss 처리된다.
+
+### 검증
+
+```
+334 lib + 2 integration tests, 0 failed
+clippy -D warnings, fmt clean
+```
+
+### 남은 것
+
+- 함수 식별은 여전히 이름 기준(오버로드/이름 변경은 순서 매칭). signature 기반 식별은 후속.
+- 모듈 단위 그룹 요약은 미구현.

@@ -175,7 +175,10 @@ Since origin/main  1 new >10 · 0 worsened   (66 files compared, 0 skipped)
 ```
 
 - **added**: the function did not exist at the revision and is already over 10.
-- **worsened**: it existed at or under 10 and crossed it.
+- **worsened**: it got worse — including functions that were **already over
+  10**. A function is reported when CCN, nesting depth or length grows
+  (`ccn +3`, `nesting +1`, `nloc +21`); identical or improved functions are
+  silent. So `30 → 33` is reported, not just the 9 → 11 crossing.
 - matching is by function name, consuming duplicates in source order.
 - a file that did not exist at the revision counts as an empty baseline, so its
   complex functions are reported as added. The revision itself is validated

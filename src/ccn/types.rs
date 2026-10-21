@@ -137,6 +137,11 @@ pub struct FunctionCcn {
     /// `1 + decision_points`, minimum 1.
     pub ccn: u32,
     pub params: usize,
+    /// Maximum nesting depth of control-flow constructs inside the function
+    /// (a flat function is 0; `if { for { } }` is 2). Cached files from older
+    /// versions deserialize as 0.
+    #[serde(default)]
+    pub max_nesting: u32,
 }
 
 /// Raw engine output for one file.
@@ -229,6 +234,7 @@ mod tests {
             nloc: 1,
             ccn,
             params: 0,
+            max_nesting: 0,
         }
     }
 
