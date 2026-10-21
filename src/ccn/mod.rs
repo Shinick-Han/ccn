@@ -18,7 +18,8 @@ pub use types::{CcnSummary, CcnTier, FileCcn, FunctionCcn, Lang};
 /// Tier selection:
 /// 1. extension wins over tokei's name (`.tsx` needs the TSX grammar),
 /// 2. a wired grammar + successful parse -> `Exact`,
-/// 3. anything else -> keyword heuristic, `Heuristic`.
+/// 3. a compatible grammar (C <-> C++) if the first one rejects the file,
+/// 4. anything else -> keyword heuristic, `Heuristic`.
 pub fn analyze_file(path: &Path, source: &[u8], tokei_lang: &str) -> CcnSummary {
     let lang =
         Lang::from_path(&path.to_string_lossy()).or_else(|| Lang::from_tokei_name(tokei_lang));
@@ -27,9 +28,26 @@ pub fn analyze_file(path: &Path, source: &[u8], tokei_lang: &str) -> CcnSummary 
         if let Ok(file) = engine::analyze_file(path, source, lang) {
             return CcnSummary::from_file(file);
         }
+        // A `.h` header is commonly C++ (templates, classes, namespaces) even
+        // when the extension looks like C. Retry with the sibling grammar
+        // instead of degrading the whole file to a keyword count.
+        for alternative in fallbacks(lang) {
+            if let Ok(file) = engine::analyze_file(path, source, *alternative) {
+                return CcnSummary::from_file(file);
+            }
+        }
     }
 
     CcnSummary::heuristic(heuristic::analyze_file(source, tokei_lang))
+}
+
+/// Grammars that can plausibly parse the same file.
+fn fallbacks(lang: Lang) -> &'static [Lang] {
+    match lang {
+        Lang::C => &[Lang::Cpp],
+        Lang::Cpp => &[Lang::C],
+        _ => &[],
+    }
 }
 
 #[cfg(test)]
@@ -42,6 +60,32 @@ mod tests {
         assert_eq!(s.tier, CcnTier::Heuristic);
         assert!(s.file_ccn.is_some());
         assert_eq!(s.functions, 0);
+    }
+
+    #[test]
+    fn a_cpp_header_with_a_h_extension_is_parsed_as_cpp() {
+        // `.h` maps to C, but this is C++: the C grammar rejects it and the
+        // dispatcher must retry with C++ rather than fall back to a heuristic.
+        let source = br#"
+template <typename T>
+class Box {
+public:
+    explicit Box(T value) : value_(value) {}
+    T get() const { return value_; }
+private:
+    T value_;
+};
+"#;
+        let summary = analyze_file(Path::new("include/box.h"), source, "C++");
+        assert_eq!(summary.tier, CcnTier::Exact);
+        assert!(summary.functions >= 1, "box.h should expose a function");
+    }
+
+    #[test]
+    fn a_plain_c_header_still_parses_as_c() {
+        let source = b"int add(int a, int b);\n";
+        let summary = analyze_file(Path::new("add.h"), source, "C");
+        assert_eq!(summary.tier, CcnTier::Exact);
     }
 
     #[test]
