@@ -144,6 +144,8 @@ Since origin/main  1 new >10 · 0 worsened   (66 files compared, 0 skipped)
 - a file that did not exist at the revision counts as an empty baseline, so its
   complex functions are reported as added. The revision itself is validated
   first, so a typo cannot turn the whole repository into "new".
+- **renames are followed** (`git diff -M`): a moved file is compared against its
+  old path, so moving code does not look like a hundred new functions.
 - P4: `--baseline 123456` uses `p4 print @=123456` for the old contents.
 
 ## GitHub Actions
@@ -170,8 +172,11 @@ steps:
     with: { sarif_file: ccn.sarif }
 ```
 
-- the action builds the binary from source (`cargo build --release --locked`)
-  and always passes `--no-report`.
+- the action first tries the prebuilt asset from this repository's latest
+  release (`ccn-linux-x64`, `ccn-macos-x64`, `ccn-windows-x64.exe`) and falls
+  back to `cargo build --release --locked`. Private repositories cannot be
+  downloaded anonymously, so they take the source path.
+- it always passes `--no-report`.
 - `fail-on-new: "true"` makes the step fail when the PR adds or worsens a
   function above CCN 10. SARIF still uploads because of `if: always()`.
 - with `--baseline`, SARIF contains only the delta; without it, it contains
@@ -201,6 +206,10 @@ P4 limits, by design:
 - **Read-only workspaces**: `p4 sync` writes files read-only, so
   `--trend` falls back to `%LOCALAPPDATA%\ccn\history-<hash>.json` when the
   repository path cannot be written.
+- Validated against a local Helix Core server (`p4d`) with four changelists:
+  scan, `--since <CL>`, `--baseline <CL>`, `--hotspots` and `--sarif` all
+  produce the expected results. The fixes that came out of that run are in
+  `docs/PLAN.md` §25.
 
 ## Cache
 

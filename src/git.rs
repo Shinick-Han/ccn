@@ -195,6 +195,57 @@ pub fn changed_since(repo: &Path, rev: &str) -> Option<HashSet<String>> {
     Some(changed)
 }
 
+/// Renames between `rev` and the working tree: new path -> old path,
+/// work-tree-relative and `/`-separated.
+///
+/// `git diff -M` uses rename detection, so a path that only moved appears as a
+/// single `R<score>` record instead of a delete plus an add. Only renames are
+/// kept: `A`, `M` and `D` entries carry no old path and are ignored.
+///
+/// Returns `None` when `rev` is empty, starts with `-`, contains whitespace,
+/// `repo` is not a work tree, git is missing, the revision is unknown, the
+/// command fails, or it exceeds [`TIMEOUT`]. A successful diff with no renames
+/// is `Some(empty)`, which is meaningfully different from "could not ask".
+pub fn renames(repo: &Path, rev: &str) -> Option<HashMap<String, String>> {
+    if rev.is_empty() || rev.starts_with('-') || rev.contains(char::is_whitespace) {
+        return None;
+    }
+    let work_tree = work_tree(repo)?;
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg("core.quotepath=false")
+        .arg("-C")
+        .arg(&work_tree)
+        .args(["diff", "-M", "--name-status", rev, "--"]);
+    let out = run(cmd)?;
+
+    let text = String::from_utf8_lossy(&out);
+    let mut renames = HashMap::new();
+    for raw in text.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.is_empty() {
+            continue;
+        }
+        // `R<score>\told\tnew`; the first field never contains a tab, so
+        // splitting the rest into exactly two paths is safe.
+        let mut fields = line.splitn(3, '\t');
+        let (Some(status), Some(old), Some(new)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !status.starts_with('R') {
+            continue;
+        }
+        let (old, new) = (old.trim(), new.trim());
+        if old.is_empty() || new.is_empty() {
+            continue;
+        }
+        renames.insert(new.replace('\\', "/"), old.replace('\\', "/"));
+    }
+    Some(renames)
+}
+
 /// True when `rev` resolves to a commit in `repo`.
 pub fn rev_exists(repo: &Path, rev: &str) -> bool {
     if rev.is_empty() || rev.starts_with('-') || rev.contains(char::is_whitespace) {
@@ -715,6 +766,69 @@ mod tests {
 
         // A revision that does not exist is "could not ask", not "nothing changed".
         assert!(changed_since(tmp.path(), "no-such-rev-9f3a").is_none());
+    }
+
+    #[test]
+    fn renames_maps_the_new_path_to_the_old_one() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("renames");
+        init_repo(tmp.path());
+
+        write(tmp.path(), "a.rs", "fn a() {}\n");
+        commit(tmp.path(), "first");
+
+        git(tmp.path(), &["mv", "a.rs", "b.rs"]);
+        commit(tmp.path(), "rename");
+
+        let renames = renames(tmp.path(), "HEAD~1").expect("diff against HEAD~1");
+        assert_eq!(
+            renames,
+            HashMap::from([("b.rs".to_string(), "a.rs".to_string())]),
+            "a pure rename is one R100 record, not a delete plus an add"
+        );
+    }
+
+    #[test]
+    fn a_plain_modification_has_no_renames() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("renames-mod");
+        init_repo(tmp.path());
+        write(tmp.path(), "a.rs", "1\n");
+        commit(tmp.path(), "first");
+        write(tmp.path(), "a.rs", "1\n2\n");
+        commit(tmp.path(), "modify");
+
+        let renames = renames(tmp.path(), "HEAD~1").expect("diff against HEAD~1");
+        assert!(renames.is_empty(), "A/M entries carry no old path");
+    }
+
+    #[test]
+    fn no_renames_is_some_empty_not_none() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("renames-none");
+        init_repo(tmp.path());
+        write(tmp.path(), "a.rs", "1\n");
+        commit(tmp.path(), "first");
+
+        assert_eq!(
+            renames(tmp.path(), "HEAD"),
+            Some(HashMap::new()),
+            "a successful diff with nothing renamed is a known-empty answer"
+        );
+    }
+
+    #[test]
+    fn renames_rejects_bad_revisions_before_spawning() {
+        let tmp = TempDir::new("renames-bad-rev");
+        assert!(renames(tmp.path(), "").is_none());
+        assert!(renames(tmp.path(), "--output=/tmp/x").is_none());
+        assert!(renames(tmp.path(), "HE AD").is_none());
     }
 
     #[test]

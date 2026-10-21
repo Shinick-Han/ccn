@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: ccn-linux-x64
+            artifact: ccn
+          - os: macos-latest
+            asset: ccn-macos-x64
+            artifact: ccn
+          - os: windows-latest
+            asset: ccn-windows-x64.exe
+            artifact: ccn.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="target/release/${{ matrix.artifact }}"
+          if [[ ! -f "$src" ]]; then
+            echo "::error::missing build output: $src"
+            exit 1
+          fi
+          cp "$src" "${{ matrix.asset }}"
+          if [[ "${RUNNER_OS}" != "Windows" ]]; then
+            chmod +x "${{ matrix.asset }}"
+          fi
+          ls -l "${{ matrix.asset }}"
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          generate_release_notes: true

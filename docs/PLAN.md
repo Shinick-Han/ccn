@@ -967,3 +967,50 @@ YAML 2개 파싱 확인 (action.yml, ccn.yml)
 - 액션이 매 실행마다 소스를 빌드한다(캐시가 있어도 수 분). 릴리스 바이너리를 내려받는 방식이 다음 개선.
 - 코드 스캐닝 업로드는 공개 저장소 또는 GHAS가 켜진 private 저장소에서만 동작한다.
 - SARIF 전체 모드는 노이즈가 될 수 있어 PR에서는 델타 모드를 권장.
+
+---
+
+## 25. 릴리스 · 리네임 · P4 실서버 검증 (2026-10-21, 0.7.0)
+
+### 릴리스 바이너리
+
+`.github/workflows/release.yml`이 `v*` 태그에서 3개 플랫폼 바이너리를 만든다.
+
+- 자산: `ccn-linux-x64`, `ccn-macos-x64`, `ccn-windows-x64.exe` (raw, 압축 없음)
+- `action.yml`은 최신 릴리스 자산을 먼저 받고, 실패하면 소스 빌드로 폴백한다.
+- private 저장소는 익명 다운로드가 404이므로 폴백 경로를 탄다(문서화됨).
+
+### 리네임 추적
+
+`git diff -M --name-status <rev>`를 파싱해 `new -> old` 맵을 만들고, 새 경로의 베이스라인이 없으면 옛 경로에서 읽는다.
+
+- `git::renames`, `vcs::renamed_from`, `baseline::collect`에서 사용
+- 이동만 한 파일: 변화 없음. 이동 + 복잡도 증가: `Worsened`. 진짜 새 파일: `Added`.
+- P4는 리네임 추적 없음(빈 맵).
+
+### P4 실서버 검증 (로컬 p4d)
+
+Helix Core `p4d`를 로컬에 띄우고 depot/클라이언트/CL 4개를 만들어 실제로 돌렸다. **단위 테스트로는 못 잡는 버그 7개를 발견했다:**
+
+1. **`p4 -q files`는 출력을 통째로 억제한다.** 전역 `-q`는 조용히 빈 결과를 만든다. → 전역 `-q` 제거, `print -q`만 유지.
+2. **`-ztag`는 전역 플래그다.** `p4 changes -ztag`는 "Invalid option"으로 실패해 히스토리가 통째로 사라졌다. → `p4 -ztag changes ...`, `p4 -ztag describe ...`.
+3. **`p4 where`는 디렉토리를 받지 않는다.** `...` 와일드카드가 필요하고, `//depot` + `...`는 `//depot/...`이 되어야 한다(슬래시 누락 주의). → `depot_wildcard` 헬퍼.
+4. **`@=N,@now`는 N 시점 파일까지 포함한다.** "N 이후 변경"은 `@>N`. → `--since`가 b.rs까지 잡던 문제 수정.
+5. (추가) `p4 changes @=N`은 파일 스펙이 없으면 빈 결과 → `rev_exists`는 `describe -s N`으로 확인.
+6. (추가) 스캐너가 넘기는 `\\?\C:\...` 경로를 `p4 where`가 이해하지 못한다 → mapping_for에서 prefix 제거.
+7. (추가) `-ztag` 위치와 함께 `p4 opened`의 "File(s) not opened" 문구 처리.
+
+검증 결과:
+```
+scan          3 files · Health 86.9 / D
+--since 1     2 files (a.rs, c.rs)
+--baseline 1  2 new >10 (deep 15, complex 13)
+--hotspots    P4 4 changelists · src/a.rs 3 commits · src/c.rs 2 · author test
+--sarif       delta results emitted
+```
+
+### 남은 것
+
+- P4 `lines_changed`는 여전히 0 (`describe -s`가 diff를 주지 않음).
+- P4 리네임/스트림 간 이력은 범위 밖.
+- 릴리스 워크플로는 태그를 푸시해야 처음 실행된다.

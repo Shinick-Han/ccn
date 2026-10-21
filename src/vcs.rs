@@ -125,6 +125,31 @@ pub fn file_at(scan_root: &Path, backend: Backend, rev: &str, path: &str) -> Opt
     }
 }
 
+/// Renames since `rev`, as `new path -> old path`, relative to the scan root.
+///
+/// Both sides must live under the scan root: a rename whose old path is outside
+/// would make the baseline read escape the subtree the report describes, so the
+/// pair is dropped. Perforce has no rename tracking, so it always returns an
+/// empty map. Never panics; a backend that cannot answer degrades to "no
+/// renames", and the baseline then treats the new path as new exactly as before.
+pub fn renamed_from(scan_root: &Path, backend: Backend, rev: &str) -> HashMap<String, String> {
+    match backend {
+        Backend::Git => {
+            let Some(work_tree) = git::work_tree(scan_root) else {
+                return HashMap::new();
+            };
+            let Some(prefix) = git_prefix(scan_root, &work_tree) else {
+                return HashMap::new();
+            };
+            let Some(renames) = git::renames(scan_root, rev) else {
+                return HashMap::new();
+            };
+            rebase_pairs(renames, &prefix)
+        }
+        Backend::P4 => HashMap::new(),
+    }
+}
+
 /// Paths changed since `rev`, relative to the scan root.
 ///
 /// Files outside the scan root are dropped: a scan of `repo/sub` must never see
@@ -180,6 +205,22 @@ fn rebase<T>(map: HashMap<String, T>, prefix: &str) -> HashMap<String, T> {
         .filter_map(|(path, value)| {
             path.strip_prefix(prefix)
                 .map(|relative| (relative.to_string(), value))
+        })
+        .collect()
+}
+
+/// [`rebase`] for rename pairs: both the new and the old path must be under
+/// `prefix`, otherwise the pair is dropped.
+fn rebase_pairs(pairs: HashMap<String, String>, prefix: &str) -> HashMap<String, String> {
+    if prefix.is_empty() {
+        return pairs;
+    }
+    pairs
+        .into_iter()
+        .filter_map(|(new, old)| {
+            let new = new.strip_prefix(prefix)?;
+            let old = old.strip_prefix(prefix)?;
+            Some((new.to_string(), old.to_string()))
         })
         .collect()
 }
@@ -359,6 +400,39 @@ mod tests {
         let changed =
             changed_since(&scan_root, Backend::Git, "HEAD").expect("diff from subdirectory");
         assert_eq!(changed, HashSet::from(["a.rs".to_string()]));
+    }
+
+    #[test]
+    fn renamed_from_rebases_both_sides_onto_the_scan_root() {
+        require_git!();
+        let tmp = TempDir::new("renames-sub");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        init_repo(&repo);
+        write(&repo, "sub/a.rs", "1\n");
+        write(&repo, "outside.rs", "1\n");
+        commit(&repo, "first");
+
+        git(&repo, &["mv", "sub/a.rs", "sub/b.rs"]);
+        git(&repo, &["mv", "outside.rs", "renamed-outside.rs"]);
+        commit(&repo, "renames");
+
+        let renames = renamed_from(&repo.join("sub"), Backend::Git, "HEAD~1");
+        assert_eq!(
+            renames,
+            HashMap::from([("b.rs".to_string(), "a.rs".to_string())]),
+            "both sides are scan-root relative; the outside rename is dropped"
+        );
+    }
+
+    #[test]
+    fn renamed_from_is_empty_for_p4_and_unreadable_roots() {
+        let tmp = TempDir::new("renames-empty");
+        let repo = tmp.path().join("plain");
+        fs::create_dir_all(&repo).expect("create dir");
+        assert!(renamed_from(&repo, Backend::P4, "HEAD").is_empty());
+        assert!(renamed_from(&repo, Backend::Git, "HEAD").is_empty());
+        assert!(renamed_from(&repo, Backend::Git, "--bad").is_empty());
     }
 
     #[test]

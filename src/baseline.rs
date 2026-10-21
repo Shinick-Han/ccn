@@ -138,6 +138,9 @@ pub fn compare_file(
 /// independent of worker scheduling.
 pub fn collect(result: &ScanResult, backend: Backend, rev: &str, threshold: u32) -> Baseline {
     let root = Path::new(&result.root);
+    // One extra VCS command, before the parallel reads: rename detection is not
+    // per-file work. An empty map (P4, or no renames) is the old behaviour.
+    let renamed = crate::vcs::renamed_from(root, backend, rev);
 
     let outcomes: Vec<FileOutcome> = result
         .files
@@ -148,7 +151,9 @@ pub fn collect(result: &ScanResult, backend: Backend, rev: &str, threshold: u32)
             {
                 return None;
             }
-            Some(measure_baseline(root, backend, rev, file, summary))
+            Some(measure_baseline(
+                root, backend, rev, file, summary, &renamed,
+            ))
         })
         .collect();
 
@@ -206,12 +211,17 @@ fn measure_baseline(
     rev: &str,
     file: &FileLoc,
     summary: &CcnSummary,
+    renamed: &HashMap<String, String>,
 ) -> FileOutcome {
-    // `None` means "this path has no version at `rev`" — a file added by the
-    // change under review. Its baseline is empty, so every complex function in
-    // it is genuinely new. The revision itself is validated by the caller, so
-    // a typo cannot turn the whole repository into "added".
-    let Some(bytes) = crate::vcs::file_at(root, backend, rev, &file.path) else {
+    // `None` means "this path has no version at `rev`". Before calling the
+    // file new, ask whether it is the new name of a file that did exist: a
+    // pure rename would otherwise report every function as added.
+    let baseline_bytes = crate::vcs::file_at(root, backend, rev, &file.path).or_else(|| {
+        let old = renamed.get(&file.path)?;
+        crate::vcs::file_at(root, backend, rev, old)
+    });
+
+    let Some(bytes) = baseline_bytes else {
         return FileOutcome::Compared {
             path: file.path.clone(),
             base: Vec::new(),
@@ -342,6 +352,174 @@ mod tests {
     /// A root that does not exist, so every VCS read must answer `None`
     /// regardless of which backend implementation is wired in.
     const MISSING_ROOT: &str = "ccn-baseline-root-that-does-not-exist";
+
+    fn git_works() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    struct TempDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("ccn-baseline-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "CCN Test"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    fn commit(dir: &std::path::Path, message: &str) {
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", message]);
+    }
+
+    /// Rust source for one `foo` whose CCN is `1 + ifs` (an `if` is a decision).
+    fn rust_source(ifs: usize) -> String {
+        let mut source = String::from("fn foo(x: i32) {\n");
+        for _ in 0..ifs {
+            source.push_str("    if x > 0 { }\n");
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    /// A `FileLoc` whose per-function detail comes from the real analyser, so
+    /// the baseline side and the current side use the same parser.
+    fn scanned(root: &std::path::Path, rel: &str) -> FileLoc {
+        let bytes = std::fs::read(root.join(rel)).expect("read scanned file");
+        let summary = crate::ccn::analyze_file(std::path::Path::new(rel), &bytes, "Rust");
+        FileLoc {
+            ccn: Some(summary),
+            ..file(rel, &[])
+        }
+    }
+
+    #[test]
+    fn a_moved_file_with_identical_functions_has_no_changes() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("rename-same");
+        let repo = tmp.path();
+        init_repo(repo);
+        std::fs::write(repo.join("a.rs"), rust_source(11)).expect("write a.rs");
+        commit(repo, "first");
+
+        git(repo, &["mv", "a.rs", "b.rs"]);
+        commit(repo, "rename");
+
+        let result = scan_result(
+            repo.to_str().expect("utf-8 root"),
+            vec![scanned(repo, "b.rs")],
+        );
+        let baseline = collect(&result, Backend::Git, "HEAD~1", 10);
+
+        assert_eq!(
+            baseline.files_compared, 1,
+            "a renamed file still has a baseline to compare against"
+        );
+        assert_eq!(baseline.files_skipped, 0);
+        assert!(
+            baseline.changes.is_empty(),
+            "the old file's complexity is not a new function: {:?}",
+            baseline.changes
+        );
+    }
+
+    #[test]
+    fn a_moved_file_whose_function_grew_is_worsened_against_the_old_path() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("rename-grew");
+        let repo = tmp.path();
+        init_repo(repo);
+        std::fs::write(repo.join("a.rs"), rust_source(8)).expect("write a.rs");
+        commit(repo, "first");
+
+        git(repo, &["mv", "a.rs", "b.rs"]);
+        commit(repo, "rename");
+
+        // 1 + 8 ifs = 9 at HEAD~1; 1 + 11 ifs = 12 now.
+        std::fs::write(repo.join("b.rs"), rust_source(11)).expect("grow b.rs");
+
+        let result = scan_result(
+            repo.to_str().expect("utf-8 root"),
+            vec![scanned(repo, "b.rs")],
+        );
+        let baseline = collect(&result, Backend::Git, "HEAD~1", 10);
+
+        assert_eq!(baseline.files_compared, 1);
+        assert_eq!(
+            baseline.changes,
+            vec![change("b.rs", "foo", 1, 12, Some(9), Kind::Worsened)],
+            "the baseline is a.rs at rev, so the delta is real"
+        );
+    }
+
+    #[test]
+    fn an_actually_new_file_is_still_added() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("really-new");
+        let repo = tmp.path();
+        init_repo(repo);
+        std::fs::write(repo.join("a.rs"), rust_source(2)).expect("write a.rs");
+        commit(repo, "first");
+
+        std::fs::write(repo.join("new.rs"), rust_source(11)).expect("write new.rs");
+
+        let result = scan_result(
+            repo.to_str().expect("utf-8 root"),
+            vec![scanned(repo, "new.rs")],
+        );
+        let baseline = collect(&result, Backend::Git, "HEAD", 10);
+
+        assert_eq!(baseline.files_compared, 1);
+        assert_eq!(
+            baseline.changes,
+            vec![change("new.rs", "foo", 1, 12, None, Kind::Added)],
+            "no rename either, so the file really is new"
+        );
+    }
 
     #[test]
     fn added_worsened_and_ignored_are_distinguished() {

@@ -82,10 +82,38 @@ type Authors = HashMap<String, HashMap<String, u32>>;
 /// pay a server round-trip, or a 20 s timeout, in every directory that merely
 /// has `p4` on `PATH`.
 pub fn detect(dir: &Path) -> bool {
-    if !dir.is_dir() || !has_workspace_hint(dir) {
+    if !dir.is_dir() {
         return false;
     }
-    run_p4(dir, &["info"]).is_some()
+    // `p4 info` succeeds even outside a workspace ("Client unknown."), so the
+    // client name and its root are the signals. This also covers users who
+    // configure P4CLIENT/P4PORT with `p4 set` (registry) rather than env vars.
+    let Some(info) = run_p4(dir, &["info"]) else {
+        return false;
+    };
+    let client = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Client name: "))
+        .map(str::trim)
+        .unwrap_or("");
+    if client.is_empty() || client.eq_ignore_ascii_case("unknown") {
+        return false;
+    }
+    let Some(root) = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Client root: "))
+        .map(str::trim)
+        .filter(|root| !root.is_empty() && !root.eq_ignore_ascii_case("unknown"))
+    else {
+        return false;
+    };
+
+    // Only claim a directory that is actually inside the client view.
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let root = Path::new(root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(root));
+    dir.starts_with(root)
 }
 
 /// Files changed since revision `rev` (a changelist number, or `"opened"` for
@@ -106,7 +134,9 @@ pub fn changed_since(dir: &Path, rev: &str) -> Option<HashSet<String>> {
     let mut changed = HashSet::new();
 
     if let Rev::Since(cl) = rev {
-        let spec = format!("{}...@={cl},@now", mapping.depot_prefix);
+        // `@>N` is "revisions after changelist N". `@=N,@now` includes the
+        // files as they were *at* N, which would report untouched files too.
+        let spec = format!("{}...@>{cl}", depot_wildcard(&mapping.depot_prefix));
         let out = run_p4(dir, &["files", &spec])?;
         for depot in parse_files(&out) {
             if let Some(path) = mapping.relative(&depot) {
@@ -144,9 +174,10 @@ pub fn rev_exists(dir: &Path, rev: &str) -> bool {
     let Some(Rev::Since(cl)) = parse_rev(rev) else {
         return false;
     };
-    let spec = format!("@={cl}");
-    run_p4(dir, &["-q", "changes", "-m1", "-s", "submitted", &spec])
-        .is_some_and(|out| !out.trim().is_empty())
+    // `p4 changes @=N` needs a file spec and prints nothing for a bare
+    // revision; `describe` answers "does this changelist exist" directly.
+    run_p4(dir, &["describe", "-s", &cl.to_string()])
+        .is_some_and(|out| out.contains(&format!("Change {cl} ")))
 }
 
 pub fn file_at(dir: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
@@ -163,7 +194,7 @@ pub fn file_at(dir: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
     // stderr, which parsing ignores); `print -q` is the command option that
     // suppresses the `//depot/...#rev - ...` header line, which would otherwise
     // be prepended to the captured bytes.
-    run_p4_bytes(dir, &["-q", "print", "-q", &spec])
+    run_p4_bytes(dir, &["print", "-q", &spec])
 }
 
 /// Churn and authorship for the last `max_changes` submitted changelists.
@@ -179,17 +210,19 @@ pub fn collect_history(dir: &Path, max_changes: u32) -> Option<History> {
     let mapping = mapping_for(dir)?;
     let max = max_changes.max(1);
     let max_arg = max.to_string();
-    let depot_spec = format!("{}...", mapping.depot_prefix);
+    let depot_spec = format!("{}...", depot_wildcard(&mapping.depot_prefix));
 
     let out = run_p4(
         dir,
         &[
+            // `-ztag` is a global p4 flag: it must precede the command, or p4
+            // rejects it with "Invalid option" and the whole history is lost.
+            "-ztag",
             "changes",
             "-m",
             &max_arg,
             "-s",
             "submitted",
-            "-ztag",
             &depot_spec,
         ],
     )?;
@@ -210,7 +243,7 @@ pub fn collect_history(dir: &Path, max_changes: u32) -> Option<History> {
         .par_iter()
         .filter_map(|change| {
             let cl = change.change.to_string();
-            let out = run_p4(dir, &["describe", "-s", "-ztag", &cl])?;
+            let out = run_p4(dir, &["-ztag", "describe", "-s", &cl])?;
             let describe = parse_describe(&out);
             let user = if describe.user.is_empty() {
                 change.user.clone()
@@ -386,12 +419,34 @@ fn parse_rev(raw: &str) -> Option<Rev> {
 
 /// Resolve `dir` through `p4 where`, the only command that knows which depot
 /// path the local tree corresponds to.
+/// `//depot/proj` -> `//depot/proj/`, so a caller can append `...` and get a
+/// valid wildcard. `p4 where` strips the trailing ellipsis, but the depot
+/// separator is not optional: `//depot/proj...` is a different (invalid) path.
+fn depot_wildcard(prefix: &str) -> String {
+    if prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
 fn mapping_for(dir: &Path) -> Option<Mapping> {
     if !dir.is_dir() {
         return None;
     }
-    let local = dir.to_string_lossy().into_owned();
-    let out = run_p4(dir, &["where", &local])?;
+    // The scanner canonicalises its root, which yields `\\?\C:\...` on Windows;
+    // `p4 where` does not understand the verbatim prefix.
+    let plain = dir.to_string_lossy();
+    let dir = Path::new(plain.trim_start_matches(r"\\?\"));
+    // `p4 where` needs a file spec, not a bare directory: without the wildcard
+    // it fails with "must refer to client ... or a depot".
+    let local = dir.to_string_lossy();
+    let spec = if cfg!(windows) {
+        format!("{local}\\...")
+    } else {
+        format!("{local}/...")
+    };
+    let out = run_p4(dir, &["where", &spec])?;
     parse_where(&out, dir)
 }
 
@@ -631,22 +686,6 @@ fn trim_authors(authors: &mut Authors) {
         per_author.clear();
         per_author.extend(ranked);
     }
-}
-
-/// Is there a reason to believe `dir` belongs to a Perforce workspace?
-///
-/// Only a cheap filesystem/env check — the authoritative answer still comes from
-/// `p4 info` in [`detect`].
-fn has_workspace_hint(dir: &Path) -> bool {
-    if std::env::var_os("P4CLIENT").is_some_and(|value| !value.is_empty()) {
-        return true;
-    }
-    let config_name = std::env::var("P4CONFIG")
-        .ok()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| ".p4config".to_string());
-    dir.ancestors()
-        .any(|ancestor| ancestor.join(&config_name).is_file())
 }
 
 /// Run `p4 <args>` with `dir` as the working directory (so `P4CONFIG` discovery

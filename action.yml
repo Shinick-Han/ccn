@@ -43,10 +43,82 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Build ccn
+    - name: Install ccn (prebuilt, else from source)
       shell: bash
-      working-directory: ${{ github.action_path }}
-      run: cargo build --release --locked
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        action_path="${GITHUB_ACTION_PATH:?GITHUB_ACTION_PATH is not set}"
+        dest_dir="$action_path/target/release"
+        mkdir -p "$dest_dir"
+
+        os="$(uname -s)"
+        arch="$(uname -m)"
+
+        # Map the runner to the raw asset published by .github/workflows/release.yml.
+        # macOS job builds on the current macos-latest arch, hence one x64-named asset.
+        case "$os" in
+          Linux)
+            if [[ "$arch" == "x86_64" ]]; then
+              asset="ccn-linux-x64"
+              bin_name="ccn"
+            else
+              asset=""
+              bin_name="ccn"
+            fi
+            ;;
+          Darwin)
+            asset="ccn-macos-x64"
+            bin_name="ccn"
+            ;;
+          MINGW*|MSYS*|CYGWIN*)
+            asset="ccn-windows-x64.exe"
+            bin_name="ccn.exe"
+            ;;
+          *)
+            asset=""
+            bin_name="ccn"
+            ;;
+        esac
+
+        url_base="https://github.com/Shinick-Han/ccn/releases/latest/download"
+        tmp="$RUNNER_TEMP/ccn-bin"
+        path_taken="source"
+
+        # $1 is "auth" or "anon".
+        download() {
+          local -a args=(-fsSL --retry 3 -o "$tmp")
+          if [[ "$1" == "auth" ]]; then
+            args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+          fi
+          curl "${args[@]}" "$url_base/$asset" && [[ -s "$tmp" ]]
+        }
+
+        if [[ -n "$asset" ]]; then
+          # Private repos need a token that can read Shinick-Han/ccn; a public
+          # asset still downloads anonymously, so try that before giving up.
+          if [[ -n "${GITHUB_TOKEN:-}" ]] && download auth; then
+            path_taken="prebuilt"
+          elif download anon; then
+            path_taken="prebuilt"
+          fi
+        fi
+
+        if [[ "$path_taken" == "prebuilt" ]]; then
+          cp "$tmp" "$dest_dir/$bin_name"
+          if [[ "$os" != MINGW* && "$os" != MSYS* && "$os" != CYGWIN* ]]; then
+            chmod +x "$dest_dir/$bin_name"
+          fi
+          echo "ccn binary: prebuilt ($asset)"
+        else
+          echo "::warning::prebuilt ccn download unavailable; building from source"
+          (cd "$action_path" && cargo build --release --locked)
+          echo "ccn binary: source ($action_path/target/release/$bin_name)"
+        fi
+
+        echo "CCN_BIN=$dest_dir/$bin_name" >> "$GITHUB_ENV"
 
     - name: Scan
       id: scan
