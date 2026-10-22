@@ -44,7 +44,7 @@ jobs:
             . "$HOME/.cargo/env"
 
             cargo build --release --locked --features workbench \
-              --bin ccn-workbench --bin ccn-nvim-probe
+              --bin ccn --bin ccn-workbench --bin ccn-nvim-probe
             echo "--- glibc gate (workbench) ---"
             max=$(objdump -T target/release/ccn-workbench \
               | grep -o "GLIBC_[0-9.]*" | sort -V | tail -n1)
@@ -87,6 +87,36 @@ jobs:
             kill "$nvim_pid" 2>/dev/null || true
             wait "$nvim_pid" 2>/dev/null || true
             rm -rf "$tmp"
+
+            echo "--- ccn.nvim plugin on EPEL nvim 0.8 (jobstart fallback) ---"
+            tmp2=$(mktemp -d)
+            printf "%s\n" \
+              "int simple(int x) { return x + 1; }" \
+              "int messy(int x) {" \
+              "    if (x > 0) x++;" \
+              "    if (x > 1) x++;" \
+              "    if (x > 2) x++;" \
+              "    if (x > 3) x++;" \
+              "    if (x > 4) x++;" \
+              "    if (x > 5) x++;" \
+              "    if (x > 6) x++;" \
+              "    if (x > 7) x++;" \
+              "    if (x > 8) x++;" \
+              "    if (x > 9) x++;" \
+              "    if (x > 10) x++;" \
+              "    if (x > 11) x++;" \
+              "    return x;" \
+              "}" > "$tmp2/a.cpp"
+            PATH="/src/target/release:$PATH" nvim --headless -u NONE \
+              --cmd "set rtp+=/src/spikes/ccn.nvim" \
+              -c "lua require(\"ccn\").setup()" \
+              -c "edit $tmp2/a.cpp" \
+              -c "CCNRefresh" -c "sleep 1500m" \
+              -c "lua print(vim.inspect(vim.diagnostic.get(0)))" \
+              -c "qa!" 2>&1 | tee /tmp/ccn-plugin.log
+            grep -q "source = \"ccn\"" /tmp/ccn-plugin.log
+            echo "ccn.nvim plugin ok"
+            rm -rf "$tmp2"
 
             echo "--- stage artifacts ---"
             cp target/release/ccn-workbench ccn-workbench-linux-x64
