@@ -153,17 +153,17 @@ fn split_areas(size: Rect, ratio: u16) -> (Rect, Rect, Rect) {
     (left, divider, right)
 }
 
-/// Pane focus toggle. Alt+E is the advertised key because many terminals
+/// Pane focus toggle. Alt+W is the advertised key because many terminals
 /// collapse Ctrl+Shift+<letter> into Ctrl+<letter>; the latter would steal a
 /// Neovim binding. Ctrl+Shift+E and F8 stay as compatibility aliases.
 #[cfg(feature = "workbench")]
 fn is_pane_toggle(key: &KeyEvent) -> bool {
-    let alt_e =
-        key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('e' | 'E'));
+    let alt_w =
+        key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('w' | 'W'));
     let ctrl_shift_e = key.modifiers.contains(KeyModifiers::CONTROL)
         && key.modifiers.contains(KeyModifiers::SHIFT)
         && matches!(key.code, KeyCode::Char('e' | 'E'));
-    alt_e || ctrl_shift_e
+    alt_w || ctrl_shift_e
 }
 /// Convert a mouse x position into a clamped split percentage.
 #[cfg(feature = "workbench")]
@@ -2284,7 +2284,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("F5", "command palette"),
                 ("F6", "baseline review (then d for diff)"),
                 ("F7", "diagnostics"),
-                ("Alt+E", "files / editor panes"),
+                ("Alt+W", "files / editor panes"),
                 ("F10", "back to the dashboard"),
             ],
         ),
@@ -2815,9 +2815,9 @@ mod tests {
 
     #[test]
     #[cfg(feature = "workbench")]
-    fn pane_toggle_prefers_alt_e_without_stealing_ctrl_e() {
+    fn pane_toggle_prefers_alt_w_without_stealing_ctrl_e() {
         assert!(is_pane_toggle(&KeyEvent::new(
-            KeyCode::Char('e'),
+            KeyCode::Char('w'),
             KeyModifiers::ALT
         )));
         assert!(is_pane_toggle(&KeyEvent::new(
