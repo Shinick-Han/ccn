@@ -20,7 +20,10 @@
 
 use std::io::{self, Stdout};
 use std::panic::AssertUnwindSafe;
+#[cfg(feature = "workbench")]
+use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -86,6 +89,109 @@ pub fn run(result: &ScanResult, report: &Report) -> std::io::Result<TuiAction> {
                 .map_or(TuiAction::Quit, TuiAction::Edit)
         }),
         Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Run the dashboard and workbench in one terminal and one event loop.
+///
+/// The dashboard is rebuilt after a workbench session so the scan/report and
+/// the final gates see files edited in the editor. The terminal guard lives for
+/// the whole loop; `e` switches views without leaving the alternate screen.
+pub fn run_unified(
+    result: &mut ScanResult,
+    report: &mut Report,
+    options: &crate::loc::ScanOptions,
+    hotspots: bool,
+    history_limit: u32,
+    editor: &str,
+) -> io::Result<()> {
+    if !is_interactive() {
+        return Err(io::Error::other(
+            "ccn: the interactive dashboard needs a terminal (stdout is not a TTY)",
+        ));
+    }
+    #[cfg(not(feature = "workbench"))]
+    let _ = (options, hotspots, history_limit, editor);
+
+    let mut guard = TerminalGuard::enter()?;
+
+    loop {
+        let action = {
+            let mut app = App::new(result, report);
+            loop {
+                guard.terminal.draw(|frame| render(frame, &mut app))?;
+                if app.quit {
+                    break app
+                        .pending_edit
+                        .take()
+                        .map_or(TuiAction::Quit, TuiAction::Edit);
+                }
+                if event::poll(Duration::from_millis(50))? {
+                    if let Event::Key(key) = event::read()? {
+                        app.handle_key(key);
+                    }
+                }
+            }
+        };
+
+        match action {
+            TuiAction::Quit => return Ok(()),
+            TuiAction::Edit(path) => {
+                #[cfg(feature = "workbench")]
+                let target = Path::new(&result.root).join(&path);
+                #[cfg(feature = "workbench")]
+                let size = guard.terminal.size()?;
+
+                #[cfg(feature = "workbench")]
+                {
+                    use crate::workbench::WorkbenchSession;
+
+                    let mut session = match WorkbenchSession::open(
+                        &target,
+                        editor,
+                        false,
+                        size.width,
+                        size.height,
+                    ) {
+                        Ok(session) => session,
+                        Err(e) => {
+                            eprintln!("ccn: {e}");
+                            continue;
+                        }
+                    };
+                    loop {
+                        session.tick();
+                        guard.terminal.draw(|frame| session.draw(frame))?;
+                        if event::poll(Duration::from_millis(16))? {
+                            match event::read()? {
+                                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                    if session.handle_key(key) {
+                                        break;
+                                    }
+                                }
+                                Event::Resize(width, height) => session.resize(width, height),
+                                _ => {}
+                            }
+                        }
+                    }
+                    session.close();
+
+                    match crate::loc::scan(options) {
+                        Ok(updated) => {
+                            *result = updated;
+                            *report = crate::metrics::build_with(result, hotspots, history_limit);
+                        }
+                        Err(e) => eprintln!("ccn: {e}"),
+                    }
+                }
+
+                #[cfg(not(feature = "workbench"))]
+                {
+                    let _ = path;
+                    eprintln!("ccn: this build has no workbench support");
+                }
+            }
+        }
     }
 }
 

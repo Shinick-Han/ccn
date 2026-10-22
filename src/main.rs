@@ -66,39 +66,17 @@ fn main() {
     let sarif_owns_stdout = cli.sarif.as_deref() == Some("-");
     let mut tui_handled = false;
     if cli.tui && !cli.report_json && !cli.json && !sarif_owns_stdout {
-        loop {
-            match ccn::tui::run(&result, &report) {
-                Ok(ccn::tui::TuiAction::Quit) => {
-                    tui_handled = true;
-                    break;
-                }
-                Ok(ccn::tui::TuiAction::Edit(path)) => {
-                    #[cfg(feature = "workbench")]
-                    {
-                        let target = Path::new(&result.root).join(&path);
-                        let _ = ccn::workbench::run_path(&target, &cli.editor);
-                    }
-                    #[cfg(not(feature = "workbench"))]
-                    {
-                        let _ = path;
-                        eprintln!("ccn: this build has no workbench support");
-                    }
-                    match ccn::loc::scan(&cli.scan_options()) {
-                        Ok(updated) => {
-                            result = updated;
-                            report =
-                                ccn::metrics::build_with(&result, cli.hotspots, cli.history_limit);
-                        }
-                        Err(e) => {
-                            eprintln!("ccn: {e}");
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("ccn: dashboard unavailable ({e}); showing the summary instead");
-                    break;
-                }
+        match ccn::tui::run_unified(
+            &mut result,
+            &mut report,
+            &cli.scan_options(),
+            cli.hotspots,
+            cli.history_limit,
+            &cli.editor,
+        ) {
+            Ok(()) => tui_handled = true,
+            Err(e) => {
+                eprintln!("ccn: dashboard unavailable ({e}); showing the summary instead");
             }
         }
     }

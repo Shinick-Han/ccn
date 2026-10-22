@@ -24,6 +24,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
+use ratatui::Frame;
 use ratatui::Terminal;
 
 use crate::ccn::types::{CcnTier, FunctionCcn};
@@ -656,6 +657,133 @@ fn report_smoke(result: Result<(), String>) -> i32 {
     }
 }
 
+/// A workbench view that does not own the terminal.
+///
+/// The standalone `ccn workbench` command wraps this in a terminal guard; the
+/// unified dashboard embeds it as a tab and keeps one terminal/event loop.
+pub(crate) struct WorkbenchSession {
+    pub(crate) app: App,
+    pub(crate) child: Pty,
+    last_mtime_check: Instant,
+}
+
+impl WorkbenchSession {
+    pub(crate) fn open(
+        target: &Path,
+        editor_cmd: &str,
+        no_rpc: bool,
+        width: u16,
+        height: u16,
+    ) -> Result<Self, String> {
+        let target = fs::canonicalize(target)
+            .map_err(|e| format!("cannot open {}: {e}", target.display()))?;
+        if target.is_dir() {
+            return Err(format!(
+                "{} is a directory; the workbench opens one source file",
+                target.display()
+            ));
+        }
+        if !target.is_file() {
+            return Err(format!("{} is not a regular file", target.display()));
+        }
+
+        let editor = pty::parse_command(editor_cmd)?;
+        let program = editor
+            .first()
+            .cloned()
+            .ok_or_else(|| "empty --editor command".to_string())?;
+        let label = Path::new(&program)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| program.clone());
+
+        let rpc_address = if rpc::is_nvim_program(&program) && !no_rpc {
+            rpc::free_listen_address().ok()
+        } else {
+            None
+        };
+        let mut app = App::new(target.clone(), display_path(&target), label);
+        app.rpc_disabled = rpc_address.is_none();
+
+        let editor_rect = ui::editor_inner(ui::layout(Rect::new(0, 0, width, height)).editor);
+        let cwd = target.parent().unwrap_or_else(|| Path::new("."));
+        let mut editor_args = editor[1..].to_vec();
+        if let Some(address) = &rpc_address {
+            editor_args.push("--listen".to_string());
+            editor_args.push(address.clone());
+        }
+        editor_args.push(native_path(&target));
+        let child = Pty::spawn(
+            &program,
+            &editor_args,
+            cwd,
+            editor_rect.height,
+            editor_rect.width,
+        )
+        .map_err(|e| {
+            format!(
+                "{e}\n  editor: {editor_cmd}\n  hint: put Neovim on PATH (`nvim --version` should work), or pass\n        --editor \"<path-to-nvim>\" (Windows portable:\n        --editor \"C:\\Tools\\nvim\\bin\\nvim.exe\").\n        AlmaLinux/RHEL 8: sudo dnf install neovim (EPEL)."
+            )
+        })?;
+        if let Some(address) = rpc_address {
+            app.start_rpc(address);
+        }
+        Ok(Self {
+            app,
+            child,
+            last_mtime_check: Instant::now(),
+        })
+    }
+
+    pub(crate) fn tick(&mut self) {
+        self.app.poll_rpc();
+        if self.app.exited.is_none() {
+            if let Some(note) = self.child.exit_status() {
+                let empty = self.child.screen_text().trim().is_empty();
+                let hint = if empty {
+                    " (empty screen ? check --editor)"
+                } else {
+                    ""
+                };
+                self.app.exited = Some(note.clone());
+                self.app.child_alive.store(false, Ordering::Relaxed);
+                self.app.shutdown_rpc();
+                self.app.set_status(
+                    format!("[editor exited: {note}]{hint} ? F10 returns to the dashboard"),
+                    note != "exit 0" || empty,
+                );
+            }
+        }
+        if !self.app.live_mode() && self.last_mtime_check.elapsed() >= MTIME_INTERVAL {
+            self.last_mtime_check = Instant::now();
+            self.app.check_mtime();
+        }
+    }
+
+    pub(crate) fn draw(&self, frame: &mut Frame) {
+        let parser = self.child.parser();
+        let screen = match parser.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        ui::render(frame, &self.app, screen.screen());
+    }
+
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
+        handle_key(&mut self.app, &mut self.child, key)
+    }
+
+    pub(crate) fn resize(&mut self, width: u16, height: u16) {
+        let editor = ui::editor_inner(ui::layout(Rect::new(0, 0, width, height)).editor);
+        self.child.resize(editor.height, editor.width);
+    }
+
+    pub(crate) fn close(mut self) {
+        self.app.shutdown_rpc();
+        self.child.kill();
+    }
+}
+
 fn run_workbench(cli: &Cli) -> Result<(), String> {
     let requested = cli.target.as_deref().ok_or_else(|| {
         "missing <path-or-file> (usage: ccn workbench [--editor <cmd>] <file>)".to_string()
@@ -735,7 +863,7 @@ fn run_workbench(cli: &Cli) -> Result<(), String> {
         Err(e) => {
             let _ = restore_terminal();
             return Err(format!(
-                "{e}\n  editor: {}\n  hint: install Neovim on PATH or pass --editor \"<path>\"",
+                "{e}\n  editor: {}\n  hint: put Neovim on PATH (`nvim --version` should work), or pass\n        --editor \"<path-to-nvim>\" (Windows portable:\n        --editor \"C:\\Tools\\nvim\\bin\\nvim.exe\").\n        AlmaLinux/RHEL 8: sudo dnf install neovim (EPEL).",
                 cli.editor
             ));
         }

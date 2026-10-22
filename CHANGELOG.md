@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.1 (2026-10-22)
+
+Unified dashboard + workbench tab.
+
+- `ccn . --tui` now switches between the dashboard and the workbench **without
+  leaving the alternate screen**. `e` opens the selected file in the workbench,
+  `F10` returns to a freshly rescanned dashboard, and `q` exits once; gates run
+  on the final state.
+- One terminal guard, one event loop, one binary. The workbench session is
+  created/closed on switch, so the editor's PTY and RPC connection do not
+  outlive the view.
+- `--editor <cmd>` selects the editor used by `e`; the workbench footer says
+  `F10 back/quit` because the same view is used standalone and embedded.
+- `ccn workbench <file>` still runs standalone.
+- `run_unified` is covered by the WSL+tmux interactive check and the dashboard
+  `e` action unit test; scanner behavior is unchanged.
+
 ## 0.8.0 (2026-10-22)
 
 The workbench is merged into the main `ccn` binary.
