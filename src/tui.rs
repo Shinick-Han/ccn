@@ -153,6 +153,18 @@ fn split_areas(size: Rect, ratio: u16) -> (Rect, Rect, Rect) {
     (left, divider, right)
 }
 
+/// Pane focus toggle. Alt+E is the advertised key because many terminals
+/// collapse Ctrl+Shift+<letter> into Ctrl+<letter>; the latter would steal a
+/// Neovim binding. Ctrl+Shift+E and F8 stay as compatibility aliases.
+#[cfg(feature = "workbench")]
+fn is_pane_toggle(key: &KeyEvent) -> bool {
+    let alt_e =
+        key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('e' | 'E'));
+    let ctrl_shift_e = key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && matches!(key.code, KeyCode::Char('e' | 'E'));
+    alt_e || ctrl_shift_e
+}
 /// Convert a mouse x position into a clamped split percentage.
 #[cfg(feature = "workbench")]
 fn split_ratio_from_x(x: u16, width: u16) -> u16 {
@@ -963,6 +975,13 @@ pub fn run_unified(
                                         && matches!(key.code, KeyCode::Char('p' | 'P'))
                                     {
                                         fuzzy.open(&fuzzy_paths);
+                                        continue;
+                                    }
+                                    if is_pane_toggle(&key) {
+                                        focus = match focus {
+                                            SplitFocus::Files => SplitFocus::Workbench,
+                                            SplitFocus::Workbench => SplitFocus::Files,
+                                        };
                                         continue;
                                     }
                                     match focus {
@@ -2265,13 +2284,14 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("F5", "command palette"),
                 ("F6", "baseline review (then d for diff)"),
                 ("F7", "diagnostics"),
-                ("F8", "files / editor panes"),
+                ("Alt+E", "files / editor panes"),
                 ("F10", "back to the dashboard"),
             ],
         ),
         (
             "ADVANCED (still works)",
             &[
+                ("F8 / Ctrl+Shift+E", "pane switch (compatibility)"),
                 ("F9", "editor / function sidebar"),
                 ("g / G", "first / last"),
                 ("Tab", "chart: CCN per function / LOC per file"),
@@ -2791,6 +2811,23 @@ mod tests {
         app.paste_filter("alpha\r\n.rs");
         assert_eq!(app.filter_input.as_deref(), Some("alpha.rs"));
         assert_eq!(app.view.len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "workbench")]
+    fn pane_toggle_prefers_alt_e_without_stealing_ctrl_e() {
+        assert!(is_pane_toggle(&KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::ALT
+        )));
+        assert!(is_pane_toggle(&KeyEvent::new(
+            KeyCode::Char('E'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(!is_pane_toggle(&KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     #[test]
