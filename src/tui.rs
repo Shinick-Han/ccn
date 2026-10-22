@@ -26,9 +26,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(feature = "workbench")]
-use crate::diagnostics::{Area, Diagnostic, Diagnostics, Severity};
+use crate::diagnostics::{Area, Diagnostic, Diagnostics, Filter as DiagFilter, Severity};
 #[cfg(feature = "workbench")]
-use crate::diff::{diff_lines, DiffLine};
+use crate::diff::{diff_lines, hunks, next_hunk, prev_hunk, DiffLine, Hunk};
 #[cfg(feature = "workbench")]
 use crate::fuzzy::FuzzyState;
 #[cfg(feature = "workbench")]
@@ -134,6 +134,7 @@ enum SplitFocus {
 struct DiffPane {
     rows: Vec<DiffLine>,
     selected: usize,
+    hunk: Option<Hunk>,
     title: String,
 }
 
@@ -316,6 +317,7 @@ fn build_diff_pane(
     Ok(DiffPane {
         rows,
         selected: 0,
+        hunk: None,
         title: format!("{} - {} @ {}", change.name, change.path, rev),
     })
 }
@@ -355,6 +357,8 @@ pub fn run_unified(
     #[cfg(feature = "workbench")]
     let mut diagnostics: Option<(Diagnostics, usize)> = None;
     #[cfg(feature = "workbench")]
+    let mut diag_filter = DiagFilter::default();
+    #[cfg(feature = "workbench")]
     let mut diff: Option<DiffPane> = None;
     #[cfg(feature = "workbench")]
     let mut review: Option<ReviewQueue> = None;
@@ -374,6 +378,18 @@ pub fn run_unified(
     });
     #[cfg(not(feature = "workbench"))]
     let mut dashboard_state: Option<DashboardState> = None;
+    #[cfg(feature = "workbench")]
+    let vcs_identity = crate::vcs::detect(Path::new(&result.root)).map(|backend| {
+        match backend {
+            crate::vcs::Backend::Git => crate::status::identity_line(&crate::vcs::identity(
+                Path::new(&result.root),
+                backend,
+            )),
+            // P4 identity can invoke two bounded network commands; keep the
+            // dashboard startup path fast and show the backend only.
+            crate::vcs::Backend::P4 => "p4".to_string(),
+        }
+    });
 
     loop {
         let (action, state) = {
@@ -381,6 +397,8 @@ pub fn run_unified(
             if let Some(state) = &dashboard_state {
                 app.restore_state(state);
             }
+            #[cfg(feature = "workbench")]
+            app.set_vcs_identity(vcs_identity.clone());
             #[cfg(feature = "workbench")]
             let fuzzy_paths = tree_paths(result);
             loop {
@@ -509,6 +527,16 @@ pub fn run_unified(
                 {
                     let target = Path::new(&result.root).join(&path);
                     let target = std::fs::canonicalize(&target).unwrap_or(target);
+                    let (restore_files, restore_active) = crate::session::restore_order(&saved);
+                    let restore_active_path = restore_active.as_ref().map(|relative| {
+                        let joined = Path::new(&result.root).join(relative);
+                        std::fs::canonicalize(&joined).unwrap_or(joined)
+                    });
+                    let target = if session.is_none() {
+                        restore_active_path.clone().unwrap_or(target)
+                    } else {
+                        target
+                    };
                     let needs_restart = session
                         .as_ref()
                         .is_none_or(|session| session.app.exited.is_some());
@@ -544,8 +572,7 @@ pub fn run_unified(
                             Ok(open) => {
                                 session = Some(open);
                                 if let Some(open) = session.as_mut() {
-                                    let restored: Vec<(PathBuf, String)> = saved
-                                        .open_files
+                                    let restored: Vec<(PathBuf, String)> = restore_files
                                         .iter()
                                         .map(|relative| {
                                             let joined = Path::new(&result.root).join(relative);
@@ -554,7 +581,9 @@ pub fn run_unified(
                                             (path, relative.clone())
                                         })
                                         .collect();
-                                    open.adopt_tabs(&restored);
+                                    if let Some(active) = restore_active_path.as_ref() {
+                                        open.restore_ordered(&restored, active);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -630,19 +659,25 @@ pub fn run_unified(
                                 }
                                 if let Some((items, selected)) = &diagnostics {
                                     frame.render_widget(Clear, right);
-                                    crate::workbench::diagnostics_ui::render(
-                                        frame, right, items, *selected, true,
+                                    crate::workbench::diagnostics_ui::render_filtered(
+                                        frame,
+                                        right,
+                                        items,
+                                        *selected,
+                                        true,
+                                        diag_filter,
                                     );
                                 }
                                 if let Some(pane) = &diff {
                                     frame.render_widget(Clear, right);
-                                    crate::workbench::diff_ui::render(
+                                    crate::workbench::diff_ui::render_with_hunks(
                                         frame,
                                         right,
                                         &pane.rows,
                                         pane.selected,
                                         true,
                                         &pane.title,
+                                        pane.hunk,
                                     );
                                 }
                                 if symbols.is_open() {
@@ -712,6 +747,7 @@ pub fn run_unified(
                                                                 ),
                                                                 0,
                                                             ));
+                                                            diag_filter = DiagFilter::default();
                                                             review = None;
                                                             fuzzy.close();
                                                         }
@@ -810,10 +846,36 @@ pub fn run_unified(
                                             KeyCode::Esc | KeyCode::Char('d') => diff = None,
                                             KeyCode::Char('j') | KeyCode::Down => {
                                                 pane.selected = (pane.selected + 1)
-                                                    .min(pane.rows.len().saturating_sub(1))
+                                                    .min(pane.rows.len().saturating_sub(1));
+                                                pane.hunk = hunks(&pane.rows)
+                                                    .into_iter()
+                                                    .find(|hunk| hunk.contains(pane.selected));
                                             }
                                             KeyCode::Char('k') | KeyCode::Up => {
-                                                pane.selected = pane.selected.saturating_sub(1)
+                                                pane.selected = pane.selected.saturating_sub(1);
+                                                pane.hunk = hunks(&pane.rows)
+                                                    .into_iter()
+                                                    .find(|hunk| hunk.contains(pane.selected));
+                                            }
+                                            KeyCode::Char(']') => {
+                                                if let Some(row) =
+                                                    next_hunk(&pane.rows, pane.selected)
+                                                {
+                                                    pane.selected = row;
+                                                }
+                                                pane.hunk = hunks(&pane.rows)
+                                                    .into_iter()
+                                                    .find(|hunk| hunk.contains(pane.selected));
+                                            }
+                                            KeyCode::Char('[') => {
+                                                if let Some(row) =
+                                                    prev_hunk(&pane.rows, pane.selected)
+                                                {
+                                                    pane.selected = row;
+                                                }
+                                                pane.hunk = hunks(&pane.rows)
+                                                    .into_iter()
+                                                    .find(|hunk| hunk.contains(pane.selected));
                                             }
                                             KeyCode::PageDown => {
                                                 pane.selected = (pane.selected + 10)
@@ -831,25 +893,45 @@ pub fn run_unified(
                                         continue;
                                     }
                                     if let Some((items, selected)) = diagnostics.as_mut() {
+                                        let shown = items.filtered(diag_filter).len();
                                         match key.code {
                                             KeyCode::Esc | KeyCode::F(7) => diagnostics = None,
                                             KeyCode::Char('j')
                                             | KeyCode::Down
                                             | KeyCode::Char('n') => {
-                                                *selected = (*selected + 1)
-                                                    .min(items.len().saturating_sub(1))
+                                                *selected =
+                                                    (*selected + 1).min(shown.saturating_sub(1))
                                             }
                                             KeyCode::Char('k')
                                             | KeyCode::Up
                                             | KeyCode::Char('p') => {
                                                 *selected = selected.saturating_sub(1)
                                             }
+                                            KeyCode::Char('e') => {
+                                                diag_filter.severity = Some(Severity::Error);
+                                                *selected = 0;
+                                            }
+                                            KeyCode::Char('w') => {
+                                                diag_filter.severity = Some(Severity::Warn);
+                                                *selected = 0;
+                                            }
+                                            KeyCode::Char('i') => {
+                                                diag_filter.severity = Some(Severity::Info);
+                                                *selected = 0;
+                                            }
+                                            KeyCode::Char('u') => {
+                                                diag_filter = DiagFilter::default();
+                                                *selected = 0;
+                                            }
                                             KeyCode::Char('g') | KeyCode::Home => *selected = 0,
                                             KeyCode::Char('G') | KeyCode::End => {
-                                                *selected = items.len().saturating_sub(1)
+                                                *selected = shown.saturating_sub(1)
                                             }
                                             KeyCode::Enter => {
-                                                let item = items.items().get(*selected).cloned();
+                                                let item = items
+                                                    .filtered(diag_filter)
+                                                    .get(*selected)
+                                                    .map(|item| (*item).clone());
                                                 diagnostics = None;
                                                 if let Some(item) = item {
                                                     if let Some(path) = item.path {
@@ -882,6 +964,7 @@ pub fn run_unified(
                                     if key.code == KeyCode::F(7) {
                                         diagnostics =
                                             Some((build_diagnostics(result, report, session), 0));
+                                        diag_filter = DiagFilter::default();
                                         review = None;
                                         fuzzy.close();
                                         continue;
@@ -1390,6 +1473,8 @@ pub struct App<'a> {
     pending_edit: Option<PathBuf>,
     /// Transient dashboard warning (e.g. unsaved buffers blocking quit).
     notice: Option<String>,
+    /// VCS label (`git main`, `p4 client`) shown in the header when known.
+    vcs_identity: Option<String>,
     quit: bool,
 }
 
@@ -1438,10 +1523,16 @@ impl<'a> App<'a> {
             overlay: Overlay::None,
             pending_edit: None,
             notice: None,
+            vcs_identity: None,
             quit: false,
         };
         app.rebuild();
         app
+    }
+
+    /// Set the VCS label once per scan/identity refresh.
+    pub fn set_vcs_identity(&mut self, value: Option<String>) {
+        self.vcs_identity = value;
     }
 
     /// Filter that is currently narrowing the list, if any.
@@ -1853,6 +1944,13 @@ fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
         Span::styled(" · ", muted),
         Span::styled(app.report.root.replace('\\', "/"), text),
     ];
+    if let Some(identity) = &app.vcs_identity {
+        left.push(Span::styled("  ", muted));
+        left.push(Span::styled(
+            identity.as_str(),
+            Style::default().fg(AURA.accent_alt),
+        ));
+    }
     if let Some(filter) = app.active_filter() {
         left.push(Span::styled("  [filter: ", muted));
         left.push(Span::styled(filter.to_string(), text));

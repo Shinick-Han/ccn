@@ -69,6 +69,74 @@ pub fn changed_count(rows: &[DiffLine]) -> usize {
         .count()
 }
 
+/// A maximal contiguous run of changed rows.
+///
+/// `start` and `end` are inclusive row indices into the unified sequence.
+/// Context rows separate hunks; a replacement (removals followed by additions)
+/// is a single hunk because no context row intervenes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hunk {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Hunk {
+    /// Whether `row` lies inside this hunk.
+    pub fn contains(&self, row: usize) -> bool {
+        self.start <= row && row <= self.end
+    }
+}
+
+/// Every hunk in `rows`, in ascending row order.
+pub fn hunks(rows: &[DiffLine]) -> Vec<Hunk> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (index, row) in rows.iter().enumerate() {
+        let changed = matches!(row.kind, DiffKind::Added | DiffKind::Removed);
+        match (changed, start) {
+            (true, None) => start = Some(index),
+            (false, Some(begin)) => {
+                out.push(Hunk {
+                    start: begin,
+                    end: index - 1,
+                });
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        out.push(Hunk {
+            start: begin,
+            end: rows.len() - 1,
+        });
+    }
+    out
+}
+
+/// Start row of the first hunk strictly after `current`, or `None`.
+///
+/// A cursor inside a hunk therefore advances to the beginning of the next one;
+/// a cursor past the last hunk yields `None`.
+pub fn next_hunk(rows: &[DiffLine], current: usize) -> Option<usize> {
+    hunks(rows)
+        .into_iter()
+        .find(|hunk| hunk.start > current)
+        .map(|hunk| hunk.start)
+}
+
+/// Start row of the last hunk strictly before `current`, or `None`.
+///
+/// Inside a hunk this returns that hunk's own start, so repeated `prev`
+/// navigation lands on hunk boundaries rather than walking changed rows one at
+/// a time. A cursor at or before the first hunk yields `None`.
+pub fn prev_hunk(rows: &[DiffLine], current: usize) -> Option<usize> {
+    hunks(rows)
+        .into_iter()
+        .rfind(|hunk| hunk.start < current)
+        .map(|hunk| hunk.start)
+}
+
 fn append_diff(
     old: &[String],
     new: &[String],
@@ -559,5 +627,114 @@ mod tests {
         let rows = diff_lines(&old, &new);
         assert_eq!(changed_count(&rows), 2_000);
         assert_well_formed(&old, &new, &rows);
+    }
+
+    fn changed(kind: DiffKind, text: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            old_line: None,
+            new_line: None,
+            text: text.into(),
+        }
+    }
+
+    fn kinds(spec: &[(DiffKind, &str)]) -> Vec<DiffLine> {
+        spec.iter()
+            .map(|(kind, text)| changed(*kind, text))
+            .collect()
+    }
+
+    #[test]
+    fn one_hunk_spans_every_changed_row() {
+        let rows = kinds(&[
+            (DiffKind::Context, "a"),
+            (DiffKind::Removed, "b"),
+            (DiffKind::Added, "B"),
+            (DiffKind::Context, "c"),
+        ]);
+        assert_eq!(hunks(&rows), vec![Hunk { start: 1, end: 2 }]);
+    }
+
+    #[test]
+    fn two_hunks_are_separated_by_context() {
+        let rows = kinds(&[
+            (DiffKind::Added, "a"),
+            (DiffKind::Context, "b"),
+            (DiffKind::Context, "c"),
+            (DiffKind::Removed, "d"),
+            (DiffKind::Context, "e"),
+        ]);
+        assert_eq!(
+            hunks(&rows),
+            vec![Hunk { start: 0, end: 0 }, Hunk { start: 3, end: 3 }]
+        );
+    }
+
+    #[test]
+    fn adjacent_changes_form_a_single_hunk() {
+        let rows = kinds(&[
+            (DiffKind::Context, "a"),
+            (DiffKind::Removed, "b"),
+            (DiffKind::Added, "B"),
+            (DiffKind::Removed, "c"),
+            (DiffKind::Added, "C"),
+            (DiffKind::Context, "d"),
+        ]);
+        assert_eq!(hunks(&rows), vec![Hunk { start: 1, end: 4 }]);
+    }
+
+    #[test]
+    fn no_changes_means_no_hunks() {
+        assert!(hunks(&[]).is_empty());
+        assert_eq!(next_hunk(&[], 0), None);
+        assert_eq!(prev_hunk(&[], 0), None);
+
+        let rows = kinds(&[(DiffKind::Context, "a"), (DiffKind::Context, "b")]);
+        assert!(hunks(&rows).is_empty());
+        assert_eq!(next_hunk(&rows, 0), None);
+        assert_eq!(prev_hunk(&rows, 1), None);
+    }
+
+    #[test]
+    fn navigation_before_inside_and_after_a_hunk() {
+        //      0     1     2     3     4     5     6
+        //      ctx  chg   chg   ctx   ctx   chg   ctx
+        let rows = kinds(&[
+            (DiffKind::Context, "a"),
+            (DiffKind::Removed, "b"),
+            (DiffKind::Added, "B"),
+            (DiffKind::Context, "c"),
+            (DiffKind::Context, "d"),
+            (DiffKind::Added, "e"),
+            (DiffKind::Context, "f"),
+        ]);
+        assert_eq!(
+            hunks(&rows),
+            vec![Hunk { start: 1, end: 2 }, Hunk { start: 5, end: 5 }]
+        );
+
+        // Before the first hunk.
+        assert_eq!(next_hunk(&rows, 0), Some(1));
+        assert_eq!(prev_hunk(&rows, 0), None);
+
+        // Inside the first hunk: prev returns its start, next skips ahead.
+        assert_eq!(prev_hunk(&rows, 1), None);
+        assert_eq!(prev_hunk(&rows, 2), Some(1));
+        assert_eq!(next_hunk(&rows, 1), Some(5));
+        assert_eq!(next_hunk(&rows, 2), Some(5));
+
+        // Between the hunks.
+        assert_eq!(prev_hunk(&rows, 3), Some(1));
+        assert_eq!(next_hunk(&rows, 3), Some(5));
+
+        // Inside the second hunk.
+        assert_eq!(prev_hunk(&rows, 5), Some(1));
+        assert_eq!(next_hunk(&rows, 5), None);
+
+        // After the last hunk, including a clamped out-of-range cursor.
+        assert_eq!(prev_hunk(&rows, 6), Some(5));
+        assert_eq!(next_hunk(&rows, 6), None);
+        assert_eq!(prev_hunk(&rows, usize::MAX), Some(5));
+        assert_eq!(next_hunk(&rows, usize::MAX), None);
     }
 }

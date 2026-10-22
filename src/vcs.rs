@@ -81,6 +81,76 @@ impl Backend {
     }
 }
 
+/// Who owns the working tree being scanned: backend plus its branch/client.
+///
+/// Every field is best effort. An empty `backend` (or any value other than
+/// `"git"`/`"p4"`) means no backend was identified, and
+/// [`Identity::label`] renders that as `no VCS`. A missing branch/client or
+/// changelist is `None`, never a placeholder name: the status line must not
+/// claim an identity the repository did not report.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    /// `"git"`, `"p4"`, or empty when no backend was identified.
+    pub backend: &'static str,
+    /// Git branch (or shortened detached-HEAD commit), or the Perforce client.
+    pub branch: Option<String>,
+    /// Perforce open-changelist summary (`CL 12345`, `default CL`, ...).
+    /// Always `None` for git.
+    pub changelist: Option<String>,
+}
+
+impl Identity {
+    /// One line for a status bar: `git main`, `p4 ws (CL 12345)`, or `no VCS`.
+    ///
+    /// Empty components are skipped, so a partially failed probe degrades to
+    /// the part that is actually known (`p4 ws`, `git`) instead of printing a
+    /// dangling separator.
+    pub fn label(&self) -> String {
+        match self.backend {
+            "git" => match self.branch.as_deref().filter(|b| !b.trim().is_empty()) {
+                Some(branch) => format!("git {branch}"),
+                None => "git".to_string(),
+            },
+            "p4" => {
+                let mut label = "p4".to_string();
+                if let Some(client) = self.branch.as_deref().filter(|c| !c.trim().is_empty()) {
+                    label.push(' ');
+                    label.push_str(client);
+                }
+                if let Some(changelist) = self
+                    .changelist
+                    .as_deref()
+                    .filter(|cl| !cl.trim().is_empty())
+                {
+                    label.push_str(" (");
+                    label.push_str(changelist);
+                    label.push(')');
+                }
+                label
+            }
+            _ => "no VCS".to_string(),
+        }
+    }
+}
+
+/// Identify the workspace behind `scan_root` without collecting history.
+///
+/// This is the status-line counterpart of [`collect_history`]: at most one
+/// short command for git, or `p4 info` plus `p4 opened` for Perforce, each
+/// bounded by the existing 20 s command timeout. Failures leave the relevant
+/// [`Identity`] fields empty rather than erroring or panicking.
+pub fn identity(scan_root: &Path, backend: Backend) -> Identity {
+    let (branch, changelist) = match backend {
+        Backend::Git => (git::branch(scan_root), None),
+        Backend::P4 => crate::p4::identity(scan_root),
+    };
+    Identity {
+        backend: backend.name(),
+        branch,
+        changelist,
+    }
+}
+
 /// Backend-neutral history, keyed by **scan-root-relative**, `/`-separated paths.
 #[derive(Debug, Clone, PartialEq)]
 pub struct History {
@@ -512,6 +582,28 @@ mod tests {
         assert!(
             !history.churn.contains_key("outside.rs"),
             "history has the same scan-root contract as changed_since"
+        );
+    }
+
+    #[test]
+    fn identity_is_empty_for_an_unreadable_root() {
+        let tmp = TempDir::new("identity-missing");
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(
+            identity(&missing, Backend::Git),
+            Identity {
+                backend: "git",
+                branch: None,
+                changelist: None,
+            }
+        );
+        assert_eq!(
+            identity(&missing, Backend::P4),
+            Identity {
+                backend: "p4",
+                branch: None,
+                changelist: None,
+            }
         );
     }
 

@@ -8,7 +8,7 @@
 //! (C0, DEL and C1, including `\r`/`\n`) becomes a single space, so source
 //! text can never move the cursor or corrupt the surrounding layout.
 
-use crate::diff::{DiffKind, DiffLine};
+use crate::diff::{hunks, DiffKind, DiffLine, Hunk};
 use crate::theme::AURA;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -52,6 +52,36 @@ fn summary_line(rows: &[DiffLine], selected: usize) -> String {
         "+{added} -{removed} {context} context \u{b7} {position}/{}",
         rows.len()
     )
+}
+
+/// The hunk the caller asked to highlight, resolved against the current rows.
+///
+/// A stale or partially specified hunk falls back to the hunk containing its
+/// start row, so navigation never highlights unrelated context.
+fn resolve_hunk(rows: &[DiffLine], hunk: Option<Hunk>) -> Option<Hunk> {
+    let hunk = hunk?;
+    let all = hunks(rows);
+    all.iter()
+        .find(|candidate| candidate.start == hunk.start && candidate.end == hunk.end)
+        .or_else(|| all.iter().find(|candidate| candidate.contains(hunk.start)))
+        .copied()
+}
+
+/// `hunk N/M` for the active hunk, or `None` when there is nothing to label.
+fn hunk_label(rows: &[DiffLine], active: Option<Hunk>) -> Option<String> {
+    let all = hunks(rows);
+    let active = resolve_hunk(rows, active)?;
+    let index = all.iter().position(|hunk| *hunk == active)?;
+    Some(format!("hunk {}/{}", index + 1, all.len()))
+}
+
+/// Summary plus an optional hunk position, e.g. `... \u{b7} hunk 2/5`.
+fn summary_line_with_hunk(rows: &[DiffLine], selected: usize, active: Option<Hunk>) -> String {
+    let base = summary_line(rows, selected);
+    match hunk_label(rows, active) {
+        Some(label) => format!("{base} \u{b7} {label}"),
+        None => base,
+    }
 }
 
 /// Marker shown between the line numbers and the source text.
@@ -130,8 +160,28 @@ fn format_row(row: &DiffLine, num_width: usize) -> String {
 }
 
 /// Build one styled row. The caller guarantees `width > 0`.
+#[allow(dead_code)]
 fn row_line(row: &DiffLine, num_width: usize, width: u16, selected: bool) -> Line<'static> {
-    let bg = if selected { AURA.pill } else { AURA.card };
+    row_line_with(row, num_width, width, selected, false)
+}
+
+/// Build one styled row, optionally dimmed as part of the active hunk.
+fn row_line_with(
+    row: &DiffLine,
+    num_width: usize,
+    width: u16,
+    selected: bool,
+    active_hunk: bool,
+) -> Line<'static> {
+    let bg = if selected {
+        AURA.pill
+    } else if active_hunk {
+        // A shade darker than the card so the hunk reads as a group without
+        // competing with the selected-row pill.
+        AURA.canvas
+    } else {
+        AURA.card
+    };
     let fg = kind_color(&row.kind);
     let kind_style = if selected {
         Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)
@@ -201,6 +251,25 @@ pub(crate) fn render(
     focused: bool,
     title: &str,
 ) {
+    render_with_hunks(frame, area, rows, selected, focused, title, None);
+}
+
+/// Render the diff panel, optionally labelling and highlighting one hunk.
+///
+/// `hunk` is a row range previously obtained from [`crate::diff::hunks`]. When
+/// supplied, the subtitle gains `hunk N/M` and those rows use a slightly darker
+/// background; when `None`, the output is identical to [`render`].
+#[allow(dead_code)]
+pub(crate) fn render_with_hunks(
+    frame: &mut Frame,
+    area: Rect,
+    rows: &[DiffLine],
+    selected: usize,
+    focused: bool,
+    title: &str,
+    hunk: Option<Hunk>,
+) {
+    let active_hunk = resolve_hunk(rows, hunk);
     let border = if focused {
         AURA.border_focus
     } else {
@@ -224,7 +293,10 @@ pub(crate) fn render(
     }
 
     // Row 0 is always the subtitle; the list gets what remains.
-    let subtitle = truncate_chars(&summary_line(rows, selected), inner.width);
+    let subtitle = truncate_chars(
+        &summary_line_with_hunk(rows, selected, active_hunk),
+        inner.width,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             subtitle,
@@ -278,7 +350,18 @@ pub(crate) fn render(
     let lines: Vec<Line> = rows[start..end]
         .iter()
         .enumerate()
-        .map(|(offset, row)| row_line(row, num_width, list_area.width, start + offset == selected))
+        .map(|(offset, row)| {
+            let index = start + offset;
+            let selected = index == selected;
+            let in_hunk = active_hunk.is_some_and(|hunk| hunk.contains(index));
+            row_line_with(
+                row,
+                num_width,
+                list_area.width,
+                selected,
+                in_hunk && !selected,
+            )
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(AURA.card)),
@@ -453,6 +536,125 @@ mod tests {
         // Very wide line numbers must not overflow a narrow panel.
         let rows = vec![row(DiffKind::Added, None, Some(123_456), "text")];
         draw(8, 4, &rows, 0);
+    }
+
+    fn two_hunk_sample() -> Vec<DiffLine> {
+        vec![
+            row(DiffKind::Context, Some(1), Some(1), "a"),
+            row(DiffKind::Added, None, Some(2), "b"),
+            row(DiffKind::Context, Some(2), Some(3), "c"),
+            row(DiffKind::Removed, Some(3), None, "d"),
+            row(DiffKind::Context, Some(4), Some(4), "e"),
+        ]
+    }
+
+    #[test]
+    fn hunk_label_reports_position_and_total() {
+        let rows = sample();
+        assert_eq!(hunk_label(&rows, None), None);
+        assert_eq!(
+            hunk_label(&rows, Some(Hunk { start: 1, end: 2 })),
+            Some("hunk 1/1".to_string())
+        );
+        // A stale range still resolves through its start row.
+        assert_eq!(
+            hunk_label(&rows, Some(Hunk { start: 1, end: 99 })),
+            Some("hunk 1/1".to_string())
+        );
+
+        let rows = two_hunk_sample();
+        assert_eq!(
+            hunk_label(&rows, Some(Hunk { start: 1, end: 1 })),
+            Some("hunk 1/2".to_string())
+        );
+        assert_eq!(
+            hunk_label(&rows, Some(Hunk { start: 3, end: 3 })),
+            Some("hunk 2/2".to_string())
+        );
+        // No changed rows: no label even if a hunk was supplied.
+        assert_eq!(hunk_label(&[], Some(Hunk { start: 0, end: 0 })), None);
+    }
+
+    #[test]
+    fn summary_appends_hunk_position_without_changing_the_old_form() {
+        let rows = sample();
+        assert_eq!(
+            summary_line_with_hunk(&rows, 2, None),
+            summary_line(&rows, 2)
+        );
+        assert_eq!(
+            summary_line_with_hunk(&rows, 2, Some(Hunk { start: 1, end: 2 })),
+            "+1 -1 2 context \u{b7} 3/4 \u{b7} hunk 1/1"
+        );
+    }
+
+    #[test]
+    fn hunk_subtitle_and_highlight_render() {
+        let rows = sample();
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_with_hunks(
+                    frame,
+                    frame.area(),
+                    &rows,
+                    0,
+                    true,
+                    "main.rs",
+                    Some(Hunk { start: 1, end: 2 }),
+                );
+            })
+            .unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("hunk 1/1"), "{text}");
+
+        // The active hunk rows use the subtle canvas background.
+        let buffer = terminal.backend().buffer();
+        let mut found = false;
+        for y in 0..8 {
+            for x in 0..60 {
+                if buffer[(x, y)].bg == AURA.canvas {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "active hunk should be highlighted: {text}");
+    }
+
+    #[test]
+    fn tiny_areas_render_with_a_hunk_without_panicking() {
+        for (w, h) in [(1, 1), (1, 3), (3, 2), (5, 2), (12, 3), (19, 4)] {
+            let rows = sample();
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_with_hunks(
+                        frame,
+                        frame.area(),
+                        &rows,
+                        1,
+                        false,
+                        "x",
+                        Some(Hunk { start: 1, end: 2 }),
+                    );
+                })
+                .unwrap();
+            // Empty rows with a hunk hint must also stay safe.
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_with_hunks(
+                        frame,
+                        frame.area(),
+                        &[],
+                        0,
+                        false,
+                        "",
+                        Some(Hunk { start: 0, end: 0 }),
+                    );
+                })
+                .unwrap();
+        }
     }
 
     #[test]

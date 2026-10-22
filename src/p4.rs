@@ -155,6 +155,113 @@ pub fn detect(dir: &Path) -> bool {
     dir.starts_with(root)
 }
 
+/// Identity fields available without slowing the scan down.
+///
+/// Returns `(client, changelist summary)`. The client name comes from the
+/// already-cheap `p4 info`; one further bounded command (`p4 opened`) supplies
+/// the open changelist summary. No changelist is invented when `p4 opened`
+/// cannot answer or lists only files with no changelist.
+///
+/// Every failure path is an empty side, never an error: a missing `p4`, a
+/// directory outside a workspace, an expired ticket or the 20 s [`TIMEOUT`]
+/// simply leaves the status line without that field.
+pub(crate) fn identity(dir: &Path) -> (Option<String>, Option<String>) {
+    if !dir.is_dir() {
+        return (None, None);
+    }
+    let Some(info) = run_p4(dir, &["info"]) else {
+        return (None, None);
+    };
+    let Some(client) = parse_client_name(&info) else {
+        // `p4 info` can succeed with "Client unknown."; without a client there
+        // is no workspace identity to show.
+        return (None, None);
+    };
+    let changelist = run_p4(dir, &["opened"])
+        .as_deref()
+        .and_then(parse_open_changelists);
+    (Some(client), changelist)
+}
+
+/// Extract `Client name:` from `p4 info` output.
+///
+/// Empty and `unknown` values are rejected so a machine without a workspace
+/// does not render `p4 unknown`. Matching is case-insensitive on the word only;
+/// a real client name is preserved verbatim.
+pub(crate) fn parse_client_name(info: &str) -> Option<String> {
+    let value = info.lines().find_map(|raw| {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        line.strip_prefix("Client name: ")
+    })?;
+    let client = value.trim();
+    if client.is_empty() || client.eq_ignore_ascii_case("unknown") {
+        None
+    } else {
+        Some(client.to_string())
+    }
+}
+
+/// Summarise the changelists in `p4 opened` output.
+///
+/// A line looks like `//depot/a.rs#3 - edit change 12345 (text)` or
+/// `//depot/a.rs#3 - add default change (text)`. Only the token around `change`
+/// is trusted: a numeric changelist is collected (deduplicated), `default`
+/// marks the default changelist, and anything else is ignored rather than
+/// guessed.
+///
+/// The result is a short label such as `CL 12345`, `CLs 123, 456 +1 more` or
+/// `default CL`, or `None` when the output has no usable changelist. At most
+/// three numbered changelists are spelled out so a workspace with many open
+/// files cannot grow the status line without bound.
+fn parse_open_changelists(opened: &str) -> Option<String> {
+    let mut changes = std::collections::BTreeSet::new();
+    let mut has_default = false;
+
+    for raw in opened.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let mut words = line.split_whitespace();
+        let mut previous = None;
+        while let Some(word) = words.next() {
+            if word != "change" {
+                previous = Some(word);
+                continue;
+            }
+            match words.next() {
+                Some("default") => has_default = true,
+                Some(number) => {
+                    if let Ok(cl) = number.parse::<u32>() {
+                        changes.insert(cl);
+                    } else if previous == Some("default") {
+                        // `default change (text)`: the marker precedes the
+                        // keyword and the trailing parenthesis follows it.
+                        has_default = true;
+                    }
+                }
+                None if previous == Some("default") => has_default = true,
+                _ => {}
+            }
+            break;
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !changes.is_empty() {
+        let shown: Vec<String> = changes.iter().take(3).map(u32::to_string).collect();
+        let label = if changes.len() == 1 { "CL" } else { "CLs" };
+        let mut summary = format!("{label} {}", shown.join(", "));
+        let hidden = changes.len().saturating_sub(shown.len());
+        if hidden > 0 {
+            summary.push_str(&format!(" +{hidden} more"));
+        }
+        parts.push(summary);
+    }
+    if has_default {
+        parts.push("default CL".to_string());
+    }
+
+    (!parts.is_empty()).then(|| parts.join(" + "))
+}
+
 /// Files changed since revision `rev` (a changelist number, or `"opened"` for
 /// pending local changes), as scan-root-relative paths.
 ///
@@ -1587,6 +1694,69 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn parse_client_name_rejects_unknown_and_keeps_the_real_name() {
+        let info = "User name: alice\r\nClient name: ws-main\r\nClient root: C:\\ws\r\n";
+        assert_eq!(parse_client_name(info).as_deref(), Some("ws-main"));
+
+        assert_eq!(parse_client_name("Client name: unknown\n"), None);
+        assert_eq!(parse_client_name("Client name: \n"), None);
+        assert_eq!(parse_client_name("User name: alice\n"), None);
+    }
+
+    #[test]
+    fn parse_open_changelists_deduplicates_and_summarises() {
+        let opened = "\
+//depot/proj/a.rs#3 - edit change 12345 (text)
+//depot/proj/b.rs#1 - edit change 12345 (text)
+//depot/proj/c.rs#2 - add change 12344 (text)
+";
+        assert_eq!(
+            parse_open_changelists(opened).as_deref(),
+            Some("CLs 12344, 12345")
+        );
+
+        let default = "\
+//depot/proj/a.rs#3 - edit default change (text)
+//depot/proj/b.rs#1 - add change 12345 (text)
+";
+        assert_eq!(
+            parse_open_changelists(default).as_deref(),
+            Some("CL 12345 + default CL")
+        );
+        assert_eq!(
+            parse_open_changelists("//depot/proj/a.rs#3 - edit default change (text)\n").as_deref(),
+            Some("default CL")
+        );
+        assert_eq!(
+            parse_open_changelists("File(s) not opened on this client.\n"),
+            None
+        );
+        assert_eq!(
+            parse_open_changelists("//depot/proj/a.rs#3 - edit change not-a-number (text)\n"),
+            None,
+            "an unrecognised changelist is not guessed"
+        );
+    }
+
+    #[test]
+    fn parse_open_changelists_bounds_a_long_list() {
+        let mut opened = String::new();
+        for cl in 101..=105 {
+            opened.push_str(&format!("//depot/a.rs#1 - edit change {cl} (text)\n"));
+        }
+        assert_eq!(
+            parse_open_changelists(&opened).as_deref(),
+            Some("CLs 101, 102, 103 +2 more")
+        );
+    }
+
+    #[test]
+    fn identity_does_not_spawn_for_a_missing_directory() {
+        let missing = std::env::temp_dir().join("ccn-p4-identity-does-not-exist");
+        assert_eq!(identity(&missing), (None, None));
     }
 
     #[test]

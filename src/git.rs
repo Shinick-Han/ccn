@@ -383,6 +383,51 @@ fn is_tree_path(path: &str) -> bool {
         .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
+/// Current branch of `dir`, or the short commit id when HEAD is detached.
+///
+/// `git symbolic-ref --short -q HEAD` is the cheap answer and works from any
+/// directory inside the work tree, so no separate `rev-parse --show-toplevel`
+/// round trip is needed. A detached HEAD makes that command fail, and the short
+/// commit id is then the only useful identity the repository has.
+///
+/// Best effort by design: a missing `git`, a non-repository directory, a timeout
+/// or unreadable output all yield `None`, never an error or a fabricated name.
+pub(crate) fn branch(dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut symbolic = Command::new("git");
+    symbolic
+        .arg("-C")
+        .arg(dir)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"]);
+    if let Some(out) = run(symbolic) {
+        if let Some(name) = parse_ref_output(&out) {
+            return Some(name);
+        }
+    }
+
+    let mut short = Command::new("git");
+    short
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--short", "HEAD"]);
+    run(short).and_then(|out| parse_ref_output(&out))
+}
+
+/// Parse a one-line git ref/commit response (`<name>\n`, possibly CRLF).
+///
+/// The first non-blank line is kept verbatim apart from surrounding whitespace.
+/// A ref name containing internal spaces is legal on some filesystems, so only
+/// the line terminator is removed, not interior whitespace.
+pub(crate) fn parse_ref_output(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).trim())
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// Work-tree root for `dir`, or `None` when git cannot answer.
 pub fn work_tree(dir: &Path) -> Option<PathBuf> {
     if !dir.is_dir() {
@@ -1157,6 +1202,51 @@ mod tests {
         assert_eq!(file_at(tmp.path(), "HEAD", ""), FileAt::Unavailable);
         assert_eq!(file_at(tmp.path(), "HEAD", "a\0b.rs"), FileAt::Unavailable);
         assert_eq!(file_at(tmp.path(), "HE AD", "a.rs"), FileAt::Unavailable);
+    }
+
+    #[test]
+    fn parse_ref_output_keeps_the_first_non_blank_line() {
+        assert_eq!(parse_ref_output(b"main\n"), Some("main".to_string()));
+        assert_eq!(
+            parse_ref_output(b"\r\nfeature/topic\r\n"),
+            Some("feature/topic".to_string())
+        );
+        assert_eq!(
+            parse_ref_output(b"release 1.2\n"),
+            Some("release 1.2".to_string()),
+            "interior whitespace belongs to the ref name"
+        );
+        assert_eq!(parse_ref_output(b""), None);
+        assert_eq!(parse_ref_output(b" \r\n\t\n"), None);
+    }
+
+    #[test]
+    fn branch_reports_the_branch_then_the_short_id_when_detached() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("identity");
+        init_repo(tmp.path());
+        write(tmp.path(), "a.rs", "1\n");
+        commit(tmp.path(), "first");
+        git(tmp.path(), &["checkout", "-q", "-b", "ccn-identity"]);
+
+        assert_eq!(branch(tmp.path()).as_deref(), Some("ccn-identity"));
+
+        git(tmp.path(), &["checkout", "-q", "--detach", "HEAD"]);
+        let detached = branch(tmp.path()).expect("detached HEAD still has an identity");
+        assert_ne!(detached, "ccn-identity");
+        assert!(
+            detached.len() >= 4 && detached.chars().all(|c| c.is_ascii_hexdigit()),
+            "a detached HEAD falls back to the short commit id, got {detached:?}"
+        );
+    }
+
+    #[test]
+    fn branch_is_none_outside_a_repository() {
+        let tmp = TempDir::new("identity-none");
+        assert!(branch(tmp.path()).is_none());
+        assert!(branch(&tmp.path().join("missing")).is_none());
     }
 
     #[test]

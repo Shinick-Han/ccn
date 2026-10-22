@@ -30,6 +30,24 @@ pub enum Area {
     Editor,
 }
 
+/// Narrowing criteria for a diagnostics view.
+///
+/// Both fields compose: a [`Filter`] with only a severity set keeps every area,
+/// and [`Filter::default`] keeps everything. Fields are matched exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Filter {
+    pub severity: Option<Severity>,
+    pub area: Option<Area>,
+}
+
+impl Filter {
+    fn matches(&self, item: &Diagnostic) -> bool {
+        self.severity
+            .is_none_or(|severity| severity == item.severity)
+            && self.area.is_none_or(|area| area == item.area)
+    }
+}
+
 /// One actionable finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -231,6 +249,30 @@ impl Diagnostics {
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// Items accepted by `filter`, in their original sorted order.
+    pub fn filtered(&self, filter: Filter) -> Vec<&Diagnostic> {
+        self.items
+            .iter()
+            .filter(|item| filter.matches(item))
+            .collect()
+    }
+
+    /// `(errors, warnings, infos)` among the items accepted by `filter`.
+    pub fn counts_for(&self, filter: Filter) -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        for item in &self.items {
+            if !filter.matches(item) {
+                continue;
+            }
+            match item.severity {
+                Severity::Error => counts.0 += 1,
+                Severity::Warn => counts.1 += 1,
+                Severity::Info => counts.2 += 1,
+            }
+        }
+        counts
     }
 
     /// `(errors, warnings, infos)`.
@@ -514,6 +556,131 @@ mod tests {
             "summary must render in a narrow ASCII terminal: {summary}"
         );
         assert_eq!(summary, "7 error(s), 2 warning(s), 2 info");
+    }
+
+    fn filter_sample() -> Diagnostics {
+        let mut diagnostics = Diagnostics::new();
+        for (area, severity, code) in [
+            (Area::Scan, Severity::Error, "scan-error"),
+            (Area::Scan, Severity::Warn, "scan-warn"),
+            (Area::Baseline, Severity::Info, "baseline-info"),
+            (Area::Editor, Severity::Error, "editor-error"),
+        ] {
+            diagnostics.push(Diagnostic {
+                area,
+                severity,
+                path: None,
+                line: None,
+                code: code.to_string(),
+                message: code.to_string(),
+            });
+        }
+        diagnostics.sort();
+        diagnostics
+    }
+
+    fn codes(items: Vec<&Diagnostic>) -> Vec<&str> {
+        items.into_iter().map(|item| item.code.as_str()).collect()
+    }
+
+    #[test]
+    fn default_filter_keeps_everything_in_sorted_order() {
+        let diagnostics = filter_sample();
+
+        assert_eq!(
+            codes(diagnostics.filtered(Filter::default())),
+            vec!["scan-error", "editor-error", "scan-warn", "baseline-info"]
+        );
+        assert_eq!(diagnostics.len(), 4);
+    }
+
+    #[test]
+    fn severity_filter_composes_without_changing_order() {
+        let diagnostics = filter_sample();
+        let filter = Filter {
+            severity: Some(Severity::Error),
+            area: None,
+        };
+
+        assert_eq!(
+            codes(diagnostics.filtered(filter)),
+            vec!["scan-error", "editor-error"]
+        );
+    }
+
+    #[test]
+    fn area_filter_composes_without_changing_order() {
+        let diagnostics = filter_sample();
+        let filter = Filter {
+            severity: None,
+            area: Some(Area::Scan),
+        };
+
+        assert_eq!(
+            codes(diagnostics.filtered(filter)),
+            vec!["scan-error", "scan-warn"]
+        );
+    }
+
+    #[test]
+    fn severity_and_area_filters_intersect() {
+        let diagnostics = filter_sample();
+        let filter = Filter {
+            severity: Some(Severity::Error),
+            area: Some(Area::Scan),
+        };
+
+        assert_eq!(codes(diagnostics.filtered(filter)), vec!["scan-error"]);
+    }
+
+    #[test]
+    fn filter_with_no_matches_is_empty_but_diagnostics_are_not() {
+        let diagnostics = filter_sample();
+        let filter = Filter {
+            severity: Some(Severity::Info),
+            area: Some(Area::Editor),
+        };
+
+        assert!(diagnostics.filtered(filter).is_empty());
+        assert_eq!(diagnostics.len(), 4);
+    }
+
+    #[test]
+    fn counts_for_uses_the_same_filter() {
+        let diagnostics = filter_sample();
+
+        assert_eq!(
+            diagnostics.counts_for(Filter::default()),
+            diagnostics.counts()
+        );
+        assert_eq!(
+            diagnostics.counts_for(Filter {
+                severity: Some(Severity::Error),
+                area: None,
+            }),
+            (2, 0, 0)
+        );
+        assert_eq!(
+            diagnostics.counts_for(Filter {
+                severity: None,
+                area: Some(Area::Scan),
+            }),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            diagnostics.counts_for(Filter {
+                severity: Some(Severity::Error),
+                area: Some(Area::Scan),
+            }),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            diagnostics.counts_for(Filter {
+                severity: Some(Severity::Info),
+                area: Some(Area::Editor),
+            }),
+            (0, 0, 0)
+        );
     }
 
     #[test]

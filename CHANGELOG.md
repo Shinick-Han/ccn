@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.0 (2026-10-22)
+
+Workspace polish.
+
+- **VCS identity** in the dashboard header: git branch (for Perforce the
+  backend label is shown without blocking startup on network commands).
+- **Exact session restore**: the saved tab order and active tab are restored
+  instead of appended tabs drifting.
+- **Diff hunk navigation**: `[`/`]` moves between changed hunks in the baseline
+  diff; the subtitle shows `hunk N/M`.
+- **Diagnostics filtering**: `e` errors, `w` warnings, `i` info, `u` all;
+  filtered/total counts and a filter label in the panel.
+- 619 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean.
+
 ## 0.16.0 (2026-10-22)
 
 Dashboard context panels.

@@ -1102,15 +1102,10 @@ impl WorkbenchSession {
         self.app.open_file(path)
     }
 
-    /// Restore the ordered buffer list from a saved session without opening
-    /// each file in Neovim yet. The first switch to a restored tab issues the
-    /// normal RPC `:edit`, so startup stays cheap.
-    pub(crate) fn adopt_tabs(&mut self, paths: &[(PathBuf, String)]) {
-        for (path, display) in paths {
-            if path.is_file() {
-                self.app.tabs.add_inactive(path, display.clone());
-            }
-        }
+    /// Restore the exact saved tab order and active tab. The caller must open
+    /// the active file first so the PTY/RPC buffer already matches.
+    pub(crate) fn restore_ordered(&mut self, paths: &[(PathBuf, String)], active: &Path) -> bool {
+        self.app.tabs.restore_ordered(paths, active)
     }
 
     #[allow(dead_code)] // Public surface for the split UI / orchestrator.

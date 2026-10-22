@@ -55,7 +55,12 @@ implementation; the public entry point is `ccn workbench` (single file) and
   the RPC snapshot, so unsaved edits are included and no file is written.
 - `F7` opens diagnostics: scan read errors/oversize/no-grammar and
   best-effort/heuristic files, baseline completeness categories, and live
-  editor/RPC errors. `F5` opens the fuzzy command palette.
+  editor/RPC errors. `e`/`w`/`i` filter errors/warnings/info, `u` clears the
+  filter. `F5` opens the fuzzy command palette.
+- Baseline diffs support `[`/`]` hunk navigation; the subtitle shows the active
+  hunk position.
+- The dashboard header shows the git branch when available (Perforce shows the
+  backend label without blocking startup on network commands).
 - `Alt+O` opens the current-file symbol palette; fuzzy-match a function and
   Enter jumps to it. The function sidebar is display-only for navigation:
   click a function row to jump, or use Alt+O. `F9` remains an advanced focus

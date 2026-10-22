@@ -88,6 +88,62 @@ impl Session {
         self.active_file = self.active_file.take().filter(|p| safe_relative(p));
         self.open_files.retain(|p| safe_relative(p));
         self.tree_expanded.retain(|p| safe_relative(p));
+
+        // `active_file` only means something while it is one of the open
+        // files. A dangling entry is dropped so startup restores a tab that
+        // actually exists rather than silently selecting nothing.
+        if let Some(active) = &self.active_file {
+            let key = relative_key(active);
+            if !self.open_files.iter().any(|path| relative_key(path) == key) {
+                self.active_file = None;
+            }
+        }
+    }
+}
+
+/// Ordered open files and the active file that belongs to them.
+///
+/// The `open_files` sequence is returned exactly as stored, with duplicates
+/// collapsed to their first occurrence (using the same case/separator rules as
+/// startup path matching) and unsafe paths ignored, mirroring
+/// [`Session::normalize`]. `active_file` is returned only when it names one of
+/// those files; otherwise it is `None`, leaving the caller free to fall back to
+/// the first restored tab.
+pub fn restore_order(session: &Session) -> (Vec<String>, Option<String>) {
+    let mut files: Vec<String> = Vec::new();
+    for path in &session.open_files {
+        if !safe_relative(path) {
+            continue;
+        }
+        let key = relative_key(path);
+        if !files.iter().any(|kept| relative_key(kept) == key) {
+            files.push(path.clone());
+        }
+    }
+
+    let active = session
+        .active_file
+        .as_ref()
+        .filter(|active| {
+            files
+                .iter()
+                .any(|path| relative_key(path) == relative_key(active))
+        })
+        .cloned();
+
+    (files, active)
+}
+
+/// Case/separator-insensitive key for a relative session path.
+fn relative_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    #[cfg(windows)]
+    {
+        normalized.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
     }
 }
 
@@ -235,6 +291,83 @@ mod tests {
 
         assert_eq!(loaded, session);
         assert_eq!(loaded.version, SESSION_VERSION);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn round_trip_preserves_open_file_order_and_active_file() {
+        let dir = temp_dir("order-roundtrip");
+        let path = dir.join("session.json");
+        let session = Session {
+            open_files: vec![
+                "src/z.rs".into(),
+                "src/a.rs".into(),
+                "src/workbench/mod.rs".into(),
+            ],
+            active_file: Some("src/a.rs".into()),
+            ..Session::default()
+        };
+
+        save_to(&path, &session).expect("save");
+        let loaded = load_from(&path);
+
+        assert_eq!(loaded.open_files, session.open_files);
+        assert_eq!(loaded.active_file, session.active_file);
+        assert_eq!(
+            restore_order(&loaded),
+            (session.open_files.clone(), session.active_file.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_order_preserves_sequence_and_drops_a_missing_active() {
+        let session = Session {
+            open_files: vec!["src/z.rs".into(), "src/a.rs".into(), "src/m.rs".into()],
+            active_file: Some("src/missing.rs".into()),
+            ..Session::default()
+        };
+
+        let (files, active) = restore_order(&session);
+        assert_eq!(files, session.open_files);
+        assert_eq!(active, None);
+    }
+
+    #[test]
+    fn restore_order_deduplicates_and_ignores_unsafe_paths() {
+        let session = Session {
+            open_files: vec![
+                "src/a.rs".into(),
+                "src/ok.rs".into(),
+                "../escape.rs".into(),
+                PathBuf::from("src/a.rs").to_string_lossy().into_owned(),
+                "src/ok.rs".into(),
+            ],
+            active_file: Some("src/a.rs".into()),
+            ..Session::default()
+        };
+
+        let (files, active) = restore_order(&session);
+        assert_eq!(files, vec!["src/a.rs".to_string(), "src/ok.rs".to_string()]);
+        assert_eq!(active, Some("src/a.rs".to_string()));
+    }
+
+    #[test]
+    fn normalize_drops_an_active_file_that_is_not_open() {
+        let dir = temp_dir("active-not-open");
+        let path = dir.join("session.json");
+        let session = Session {
+            open_files: vec!["src/a.rs".into()],
+            active_file: Some("src/other.rs".into()),
+            ..Session::default()
+        };
+        write_raw(&path, &session);
+
+        let loaded = load_from(&path);
+        assert_eq!(loaded.open_files, vec!["src/a.rs".to_string()]);
+        assert_eq!(loaded.active_file, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

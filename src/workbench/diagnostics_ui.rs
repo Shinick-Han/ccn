@@ -4,7 +4,7 @@
 //! the selected index on every frame and the renderer derives a local scroll
 //! window from it, so the selection is always kept visible.
 
-use crate::diagnostics::{Area, Diagnostic, Diagnostics, Severity};
+use crate::diagnostics::{Area, Diagnostic, Diagnostics, Filter, Severity};
 use crate::theme::AURA;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -33,6 +33,40 @@ fn area_label(area: Area) -> &'static str {
         Area::Baseline => "baseline",
         Area::Editor => "editor",
     }
+}
+
+fn severity_label(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warn => "warning",
+        Severity::Info => "info",
+    }
+}
+
+/// Human-readable active filter, or `None` when nothing is narrowed.
+fn filter_label(filter: Filter) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(severity) = filter.severity {
+        parts.push(severity_label(severity));
+    }
+    if let Some(area) = filter.area {
+        parts.push(area_label(area));
+    }
+    (!parts.is_empty()).then(|| parts.join(" + "))
+}
+
+/// Counts, visible/total, and the active filter when one is set.
+fn subtitle_text(diagnostics: &Diagnostics, filter: Filter) -> String {
+    let (errors, warnings, infos) = diagnostics.counts();
+    let shown = diagnostics.filtered(filter).len();
+    let mut text = format!(
+        "{errors}E/{warnings}W/{infos}I \u{b7} {shown}/{} shown",
+        diagnostics.len()
+    );
+    if let Some(label) = filter_label(filter) {
+        text.push_str(&format!(" \u{b7} filter: {label}"));
+    }
+    text
 }
 
 /// `path:line`, `path`, or empty when the finding is not about a file.
@@ -147,9 +181,14 @@ fn finish_row(mut spans: Vec<Span<'static>>, width: u16, selected: bool) -> Line
     Line::from(spans)
 }
 
-/// Two-line empty state.
+/// Two-line empty state when there is nothing to show at all.
 fn empty_lines() -> [&'static str; 2] {
     ["No diagnostics", "scan and baseline look clean"]
+}
+
+/// Two-line empty state when diagnostics exist but the filter hides them.
+fn no_matches_lines() -> [&'static str; 2] {
+    ["No matches for filter", "adjust or clear the filter"]
 }
 
 /// Render the diagnostics panel inside `area`.
@@ -160,6 +199,29 @@ pub(crate) fn render(
     diagnostics: &Diagnostics,
     selected: usize,
     focused: bool,
+) {
+    render_filtered(
+        frame,
+        area,
+        diagnostics,
+        selected,
+        focused,
+        Filter::default(),
+    );
+}
+
+/// Render the diagnostics panel with a `filter` applied to the rows.
+///
+/// Selection indices refer to the filtered rows. The caller is expected to
+/// clamp them; an out-of-range index is clamped here as a safety net.
+#[allow(dead_code)]
+pub(crate) fn render_filtered(
+    frame: &mut Frame,
+    area: Rect,
+    diagnostics: &Diagnostics,
+    selected: usize,
+    focused: bool,
+    filter: Filter,
 ) {
     let border = if focused {
         AURA.border_focus
@@ -183,8 +245,8 @@ pub(crate) fn render(
         return;
     }
 
-    // Row 0 is always the summary; the list gets what remains.
-    let subtitle = truncate_chars(&diagnostics.summary(), inner.width);
+    // Row 0 is always the subtitle; the list gets what remains.
+    let subtitle = truncate_chars(&subtitle_text(diagnostics, filter), inner.width);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             subtitle,
@@ -208,37 +270,41 @@ pub(crate) fn render(
         return;
     }
 
-    let items = diagnostics.items();
-    if items.is_empty() {
-        let lines: Vec<Line> = empty_lines()
+    let items = diagnostics.filtered(filter);
+    let empty = if diagnostics.is_empty() {
+        empty_lines()
+    } else if items.is_empty() {
+        no_matches_lines()
+    } else {
+        let visible = usize::from(list_area.height).max(1);
+        let selected = selected.min(items.len() - 1);
+        let start = if selected >= visible {
+            selected + 1 - visible
+        } else {
+            0
+        };
+        let end = (start + visible).min(items.len());
+
+        let lines: Vec<Line> = items[start..end]
             .iter()
-            .map(|text| {
-                Line::from(Span::styled(
-                    truncate_chars(text, list_area.width),
-                    Style::default().fg(AURA.muted).bg(AURA.card),
-                ))
-            })
+            .enumerate()
+            .map(|(offset, item)| row_line(item, list_area.width, start + offset == selected))
             .collect();
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(AURA.card)),
             list_area,
         );
         return;
-    }
-
-    let visible = usize::from(list_area.height).max(1);
-    let selected = selected.min(items.len() - 1);
-    let start = if selected >= visible {
-        selected + 1 - visible
-    } else {
-        0
     };
-    let end = (start + visible).min(items.len());
 
-    let lines: Vec<Line> = items[start..end]
+    let lines: Vec<Line> = empty
         .iter()
-        .enumerate()
-        .map(|(offset, item)| row_line(item, list_area.width, start + offset == selected))
+        .map(|text| {
+            Line::from(Span::styled(
+                truncate_chars(text, list_area.width),
+                Style::default().fg(AURA.muted).bg(AURA.card),
+            ))
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(AURA.card)),
@@ -300,6 +366,21 @@ mod tests {
         terminal
             .draw(|frame| {
                 render(frame, frame.area(), diagnostics, selected, true);
+            })
+            .unwrap();
+    }
+
+    fn draw_filtered(
+        width: u16,
+        height: u16,
+        diagnostics: &Diagnostics,
+        selected: usize,
+        filter: Filter,
+    ) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_filtered(frame, frame.area(), diagnostics, selected, true, filter);
             })
             .unwrap();
     }
@@ -387,6 +468,127 @@ mod tests {
             }
         }
         assert!(found_pill, "selected row should use the pill background");
+    }
+
+    #[test]
+    fn filter_changes_the_visible_row_count() {
+        let diagnostics = sample();
+        let mut all = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        all.draw(|frame| {
+            render_filtered(
+                frame,
+                frame.area(),
+                &diagnostics,
+                0,
+                true,
+                Filter::default(),
+            );
+        })
+        .unwrap();
+        let all_text = screen(&all);
+        assert!(all_text.contains("3/3 shown"), "{all_text}");
+        assert!(all_text.contains("src/big.rs"), "{all_text}");
+        assert!(all_text.contains("outside the vers"), "{all_text}");
+
+        let errors = Filter {
+            severity: Some(Severity::Error),
+            area: None,
+        };
+        let mut filtered = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        filtered
+            .draw(|frame| {
+                render_filtered(frame, frame.area(), &diagnostics, 0, true, errors);
+            })
+            .unwrap();
+        let filtered_text = screen(&filtered);
+        assert!(filtered_text.contains("1/3 shown"), "{filtered_text}");
+        assert!(filtered_text.contains("filter: error"), "{filtered_text}");
+        assert!(filtered_text.contains("src/broken.rs"), "{filtered_text}");
+        assert!(!filtered_text.contains("src/big.rs"), "{filtered_text}");
+        assert!(
+            !filtered_text.contains("outside the vers"),
+            "{filtered_text}"
+        );
+    }
+
+    #[test]
+    fn selected_row_scrolls_within_filtered_rows() {
+        let diagnostics = sample();
+        let filter = Filter {
+            severity: None,
+            area: Some(Area::Scan),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(44, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                // One list row: selecting the second filtered row scrolls to it.
+                render_filtered(frame, frame.area(), &diagnostics, 1, false, filter);
+            })
+            .unwrap();
+        let text = screen(&terminal);
+        let buffer = terminal.backend().buffer();
+
+        assert!(text.contains("2/3 shown"), "{text}");
+        assert!(text.contains("filter: scan"), "{text}");
+        assert!(text.contains("src/big.rs"), "{text}");
+        assert!(!text.contains("src/broken.rs"), "{text}");
+        let mut found_pill = false;
+        for y in 0..4 {
+            for x in 0..44 {
+                if buffer[(x, y)].bg == AURA.pill {
+                    found_pill = true;
+                }
+            }
+        }
+        assert!(found_pill, "filtered selected row should be pill-backed");
+    }
+
+    #[test]
+    fn empty_filter_state_differs_from_empty_diagnostics() {
+        let diagnostics = sample();
+        let filter = Filter {
+            severity: Some(Severity::Info),
+            area: Some(Area::Editor),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(48, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_filtered(frame, frame.area(), &diagnostics, 0, false, filter);
+            })
+            .unwrap();
+        let text = screen(&terminal);
+
+        assert!(text.contains("No matches for filter"), "{text}");
+        assert!(text.contains("adjust or clear the filter"), "{text}");
+        assert!(!text.contains("No diagnostics"), "{text}");
+        assert!(text.contains("0/3 shown"), "{text}");
+        assert!(text.contains("filter: info + editor"), "{text}");
+
+        // With no diagnostics at all the original empty copy still wins.
+        let empty = Diagnostics::new();
+        let mut clean = Terminal::new(TestBackend::new(48, 6)).unwrap();
+        clean
+            .draw(|frame| {
+                render_filtered(frame, frame.area(), &empty, 0, false, filter);
+            })
+            .unwrap();
+        let clean_text = screen(&clean);
+        assert!(clean_text.contains("No diagnostics"), "{clean_text}");
+        assert!(
+            !clean_text.contains("No matches for filter"),
+            "{clean_text}"
+        );
+    }
+
+    #[test]
+    fn filtered_selected_index_is_clamped() {
+        let diagnostics = sample();
+        let filter = Filter {
+            severity: None,
+            area: Some(Area::Scan),
+        };
+        // No panic even though 99 is past the end of the filtered rows.
+        draw_filtered(40, 8, &diagnostics, 99, filter);
     }
 
     #[test]

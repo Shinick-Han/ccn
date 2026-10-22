@@ -69,6 +69,42 @@ impl Tabs {
         }
     }
 
+    /// Replace the tab list with exactly `paths`, preserving their order and
+    /// display names.
+    ///
+    /// Duplicate paths collapse to their first occurrence, using the loose
+    /// comparison from [`Tabs::index_of_loose`]. Restored tabs always start
+    /// clean: dirty markers are not persisted, so an unsaved edit from a
+    /// previous process is never shown as pending after a restart.
+    ///
+    /// The active tab is the one matching `active` (loose path match), and
+    /// `true` is returned. When no tab matches -- including for an empty list
+    /// -- the first restored tab is selected instead and `false` is returned.
+    pub(crate) fn restore_ordered(&mut self, paths: &[(PathBuf, String)], active: &Path) -> bool {
+        self.tabs.clear();
+        for (path, display) in paths {
+            let key = path_key(path);
+            if self.tabs.iter().any(|tab| path_key(&tab.path) == key) {
+                continue;
+            }
+            self.tabs.push(Tab::new(path.clone(), display.clone()));
+        }
+
+        self.active = 0;
+        let active_key = path_key(active);
+        match self
+            .tabs
+            .iter()
+            .position(|tab| path_key(&tab.path) == active_key)
+        {
+            Some(index) => {
+                self.active = index;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
@@ -354,5 +390,76 @@ mod tests {
         tabs.open_or_select_named(Path::new("/work/src/engine.cpp"), "src/engine.cpp".into());
         assert_eq!(tabs.titles(), vec!["src/engine.cpp"]);
         assert_eq!(tabs.paths(), vec![PathBuf::from("/work/src/engine.cpp")]);
+    }
+
+    #[test]
+    fn restore_ordered_replaces_the_list_in_exact_order() {
+        let mut tabs = Tabs::new();
+        tabs.open_or_select(&path("stale.c"));
+        tabs.open_or_select(&path("older.c"));
+
+        let restored = vec![
+            (path("z.c"), "z.c".into()),
+            (path("a.c"), "a.c".into()),
+            (path("m.c"), "m.c".into()),
+        ];
+        assert!(tabs.restore_ordered(&restored, &path("a.c")));
+
+        assert_eq!(tabs.paths(), vec![path("z.c"), path("a.c"), path("m.c")]);
+        assert_eq!(tabs.titles(), vec!["z.c", "a.c", "m.c"]);
+        assert_eq!(tabs.active_path(), Some(path("a.c").as_path()));
+        assert_eq!(tabs.active_index(), Some(1));
+    }
+
+    #[test]
+    fn restore_ordered_selects_the_active_tab_with_a_loose_match() {
+        let mut tabs = Tabs::new();
+        #[cfg(windows)]
+        let active = PathBuf::from(r"\WORK\SRC\B.C");
+        #[cfg(not(windows))]
+        let active = PathBuf::from("/work/src/b.c");
+        let stored = PathBuf::from("/work/src/b.c");
+
+        let restored = vec![(path("a.c"), "a.c".into()), (stored, "b.c".into())];
+        assert!(tabs.restore_ordered(&restored, &active));
+        assert_eq!(tabs.active_index(), Some(1));
+        assert_eq!(tabs.titles(), vec!["a.c", "b.c"]);
+    }
+
+    #[test]
+    fn restore_ordered_falls_back_to_the_first_tab_for_a_missing_active() {
+        let mut tabs = Tabs::new();
+        let restored = vec![(path("a.c"), "a.c".into()), (path("b.c"), "b.c".into())];
+        assert!(!tabs.restore_ordered(&restored, &path("missing.c")));
+        assert_eq!(tabs.active_path(), Some(path("a.c").as_path()));
+    }
+
+    #[test]
+    fn restore_ordered_deduplicates_paths_and_starts_clean() {
+        let mut tabs = Tabs::new();
+        tabs.open_or_select(&path("a.c"));
+        tabs.set_modified(&path("a.c"), true);
+
+        let restored = vec![
+            (path("a.c"), "first/a.c".into()),
+            (path("b.c"), "b.c".into()),
+            (path("a.c"), "second/a.c".into()),
+        ];
+        assert!(tabs.restore_ordered(&restored, &path("b.c")));
+
+        assert_eq!(tabs.paths(), vec![path("a.c"), path("b.c")]);
+        assert_eq!(tabs.titles(), vec!["first/a.c", "b.c"]);
+        assert!(!tabs.any_modified());
+    }
+
+    #[test]
+    fn restore_ordered_with_an_empty_list_clears_the_tabs() {
+        let mut tabs = Tabs::new();
+        tabs.open_or_select(&path("a.c"));
+
+        assert!(!tabs.restore_ordered(&[], &path("a.c")));
+        assert!(tabs.is_empty());
+        assert_eq!(tabs.active_index(), None);
+        assert_eq!(tabs.active_path(), None);
     }
 }
