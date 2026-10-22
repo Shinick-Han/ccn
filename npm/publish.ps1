@@ -1,50 +1,78 @@
 # Publishes @shinick/ccn and its platform packages.
 #
-#   1. npm login                     (once per machine)
+#   1. npm login                     (once per machine / when the session expires)
 #   2. node npm/prepare.js           (downloads the release binaries)
-#   3. pwsh -File npm/publish.ps1
+#   3. pwsh -File npm/publish.ps1    (npm prompts for an OTP per package)
+#      pwsh -File npm/publish.ps1 -Otp 123456   (reuse one OTP while it is valid)
 #
 # The platform packages must exist before the main package is installed by
-# users, so publish them first.
+# users, so publish them first. The script is idempotent: a package already at
+# the target version is skipped, so a run that dies on an expired OTP can be
+# resumed with a fresh code.
+
+param(
+    [string]$Otp = ""
+)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $version = (Get-Content (Join-Path $root 'package.json') -Raw | ConvertFrom-Json).version
 
+$user = npm whoami 2>$null
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($user)) {
+    throw "npm is not logged in. Run 'npm login' and complete the browser/OTP step, then 'npm whoami'."
+}
+Write-Host "npm user: $user (target $version)"
+
+$otpArgs = @()
+if (-not [string]::IsNullOrWhiteSpace($Otp)) {
+    $otpArgs = @("--otp=$Otp")
+}
+
+$published = @()
 $platforms = @(
     'platforms/linux-x64',
     'platforms/darwin-x64',
     'platforms/darwin-arm64',
     'platforms/win32-x64'
 )
+$targets = @()
+foreach ($platform in $platforms) { $targets += (Join-Path $root $platform) }
+$targets += $root
 
-foreach ($platform in $platforms) {
-    $dir = Join-Path $root $platform
+foreach ($dir in $targets) {
     $manifest = Get-Content (Join-Path $dir 'package.json') -Raw | ConvertFrom-Json
-    $vendor = Join-Path $dir 'vendor'
-    if (-not (Test-Path $vendor)) {
-        throw "$platform has no vendor/ - run 'node npm/prepare.js' first"
+    $name = $manifest.name
+    $existing = npm view $name version 2>$null
+    if ($LASTEXITCODE -eq 0 -and $existing -eq $version) {
+        Write-Host "already published: $name@$version (skipping)"
+        $published += $name
+        continue
     }
     if ($manifest.version -ne $version) {
-        throw "$platform is $($manifest.version) but the main package is $version"
+        throw "$name is $($manifest.version) but the target is $version"
     }
-    Write-Host "publishing $($manifest.name)@$($manifest.version)"
+    $vendor = Join-Path $dir 'vendor'
+    if ($dir -ne $root -and -not (Test-Path $vendor)) {
+        throw "$name has no vendor/ - run 'node npm/prepare.js' first"
+    }
+
+    Write-Host "publishing $name@$version"
     Push-Location $dir
     try {
-        npm publish --access public
-        if ($LASTEXITCODE -ne 0) { throw "npm publish failed in $dir" }
+        npm publish --access public @otpArgs
+        if ($LASTEXITCODE -ne 0) { throw "npm publish failed for $name" }
     } finally {
         Pop-Location
     }
+
+    $seen = npm view $name version 2>$null
+    if ($LASTEXITCODE -ne 0 -or $seen -ne $version) {
+        throw "published $name but the registry reports '$seen' (expected $version)"
+    }
+    $published += $name
 }
 
-Push-Location $root
-try {
-    Write-Host "publishing @shinick/ccn@$version"
-    npm publish --access public
-    if ($LASTEXITCODE -ne 0) { throw "npm publish failed for the main package" }
-} finally {
-    Pop-Location
-}
-
-Write-Host "done: npx @shinick/ccn@$version --version"
+Write-Host ""
+Write-Host "published: $($published -join ', ')"
+Write-Host "verify: npx @shinick/ccn@$version --version"
