@@ -347,8 +347,12 @@ Remaining limitations / next steps:
 - One Neovim process with a ccn tab bar over its buffers. Neovim window splits,
   multiple tabpages, cross-file health summaries and project-wide symbol search
   are not managed by ccn.
-- Mouse input is captured by ccn for the divider drag; clicks inside the editor
-  are not forwarded to Neovim yet. Scrollback is also still zero rows.
+- Mouse input is captured by ccn only inside the split, for the divider drag;
+  clicks inside the editor are not forwarded to Neovim. Use Shift+drag for the
+  terminal's own text selection/copy. On the dashboard mouse reporting is off.
+- Paste is bracketed: pasted text goes to the live filter/fuzzy query, or to
+  Neovim as `ESC[200~...ESC[201~`. A terminal that does not implement bracketed
+  paste can still send text, but Ctrl+V may arrive as `0x16` in the editor.
 - Reconnect resets `base_tick` to the new connect tick; edits made while the
   connection was down can temporarily appear "saved". Edits made before the
   first successful connect are likewise the baseline, because `unsaved` is

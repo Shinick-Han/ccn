@@ -20,7 +20,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
@@ -1119,6 +1122,20 @@ impl WorkbenchSession {
         self.app.close_tab()
     }
 
+    /// Forward a terminal bracketed paste to the embedded editor. Without the
+    /// bracketed markers Neovim treats a multi-line paste as autoindented key
+    /// input; with them it behaves like a real paste.
+    pub(crate) fn paste(&mut self, text: &str) {
+        let mut bytes = Vec::with_capacity(text.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        if let Err(error) = self.child.send(&bytes) {
+            self.app
+                .set_status(format!("paste to editor failed: {error}"), true);
+        }
+    }
+
     pub(crate) fn resize(&mut self, width: u16, height: u16) {
         let editor = ui::editor_inner(ui::layout(Rect::new(0, 0, width, height)).editor);
         self.child.resize(editor.height, editor.width);
@@ -1171,8 +1188,13 @@ fn run_workbench(cli: &Cli) -> Result<(), String> {
     app.rpc_disabled = rpc_address.is_none();
 
     terminal::enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
-    execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)
-        .map_err(|e| format!("cannot enter the alternate screen: {e}"))?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        cursor::Hide
+    )
+    .map_err(|e| format!("cannot enter the alternate screen: {e}"))?;
     install_panic_hook();
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -1259,6 +1281,17 @@ fn event_loop(
                     if handle_key(app, child, key) {
                         app.shutdown_rpc();
                         return Ok(());
+                    }
+                }
+                Event::Paste(text) => {
+                    if app.focus == Focus::Editor {
+                        let mut bytes = Vec::with_capacity(text.len() + 12);
+                        bytes.extend_from_slice(b"\x1b[200~");
+                        bytes.extend_from_slice(text.as_bytes());
+                        bytes.extend_from_slice(b"\x1b[201~");
+                        if let Err(error) = child.send(&bytes) {
+                            app.set_status(format!("paste to editor failed: {error}"), true);
+                        }
                     }
                 }
                 Event::Resize(width, height) => {
@@ -1873,14 +1906,24 @@ fn screen_tail(text: &str, count: usize) -> Vec<String> {
 
 fn restore_terminal() -> io::Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, cursor::Show)
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        cursor::Show
+    )
 }
 
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            cursor::Show
+        );
         previous(info);
     }));
 }

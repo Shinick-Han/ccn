@@ -30,9 +30,11 @@ use crate::fuzzy::FuzzyState;
 #[cfg(feature = "workbench")]
 use crate::tree::{Tree, TreeAction};
 use crossterm::cursor::{Hide, Show};
+#[cfg(feature = "workbench")]
+use crossterm::event::EnableMouseCapture;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+    KeyEvent, KeyEventKind, KeyModifiers,
 };
 #[cfg(feature = "workbench")]
 use crossterm::event::{MouseButton, MouseEventKind};
@@ -276,7 +278,21 @@ pub fn run_unified(
                     break (action, app.capture_state());
                 }
                 if event::poll(Duration::from_millis(50))? {
-                    if let Event::Key(key) = event::read()? {
+                    let event = event::read()?;
+                    if let Event::Paste(text) = &event {
+                        #[cfg(feature = "workbench")]
+                        if fuzzy.is_open() {
+                            for ch in text.chars().filter(|ch| *ch != '\r' && *ch != '\n') {
+                                fuzzy.type_char(ch, &fuzzy_paths);
+                            }
+                        } else {
+                            app.paste_filter(text);
+                        }
+                        #[cfg(not(feature = "workbench"))]
+                        app.paste_filter(text);
+                        continue;
+                    }
+                    if let Event::Key(key) = event {
                         #[cfg(feature = "workbench")]
                         if fuzzy.is_open() {
                             match key.code {
@@ -321,11 +337,11 @@ pub fn run_unified(
                             // Ctrl+C is always destructive; q/Esc only when no
                             // overlay or filter owns that key.
                             if session.is_some() && destructive && (ctrl_c || !blocked_by_overlay) {
-                                if app.notice.is_some() && key.code == KeyCode::Char('q') {
-                                    // Second q: explicit discard, fall through.
+                                if app.notice.is_some() && destructive {
+                                    // Second destructive key: explicit discard.
                                 } else if app.notice.is_none() {
                                     app.notice = Some(
-                                        "live editor session: save unsaved buffers, then press q again to exit"
+                                        "live editor session: save unsaved buffers, then press q or Ctrl+C again to exit"
                                             .to_string(),
                                     );
                                     continue;
@@ -436,6 +452,7 @@ pub fn run_unified(
                         let mut focus = SplitFocus::Workbench;
                         let mut dragging = false;
                         let mut last_right = (0u16, 0u16);
+                        guard.set_mouse(true)?;
                         loop {
                             session.tick();
                             session.app.split = true;
@@ -472,6 +489,17 @@ pub fn run_unified(
                                 continue;
                             }
                             match event::read()? {
+                                Event::Paste(text) => {
+                                    if fuzzy.is_open() {
+                                        for ch in
+                                            text.chars().filter(|ch| *ch != '\r' && *ch != '\n')
+                                        {
+                                            fuzzy.type_char(ch, &fuzzy_paths);
+                                        }
+                                    } else if focus == SplitFocus::Workbench {
+                                        session.paste(&text);
+                                    }
+                                }
                                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                                     if fuzzy.is_open() {
                                         match key.code {
@@ -515,6 +543,13 @@ pub fn run_unified(
                                     match focus {
                                         SplitFocus::Files => match key.code {
                                             KeyCode::Char('q') => break,
+                                            KeyCode::Char('c')
+                                                if key
+                                                    .modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                break
+                                            }
                                             KeyCode::Char('[') => {
                                                 split_ratio = split_ratio.saturating_sub(2).max(20)
                                             }
@@ -562,6 +597,7 @@ pub fn run_unified(
                                 _ => {}
                             }
                         }
+                        guard.set_mouse(false)?;
                         tree_state = Some(tree);
                     }
 
@@ -628,7 +664,7 @@ impl TerminalGuard {
         enable_raw_mode()?;
 
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide) {
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -639,12 +675,24 @@ impl TerminalGuard {
                 let _ = execute!(
                     io::stdout(),
                     LeaveAlternateScreen,
+                    DisableBracketedPaste,
                     DisableMouseCapture,
                     Show
                 );
                 let _ = disable_raw_mode();
                 Err(error)
             }
+        }
+    }
+
+    /// Mouse reporting is only needed for the split divider. Leaving it off on
+    /// the dashboard keeps normal terminal drag-select/copy (Ctrl+C) working.
+    #[cfg(feature = "workbench")]
+    fn set_mouse(&mut self, enabled: bool) -> io::Result<()> {
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)
         }
     }
 }
@@ -657,6 +705,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
+            DisableBracketedPaste,
             DisableMouseCapture,
             Show
         );
@@ -883,6 +932,18 @@ impl<'a> App<'a> {
             Some(text) if !text.is_empty() => Some(text.as_str()),
             Some(_) => None,
             None => self.filter.as_deref(),
+        }
+    }
+
+    /// Append terminal bracketed-paste text to the live filter. Newlines are
+    /// stripped because a pasted multi-line path must not submit/move the list.
+    fn paste_filter(&mut self, text: &str) {
+        if let Some(buffer) = &mut self.filter_input {
+            for ch in text.chars().filter(|ch| *ch != '\r' && *ch != '\n') {
+                buffer.push(ch);
+            }
+            self.selected = 0;
+            self.rebuild();
         }
     }
 
@@ -2222,6 +2283,16 @@ mod tests {
             app.pending_edit.as_deref(),
             Some(std::path::Path::new(&selected))
         );
+    }
+
+    #[test]
+    fn pasted_filter_text_strips_newlines() {
+        let (result, report) = fixture();
+        let mut app = App::new(&result, &report);
+        press(&mut app, KeyCode::Char('/'));
+        app.paste_filter("alpha\r\n.rs");
+        assert_eq!(app.filter_input.as_deref(), Some("alpha.rs"));
+        assert_eq!(app.view.len(), 1);
     }
 
     #[test]
