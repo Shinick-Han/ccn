@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod model;
 pub mod p4;
 pub mod report;
+pub mod review;
 pub mod sarif;
 pub mod session;
 pub mod terminal;

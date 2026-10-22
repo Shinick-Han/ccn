@@ -6,6 +6,7 @@
 //! See `docs/workbench-spike.md`.
 
 mod pty;
+pub(crate) mod review_ui;
 mod rpc;
 mod tabs;
 mod ui;
@@ -1133,6 +1134,22 @@ impl WorkbenchSession {
         if let Err(error) = self.child.send(&bytes) {
             self.app
                 .set_status(format!("paste to editor failed: {error}"), true);
+        }
+    }
+
+    /// Jump the embedded editor to an absolute line and focus it. Used by the
+    /// baseline review panel.
+    pub(crate) fn jump_line(&mut self, line: usize) {
+        if self.app.rpc_status != RpcStatus::Live {
+            self.app
+                .set_status("jump needs a live RPC connection".to_string(), true);
+            return;
+        }
+        if let Some(handle) = &self.app.rpc {
+            handle.jump(line);
+            self.app.focus = Focus::Editor;
+            self.app
+                .set_status(format!("review jump -> line {line}"), false);
         }
     }
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.0 (2026-10-22)
+
+Baseline review panel plus terminal-input fixes.
+
+- **Baseline review (`F6`)** in the split: select a `--baseline <rev>`
+  change, `f` toggles current-file/all-files, `n/p` or `j/k` move, Enter opens
+  the owning tab and jumps to the function line. The panel shows added/worsened
+  counts, per-function `base -> ccn` delta and the first reason.
+- **Ctrl+C / Esc quit confirmation**: after the warning, a second Ctrl+C/Esc now
+  explicitly exits (previously only `q` could); Ctrl+C in the file tree hides
+  the split.
+- **Bracketed paste**: `Ctrl+V` is no longer forwarded to Neovim as `0x16`
+  (visual block); pasted text goes to the filter/fuzzy query, or to Neovim as a
+  real bracketed paste.
+- **Copy**: mouse reporting is enabled only inside the split, so dashboard
+  drag-select/copy works normally; use Shift+drag inside the split.
+- 492 lib + 17 CLI tests; clippy/fmt clean (default and lean).
+
 ## 0.10.0 (2026-10-22)
 
 The P1 IDE-feel slice: navigation, buffers and workspace restore.

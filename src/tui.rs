@@ -28,6 +28,8 @@ use std::time::Duration;
 #[cfg(feature = "workbench")]
 use crate::fuzzy::FuzzyState;
 #[cfg(feature = "workbench")]
+use crate::review::ReviewQueue;
+#[cfg(feature = "workbench")]
 use crate::tree::{Tree, TreeAction};
 use crossterm::cursor::{Hide, Show};
 #[cfg(feature = "workbench")]
@@ -237,6 +239,10 @@ pub fn run_unified(
     let mut split_ratio: u16 = saved.split_ratio;
     #[cfg(feature = "workbench")]
     let mut fuzzy = FuzzyState::new();
+    #[cfg(feature = "workbench")]
+    let mut review: Option<ReviewQueue> = None;
+    #[cfg(feature = "workbench")]
+    let mut review_current_only = false;
     #[cfg(feature = "workbench")]
     let mut tree_state: Option<Tree> = None;
     #[cfg(feature = "workbench")]
@@ -484,6 +490,24 @@ pub fn run_unified(
                                 if fuzzy.is_open() {
                                     crate::fuzzy::render(frame, frame.area(), &fuzzy, &fuzzy_paths);
                                 }
+                                if let (Some(queue), Some(base)) =
+                                    (&review, report.baseline.as_ref())
+                                {
+                                    frame.render_widget(Clear, right);
+                                    let title = queue.path_filter().map_or_else(
+                                        || format!("{} - all files", base.rev),
+                                        |path| format!("{} - {path}", base.rev),
+                                    );
+                                    crate::workbench::review_ui::render(
+                                        frame,
+                                        right,
+                                        queue.changes(),
+                                        queue.selected(),
+                                        true,
+                                        &title,
+                                        base.threshold,
+                                    );
+                                }
                             })?;
                             if !event::poll(Duration::from_millis(16))? {
                                 continue;
@@ -501,6 +525,75 @@ pub fn run_unified(
                                     }
                                 }
                                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                    if let Some(queue) = review.as_mut() {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::F(6) => review = None,
+                                            KeyCode::Char('j')
+                                            | KeyCode::Down
+                                            | KeyCode::Char('n') => queue.next(),
+                                            KeyCode::Char('k')
+                                            | KeyCode::Up
+                                            | KeyCode::Char('p') => queue.prev(),
+                                            KeyCode::Char('g') | KeyCode::Home => queue.select(0),
+                                            KeyCode::Char('G') | KeyCode::End => {
+                                                queue.select(queue.len().saturating_sub(1))
+                                            }
+                                            KeyCode::Char('f') => {
+                                                if let Some(base) = report.baseline.as_ref() {
+                                                    review_current_only = !review_current_only;
+                                                    let active = relative_to_root(
+                                                        &result.root,
+                                                        &session.app.target,
+                                                    );
+                                                    let filter = if review_current_only {
+                                                        active.as_deref()
+                                                    } else {
+                                                        None
+                                                    };
+                                                    *queue =
+                                                        ReviewQueue::new(&base.changes, filter);
+                                                }
+                                            }
+                                            KeyCode::Enter => {
+                                                if let Some(change) =
+                                                    queue.selected_change().cloned()
+                                                {
+                                                    let target =
+                                                        Path::new(&result.root).join(&change.path);
+                                                    let active = relative_to_root(
+                                                        &result.root,
+                                                        &session.app.target,
+                                                    );
+                                                    if active.as_deref()
+                                                        != Some(change.path.as_str())
+                                                    {
+                                                        if let Err(error) =
+                                                            session.open_file(&target)
+                                                        {
+                                                            eprintln!("ccn: {error}");
+                                                        }
+                                                    }
+                                                    session.jump_line(change.line);
+                                                    review = None;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if key.code == KeyCode::F(6) {
+                                        if let Some(base) = report.baseline.as_ref() {
+                                            let active =
+                                                relative_to_root(&result.root, &session.app.target);
+                                            let filter = if review_current_only {
+                                                active.as_deref()
+                                            } else {
+                                                None
+                                            };
+                                            review = Some(ReviewQueue::new(&base.changes, filter));
+                                        }
+                                        continue;
+                                    }
                                     if fuzzy.is_open() {
                                         match key.code {
                                             KeyCode::Esc => fuzzy.close(),
