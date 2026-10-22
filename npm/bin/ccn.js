@@ -35,6 +35,22 @@ if (!fs.existsSync(binary)) {
   process.exit(1);
 }
 
+// npm pack on Windows stores `vendor/ccn` as 0644, and npm does not chmod
+// files under a package's `files` list. Repair the executable bit before the
+// first spawn (npx caches are writable; a read-only install still gets a clear
+// EACCES error instead of a silent no-op).
+if (process.platform !== "win32") {
+  try {
+    fs.accessSync(binary, fs.constants.X_OK);
+  } catch (_) {
+    try {
+      fs.chmodSync(binary, 0o755);
+    } catch (_) {
+      // Let spawnSync report the permission error with its normal message.
+    }
+  }
+}
+
 const result = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });
 
 if (result.error) {

@@ -11,18 +11,28 @@
 # resumed with a fresh code.
 
 param(
-    [string]$Otp = ""
+    [string]$Otp = "",
+    [switch]$Check
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $version = (Get-Content (Join-Path $root 'package.json') -Raw | ConvertFrom-Json).version
 
+if ($Check) {
+    node (Join-Path $root 'verify-release.js')
+    exit $LASTEXITCODE
+}
+
 $user = npm whoami 2>$null
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($user)) {
     throw "npm is not logged in. Run 'npm login' and complete the browser/OTP step, then 'npm whoami'."
 }
 Write-Host "npm user: $user (target $version)"
+
+if ([string]::IsNullOrWhiteSpace($Otp) -and [Console]::IsInputRedirected) {
+    throw "This shell cannot answer npm's OTP prompt. Pass a fresh code: pwsh -File npm/publish.ps1 -Otp 123456"
+}
 
 $otpArgs = @()
 if (-not [string]::IsNullOrWhiteSpace($Otp)) {
@@ -59,10 +69,10 @@ foreach ($dir in $targets) {
         throw "$name has no vendor/ - run 'node npm/prepare.js' first"
     }
 
-    Write-Host "publishing $name@$version"
+    Write-Host "publishing $name@$version (npm may prompt for a fresh OTP)"
     Push-Location $dir
     try {
-        npm publish --access public @otpArgs
+        npm publish --access public --fetch-timeout=120000 @otpArgs
         if ($LASTEXITCODE -ne 0) { throw "npm publish failed for $name" }
     } finally {
         Pop-Location
@@ -96,4 +106,8 @@ if ($pending.Count -gt 0) {
 
 Write-Host ""
 Write-Host "published and verified: $($published -join ', ')"
+node (Join-Path $root 'verify-release.js')
+if ($LASTEXITCODE -ne 0) {
+    throw "registry verification failed"
+}
 Write-Host "verify: npx @shinick/ccn@$version --version"
