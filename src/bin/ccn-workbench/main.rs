@@ -6,12 +6,16 @@
 //! See `docs/workbench-spike.md`.
 
 mod pty;
+mod rpc;
 mod ui;
 
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -27,6 +31,7 @@ use ccn::loc::{scan, ScanOptions};
 use ccn::model::{CcnSkip, FileLoc};
 
 use pty::Pty;
+use rpc::{LiveSnapshot, RpcEvent, RpcHandle, RpcStatus};
 
 /// Re-scan the open file at most this often.
 const MTIME_INTERVAL: Duration = Duration::from_millis(500);
@@ -68,6 +73,18 @@ struct Cli {
     /// Type Korean through the PTY into Neovim, save, and assert the bytes.
     #[arg(long)]
     smoke_utf8: bool,
+
+    /// Prove the RPC path: connect, snapshot, annotate, dump extmarks.
+    #[arg(long)]
+    smoke_rpc: bool,
+
+    /// Edit through the PTY without saving and assert the live CCN changed.
+    #[arg(long)]
+    smoke_rpc_edit: bool,
+
+    /// Disable Neovim RPC; use mtime polling only.
+    #[arg(long)]
+    no_rpc: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +158,40 @@ impl FileView {
     }
 }
 
+/// One live-buffer function plus its delta against the initial scan.
+pub(crate) struct LiveRow {
+    pub function: FunctionCcn,
+    /// `+n` new (delta starts at 0), `+n` worsened, `-n` improved, `0` same.
+    pub delta: i64,
+    pub is_new: bool,
+}
+
+/// Live RPC snapshot prepared for rendering.
+pub(crate) struct LiveView {
+    pub name: String,
+    pub tier: CcnTier,
+    pub functions: Vec<LiveRow>,
+    pub sum: u32,
+    pub max: u32,
+    pub changedtick: i64,
+    pub base_tick: i64,
+    pub read_ms: f64,
+}
+
+impl LiveView {
+    pub(crate) fn unsaved(&self) -> bool {
+        self.changedtick != self.base_tick
+    }
+
+    /// Sum of all positive changes, counting new functions from zero.
+    pub(crate) fn positive_delta(&self) -> u32 {
+        self.functions
+            .iter()
+            .map(|row| row.delta.max(0) as u32)
+            .sum()
+    }
+}
+
 /// All mutable workbench state. Rendering gets an immutable borrow, so input
 /// handling is the only place that changes it.
 pub(crate) struct App {
@@ -156,6 +207,16 @@ pub(crate) struct App {
     status_error: bool,
     pub exited: Option<String>,
     mtime: Option<SystemTime>,
+    /// Initial file scan, frozen for the session; deltas compare against this.
+    pub initial: Vec<FunctionCcn>,
+    pub live: Option<LiveView>,
+    pub rpc_status: RpcStatus,
+    pub rpc_read_ms: Option<f64>,
+    pub rpc_note: Option<String>,
+    rpc: Option<RpcHandle>,
+    rpc_rx: Option<Receiver<RpcEvent>>,
+    pub child_alive: Arc<AtomicBool>,
+    pub rpc_disabled: bool,
 }
 
 impl App {
@@ -173,13 +234,238 @@ impl App {
             status_error: false,
             exited: None,
             mtime: None,
+            initial: Vec::new(),
+            live: None,
+            rpc_status: RpcStatus::Off,
+            rpc_read_ms: None,
+            rpc_note: None,
+            rpc: None,
+            rpc_rx: None,
+            child_alive: Arc::new(AtomicBool::new(true)),
+            rpc_disabled: false,
         };
         app.rescan("scan");
+        app.initial = app
+            .view
+            .as_ref()
+            .map_or_else(Vec::new, |view| view.functions.clone());
         app
     }
 
     fn function_count(&self) -> usize {
-        self.view.as_ref().map_or(0, |view| view.functions.len())
+        if self.live_mode() {
+            self.live.as_ref().map_or(0, |live| live.functions.len())
+        } else {
+            self.view.as_ref().map_or(0, |view| view.functions.len())
+        }
+    }
+
+    pub(crate) fn live_mode(&self) -> bool {
+        self.rpc_status == RpcStatus::Live && self.live.is_some()
+    }
+
+    pub(crate) fn rpc_label(&self) -> String {
+        match self.rpc_status {
+            RpcStatus::Connecting => "rpc connecting".to_string(),
+            RpcStatus::Live => match self.rpc_read_ms {
+                Some(ms) => format!("rpc live ({ms:.0} ms)"),
+                None => "rpc live".to_string(),
+            },
+            RpcStatus::Off if self.rpc_disabled => "rpc off (disabled)".to_string(),
+            RpcStatus::Off => "rpc off".to_string(),
+        }
+    }
+
+    pub(crate) fn unsaved(&self) -> bool {
+        self.live_mode() && self.live.as_ref().is_some_and(LiveView::unsaved)
+    }
+
+    pub(crate) fn delta_sum(&self) -> Option<u32> {
+        self.live.as_ref().map(LiveView::positive_delta)
+    }
+
+    /// Start the RPC worker after the editor is spawned. The baseline is the
+    /// initial file scan captured in `App::new`.
+    pub(crate) fn start_rpc(&mut self, address: String) {
+        let baseline = self.initial.clone();
+        let alive = Arc::clone(&self.child_alive);
+        match rpc::spawn(address, self.target.clone(), baseline, alive) {
+            Ok((handle, rx)) => {
+                self.rpc = Some(handle);
+                self.rpc_rx = Some(rx);
+                self.rpc_status = RpcStatus::Connecting;
+            }
+            Err(e) => {
+                self.rpc_status = RpcStatus::Off;
+                self.rpc_note = Some(e);
+            }
+        }
+    }
+
+    pub(crate) fn shutdown_rpc(&mut self) {
+        self.child_alive.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.rpc.take() {
+            handle.shutdown();
+        }
+        self.rpc_rx = None;
+    }
+
+    /// Drain worker events without blocking the crossterm loop.
+    pub(crate) fn poll_rpc(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.rpc_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for event in events {
+            match event {
+                RpcEvent::Status(status) => {
+                    let was_live = self.rpc_status == RpcStatus::Live;
+                    self.rpc_status = status;
+                    if status == RpcStatus::Live {
+                        self.rpc_note = None;
+                    }
+                    if was_live && status != RpcStatus::Live {
+                        self.live = None;
+                        self.rpc_read_ms = None;
+                        self.rescan("rpc off → rescan");
+                    }
+                }
+                RpcEvent::Snapshot(snapshot) => self.apply_snapshot(snapshot),
+                RpcEvent::Note(note) => self.rpc_note = Some(note),
+            }
+        }
+        if disconnected {
+            let was_live = self.rpc_status == RpcStatus::Live;
+            self.rpc_status = RpcStatus::Off;
+            self.rpc_rx = None;
+            self.live = None;
+            self.rpc_read_ms = None;
+            if was_live {
+                self.rescan("rpc closed → rescan");
+            }
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: LiveSnapshot) {
+        if let Some(error) = snapshot.error {
+            // Keep the last good sidebar; surface the failure instead.
+            self.rpc_note = Some(error);
+            return;
+        }
+        let Some(tier) = snapshot.tier else {
+            return;
+        };
+        let baseline = rpc::baseline_map(&self.initial);
+        let mut rows: Vec<LiveRow> = snapshot
+            .functions
+            .iter()
+            .map(|function| {
+                let key = rpc::function_key(function);
+                let delta = baseline
+                    .get(&key)
+                    .map_or(i64::from(function.ccn), |before| {
+                        i64::from(function.ccn) - i64::from(*before)
+                    });
+                LiveRow {
+                    function: function.clone(),
+                    delta,
+                    is_new: !baseline.contains_key(&key),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.function
+                .ccn
+                .cmp(&a.function.ccn)
+                .then_with(|| a.function.line.cmp(&b.function.line))
+        });
+
+        let previously_selected = self.selected_key();
+        if let Some(key) = previously_selected {
+            if let Some(index) = rows
+                .iter()
+                .position(|row| rpc::function_key(&row.function) == key)
+            {
+                self.selected = index;
+            }
+        }
+        self.selected = self.selected.min(rows.len().saturating_sub(1));
+        self.rpc_read_ms = Some(snapshot.read_ms);
+        let display_name = Path::new(&snapshot.name)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| snapshot.name.clone());
+        self.live = Some(LiveView {
+            name: display_name,
+            tier,
+            functions: rows,
+            sum: snapshot.sum,
+            max: snapshot.max,
+            changedtick: snapshot.changedtick,
+            base_tick: snapshot.base_tick,
+            read_ms: snapshot.read_ms,
+        });
+    }
+
+    fn selected_key(&self) -> Option<String> {
+        if self.live_mode() {
+            self.live
+                .as_ref()?
+                .functions
+                .get(self.selected)
+                .map(|row| rpc::function_key(&row.function))
+        } else {
+            let view = self.view.as_ref()?;
+            view.functions.get(self.selected).map(rpc::function_key)
+        }
+    }
+
+    fn selected_line(&self) -> Option<usize> {
+        if self.live_mode() {
+            self.live
+                .as_ref()?
+                .functions
+                .get(self.selected)
+                .map(|row| row.function.line)
+        } else {
+            self.view
+                .as_ref()?
+                .functions
+                .get(self.selected)
+                .map(|function| function.line)
+        }
+    }
+
+    /// Sidebar Enter/o: ask the worker to move Neovim's cursor, then focus the
+    /// editor. Without a live connection this is a status message only.
+    fn jump_selected(&mut self) {
+        if self.rpc_status != RpcStatus::Live {
+            self.set_status(
+                "jump needs a live RPC connection (rpc off/connecting)".to_string(),
+                true,
+            );
+            return;
+        }
+        let Some(line) = self.selected_line() else {
+            return;
+        };
+        let Some(handle) = &self.rpc else {
+            self.set_status("jump needs a live RPC connection".to_string(), true);
+            return;
+        };
+        handle.jump(line);
+        self.focus = Focus::Editor;
+        self.set_status(format!("jump → line {line}"), false);
     }
 
     pub(crate) fn grade(&self) -> (char, &'static str) {
@@ -197,14 +483,6 @@ impl App {
             11..=20 => ('C', "elevated"),
             21..=50 => ('D', "high"),
             _ => ('E', "very high"),
-        }
-    }
-
-    pub(crate) fn scan_label(&self) -> String {
-        if self.scan_error.is_some() {
-            "scan error".to_string()
-        } else {
-            format!("scan ok · {} ms", self.scan_ms)
         }
     }
 
@@ -343,6 +621,12 @@ fn main() -> ExitCode {
     if cli.smoke_utf8 {
         return report_smoke(run_smoke_utf8(&cli));
     }
+    if cli.smoke_rpc {
+        return report_smoke(run_smoke_rpc(&cli, false));
+    }
+    if cli.smoke_rpc_edit {
+        return report_smoke(run_smoke_rpc(&cli, true));
+    }
     match run_workbench(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -387,7 +671,20 @@ fn run_workbench(cli: &Cli) -> Result<(), String> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.clone());
+
+    let rpc_address = if rpc::is_nvim_program(&program) && !cli.no_rpc {
+        match rpc::free_listen_address() {
+            Ok(address) => Some(address),
+            Err(e) => {
+                eprintln!("ccn-workbench: RPC disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut app = App::new(target.clone(), display_path(&target), label);
+    app.rpc_disabled = rpc_address.is_none();
 
     terminal::enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
     execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)
@@ -412,6 +709,10 @@ fn run_workbench(cli: &Cli) -> Result<(), String> {
     let editor_rect = ui::editor_inner(ui::layout(Rect::new(0, 0, size.width, size.height)).editor);
     let cwd = target.parent().unwrap_or_else(|| Path::new("."));
     let mut editor_args = editor[1..].to_vec();
+    if let Some(address) = &rpc_address {
+        editor_args.push("--listen".to_string());
+        editor_args.push(address.clone());
+    }
     editor_args.push(native_path(&target));
     let mut child = match Pty::spawn(
         &program,
@@ -429,9 +730,13 @@ fn run_workbench(cli: &Cli) -> Result<(), String> {
             ));
         }
     };
+    if let Some(address) = rpc_address {
+        app.start_rpc(address);
+    }
 
     let loop_result = event_loop(&mut terminal, &mut app, &mut child);
 
+    app.shutdown_rpc();
     let exit_note = app.exited.clone();
     let screen_text = child.screen_text();
     child.kill();
@@ -462,10 +767,12 @@ fn event_loop(
 ) -> Result<(), String> {
     let mut last_mtime_check = Instant::now();
     loop {
+        app.poll_rpc();
         if event::poll(Duration::from_millis(16)).map_err(|e| format!("poll failed: {e}"))? {
             match event::read().map_err(|e| format!("read event failed: {e}"))? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if handle_key(app, child, key) {
+                        app.shutdown_rpc();
                         return Ok(());
                     }
                 }
@@ -487,6 +794,8 @@ fn event_loop(
                     ""
                 };
                 app.exited = Some(note.clone());
+                app.child_alive.store(false, Ordering::Relaxed);
+                app.shutdown_rpc();
                 app.set_status(
                     format!("[editor exited: {note}]{hint} — F10 quits"),
                     note != "exit 0" || empty,
@@ -494,7 +803,8 @@ fn event_loop(
             }
         }
 
-        if last_mtime_check.elapsed() >= MTIME_INTERVAL {
+        // RPC live is the source of truth; mtime polling is only the fallback.
+        if !app.live_mode() && last_mtime_check.elapsed() >= MTIME_INTERVAL {
             last_mtime_check = Instant::now();
             app.check_mtime();
         }
@@ -553,6 +863,7 @@ fn handle_key(app: &mut App, child: &mut Pty, key: KeyEvent) -> bool {
                 KeyCode::Char('g') | KeyCode::Home => app.select_first(),
                 KeyCode::Char('G') | KeyCode::End => app.select_last(),
                 KeyCode::Char('r') => app.rescan("manual rescan"),
+                KeyCode::Enter | KeyCode::Char('o') => app.jump_selected(),
                 KeyCode::Esc => app.toggle_focus(),
                 _ => {}
             }
@@ -821,6 +1132,198 @@ fn run_smoke_utf8(cli: &Cli) -> Result<(), String> {
     } else {
         Err("the saved file does not contain the Korean text".to_string())
     }
+}
+
+/// `--smoke-rpc` / `--smoke-rpc-edit`: prove the msgpack-RPC path without the
+/// workbench UI. Pure RPC calls only, so the same binary works on 0.8 and 0.12.
+fn run_smoke_rpc(cli: &Cli, edit: bool) -> Result<(), String> {
+    let temp = TempDir::new()?;
+    let file = temp.path.join("ccn_workbench_rpc.c");
+    let source = "int simple(int x) {\n    return x;\n}\n\nint branchy(int x) {\n    if (x > 0) {\n        return 1;\n    }\n    return 0;\n}\n";
+    fs::write(&file, source).map_err(|e| format!("cannot write the RPC smoke file: {e}"))?;
+
+    let parts = pty::parse_command(&cli.editor)?;
+    let program = parts[0].clone();
+    if !pty::program_available(&program) {
+        println!("skip: editor not found: {program} (install Neovim or pass --editor \"<cmd>\")");
+        return Ok(());
+    }
+    if !rpc::is_nvim_program(&program) {
+        return Err(format!("--smoke-rpc requires Neovim, got {program}"));
+    }
+    let address = rpc::free_listen_address()?;
+    let mut args = parts[1..].to_vec();
+    args.push("--listen".to_string());
+    args.push(address.clone());
+    args.push(native_path(&file));
+    let mut child = Pty::spawn(&program, &args, &temp.path, 30, 100)?;
+
+    let result = smoke_rpc_session(&address, &file, &mut child, edit);
+    child.kill();
+    result
+}
+
+fn smoke_rpc_session(
+    address: &str,
+    file: &Path,
+    child: &mut Pty,
+    edit: bool,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the smoke runtime: {e}"))?;
+    let (nvim, io) = smoke_connect(&runtime, address)?;
+
+    let started = Instant::now();
+    let snapshot = smoke_snapshot(&runtime, &nvim, file)?;
+    println!("buffer: {}", snapshot.name);
+    println!("namespace: {}", rpc::NAMESPACE);
+    println!(
+        "tier: {}",
+        snapshot.tier.map_or("n/a", ccn::ccn::CcnTier::as_str)
+    );
+    println!("functions: {}", snapshot.functions.len());
+    println!("sum: {}  max: {}", snapshot.sum, snapshot.max);
+    println!("read_ms: {:.2}", snapshot.read_ms);
+    println!("changedtick: {}", snapshot.changedtick);
+    if snapshot.functions.len() != 2 {
+        io.abort();
+        return Err(format!(
+            "expected 2 functions, got {}",
+            snapshot.functions.len()
+        ));
+    }
+
+    let mut live = snapshot.clone();
+    if edit {
+        let disk_before =
+            fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+        smoke_send_text(child, "ji")?;
+        smoke_send_text(child, "if (x) x++;")?;
+        child
+            .send(b"\x1b")
+            .map_err(|e| format!("cannot send Esc: {e}"))?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut changed = None;
+        while Instant::now() < deadline {
+            let next = runtime.block_on(rpc::read_snapshot(&nvim, file, snapshot.changedtick));
+            if next.error.is_none()
+                && next.changedtick != snapshot.changedtick
+                && next.sum > snapshot.sum
+            {
+                changed = Some(next);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let Some(next) = changed else {
+            io.abort();
+            return Err(format!(
+                "live CCN did not increase after typing (tick {} -> ?, sum {}); screen tail: {:?}",
+                snapshot.changedtick,
+                snapshot.sum,
+                screen_tail(&child.screen_text(), 6)
+            ));
+        };
+        let disk_after =
+            fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+        if disk_before != disk_after {
+            io.abort();
+            return Err(
+                "the PTY edit reached the file on disk; :w should not have run".to_string(),
+            );
+        }
+        println!(
+            "edit: changedtick {} -> {}  sum {} -> {} (disk unchanged)",
+            snapshot.changedtick, next.changedtick, snapshot.sum, next.sum
+        );
+        live = next;
+    }
+
+    let baseline = rpc::baseline_map(&snapshot.functions);
+    let placed = runtime.block_on(rpc::annotate(&nvim, &live.functions, &baseline))?;
+    let marks = runtime.block_on(rpc::dump_marks(&nvim))?;
+    println!("extmarks placed: {placed}  dumped: {}", marks.len());
+    for mark in &marks {
+        println!("  row={} hl={} text={:?}", mark.row, mark.hl, mark.text);
+    }
+    let expected = live.functions.len();
+    if placed != expected || marks.len() != expected {
+        io.abort();
+        return Err(format!(
+            "expected {expected} extmarks, placed {placed}, dumped {}",
+            marks.len()
+        ));
+    }
+    if marks.iter().any(|mark| !mark.text.contains("CCN")) {
+        io.abort();
+        return Err("an extmark is missing its CCN virtual text".to_string());
+    }
+
+    io.abort();
+    println!(
+        "elapsed_ms: {:.1}",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    if edit {
+        println!("smoke-rpc-edit ok");
+    } else {
+        println!("smoke-rpc ok");
+    }
+    Ok(())
+}
+
+fn smoke_connect(
+    runtime: &tokio::runtime::Runtime,
+    address: &str,
+) -> Result<(rpc::Rpc, rpc::IoTask), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match runtime.block_on(rpc::connect(address)) {
+            Ok(pair) => return Ok(pair),
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("cannot connect to {address}: {e}")),
+        }
+    }
+}
+
+fn smoke_snapshot(
+    runtime: &tokio::runtime::Runtime,
+    nvim: &rpc::Rpc,
+    file: &Path,
+) -> Result<LiveSnapshot, String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = runtime.block_on(rpc::read_snapshot(nvim, file, 0));
+        if snapshot.error.is_none() && !snapshot.name.is_empty() {
+            return Ok(snapshot);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no live snapshot after 10 s: {}",
+                snapshot
+                    .error
+                    .unwrap_or_else(|| "unknown error".to_string())
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn smoke_send_text(child: &mut Pty, text: &str) -> Result<(), String> {
+    for ch in text.chars() {
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+        let bytes = encode_key(&key).ok_or_else(|| format!("cannot encode smoke key {ch:?}"))?;
+        child
+            .send(&bytes)
+            .map_err(|e| format!("cannot send smoke key {ch:?}: {e}"))?;
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Ok(())
 }
 
 fn screen_tail(text: &str, count: usize) -> Vec<String> {

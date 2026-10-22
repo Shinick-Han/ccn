@@ -13,7 +13,7 @@ use ratatui::Frame;
 use tui_term::widget::PseudoTerminal;
 use vt100::Screen;
 
-use crate::{App, Focus};
+use crate::{App, Focus, RpcStatus};
 
 /// Named regions of the workbench, recomputed on every resize.
 pub struct LayoutRects {
@@ -67,7 +67,7 @@ pub fn render(frame: &mut Frame, app: &App, screen: &Screen) {
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let view = app.view.as_ref();
-    let path = Line::from(vec![
+    let mut path_spans = vec![
         Span::styled(
             " ccn workbench",
             Style::default()
@@ -81,47 +81,85 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled("   ", Style::default()),
         Span::styled(
-            app.scan_label(),
-            Style::default().fg(if app.scan_error.is_some() {
-                AURA.danger
-            } else {
-                AURA.ok
+            app.rpc_label(),
+            Style::default().fg(match app.rpc_status {
+                RpcStatus::Live => AURA.ok,
+                RpcStatus::Connecting => AURA.warn,
+                RpcStatus::Off => AURA.muted,
             }),
         ),
-    ]);
-
-    let summary = match view {
-        Some(v) => match (v.tier, v.count) {
-            (_, 0) if v.file_ccn.is_some() => Line::from(format!(
-                " {} · {} LOC (total {}) · file CCN {} (heuristic)",
-                v.lang,
-                v.loc,
-                v.loc_total,
-                v.file_ccn.unwrap_or_default()
-            )),
-            (Some(tier), count) => Line::from(format!(
-                " {} · {} LOC (total {}) · {} functions · CCN max {} · p90 {} · sum {} · tier {}",
-                v.lang,
-                v.loc,
-                v.loc_total,
-                count,
-                v.max,
-                v.p90,
-                v.sum,
-                tier.as_str()
-            )),
-            (None, _) => Line::from(format!(
-                " {} · {} LOC (total {}) · no function CCN ({})",
-                v.lang,
-                v.loc,
-                v.loc_total,
-                v.skip_label()
-            )),
-        },
-        None => Line::from(Span::styled(
-            " no scan result yet",
+    ];
+    if app.unsaved() {
+        path_spans.push(Span::styled(
+            "  unsaved ",
+            Style::default()
+                .fg(AURA.canvas)
+                .bg(AURA.warn)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if app.rpc_status == RpcStatus::Off && !app.rpc_disabled {
+        path_spans.push(Span::styled(
+            "  (mtime fallback)",
             Style::default().fg(AURA.muted),
-        )),
+        ));
+    }
+    let path = Line::from(path_spans);
+
+    let summary = if let (true, Some(live)) = (app.live_mode(), app.live.as_ref()) {
+        let loc = view.as_ref().map_or(0, |v| v.loc);
+        let initial = app.initial.len();
+        let count = if live.functions.len() == initial {
+            format!("{} functions live", live.functions.len())
+        } else {
+            format!(
+                "{} functions live (initial {initial})",
+                live.functions.len()
+            )
+        };
+        Line::from(format!(
+            " {} · {} LOC · {} · CCN max {} · sum {} · tier {}",
+            view.map_or(live.name.as_str(), |v| v.lang.as_str()),
+            loc,
+            count,
+            live.max,
+            live.sum,
+            live.tier.as_str()
+        ))
+    } else {
+        match view {
+            Some(v) => match (v.tier, v.count) {
+                (_, 0) if v.file_ccn.is_some() => Line::from(format!(
+                    " {} · {} LOC (total {}) · file CCN {} (heuristic)",
+                    v.lang,
+                    v.loc,
+                    v.loc_total,
+                    v.file_ccn.unwrap_or_default()
+                )),
+                (Some(tier), count) => Line::from(format!(
+                    " {} · {} LOC (total {}) · {} functions · CCN max {} · p90 {} · sum {} · tier {}",
+                    v.lang,
+                    v.loc,
+                    v.loc_total,
+                    count,
+                    v.max,
+                    v.p90,
+                    v.sum,
+                    tier.as_str()
+                )),
+                (None, _) => Line::from(format!(
+                    " {} · {} LOC (total {}) · no function CCN ({})",
+                    v.lang,
+                    v.loc,
+                    v.loc_total,
+                    v.skip_label()
+                )),
+            },
+            None => Line::from(Span::styled(
+                " no scan result yet",
+                Style::default().fg(AURA.muted),
+            )),
+        }
     };
     let summary = summary.style(Style::default().fg(AURA.muted));
 
@@ -141,6 +179,20 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Style::default().fg(AURA.muted),
     ));
+    if let Some(delta) = app.delta_sum() {
+        status_spans.push(Span::styled(
+            format!("  Δ +{delta}"),
+            Style::default()
+                .fg(if delta > 0 { AURA.warn } else { AURA.ok })
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(note) = &app.rpc_note {
+        status_spans.push(Span::styled(
+            format!("  rpc: {note}"),
+            Style::default().fg(AURA.danger),
+        ));
+    }
     if let Some(note) = &app.exited {
         status_spans.push(Span::styled(
             format!("  [editor exited: {note}]"),
@@ -205,16 +257,27 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         AURA.border
     };
+    let live = app.live_mode();
     let title = if focused {
         Line::from(vec![
             Span::styled(" functions ", Style::default().fg(AURA.accent)),
-            Span::styled("· F9 back ", Style::default().fg(AURA.muted)),
+            Span::styled(
+                if live {
+                    "· live · F9 back "
+                } else {
+                    "· F9 back "
+                },
+                Style::default().fg(AURA.muted),
+            ),
         ])
     } else {
-        Line::from(Span::styled(
-            " functions ",
-            Style::default().fg(AURA.accent),
-        ))
+        Line::from(vec![
+            Span::styled(" functions ", Style::default().fg(AURA.accent)),
+            Span::styled(
+                if live { "· live " } else { "" },
+                Style::default().fg(AURA.ok),
+            ),
+        ])
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -230,10 +293,61 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let [summary_area, list_area] =
         Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(inner);
 
-    let summary = match &app.view {
-        Some(v) => {
+    let initial = app.initial.len();
+    let summary = match (&app.live, &app.view) {
+        (Some(live), view) => {
             let mut lines = vec![Line::from(Span::styled(
-                format!(" {} · {} LOC", v.name, v.loc,),
+                format!(
+                    " {} · {} LOC",
+                    live.name,
+                    view.as_ref().map_or(0, |v| v.loc)
+                ),
+                Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
+            ))];
+            let count = if live.functions.len() == initial {
+                format!("{} functions live", live.functions.len())
+            } else {
+                format!(
+                    "{} functions live (initial {initial})",
+                    live.functions.len()
+                )
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {count} · max {} · sum {} · {:.0} ms",
+                    live.max, live.sum, live.read_ms
+                ),
+                Style::default().fg(AURA.muted),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" tier {} · grade {} · ", live.tier.as_str(), app.grade().0),
+                    Style::default().fg(AURA.muted),
+                ),
+                Span::styled(
+                    format!("Δ +{}", live.positive_delta()),
+                    Style::default()
+                        .fg(if live.positive_delta() > 0 {
+                            AURA.warn
+                        } else {
+                            AURA.ok
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                if live.unsaved() {
+                    " unsaved buffer · +new ~worse -better"
+                } else {
+                    " saved buffer · +new ~worse -better"
+                },
+                Style::default().fg(AURA.pill),
+            )));
+            Paragraph::new(lines).style(Style::default().bg(AURA.card))
+        }
+        (None, Some(v)) => {
+            let mut lines = vec![Line::from(Span::styled(
+                format!(" {} · {} LOC", v.name, v.loc),
                 Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
             ))];
             lines.push(Line::from(Span::styled(
@@ -256,12 +370,17 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(AURA.muted),
             )));
             lines.push(Line::from(Span::styled(
-                " sorted by CCN · identity below name",
+                match app.rpc_status {
+                    RpcStatus::Connecting => " rpc connecting · initial scan",
+                    RpcStatus::Off if app.rpc_disabled => " rpc off · mtime refresh",
+                    RpcStatus::Off => " rpc off · mtime refresh",
+                    RpcStatus::Live => " live snapshot pending",
+                },
                 Style::default().fg(AURA.pill),
             )));
             Paragraph::new(lines).style(Style::default().bg(AURA.card))
         }
-        None => Paragraph::new(vec![Line::from(Span::styled(
+        (None, None) => Paragraph::new(vec![Line::from(Span::styled(
             match &app.scan_error {
                 Some(err) => format!(" scan failed: {err}"),
                 None => " no file data".to_string(),
@@ -272,15 +391,16 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(summary, summary_area);
 
-    let functions = app
-        .view
-        .as_ref()
-        .map_or(&[][..], |view| view.functions.as_slice());
-    if functions.is_empty() {
-        let reason = app
-            .view
-            .as_ref()
-            .map_or(" no functions", |view| view.skip_label());
+    let live_rows = app.live.as_ref().filter(|_| live);
+    let scan_rows = app.view.as_ref().filter(|_| !live);
+    let count =
+        live_rows.map_or(0, |l| l.functions.len()) + scan_rows.map_or(0, |v| v.functions.len());
+    if count == 0 {
+        let reason = match (&app.live, &app.view) {
+            (Some(_), _) if live => " no functions in the live buffer",
+            (_, Some(view)) => view.skip_label(),
+            _ => " no functions",
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" {reason}"),
@@ -295,27 +415,59 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let rows_per_function = 2u16;
     let visible = (list_area.height / rows_per_function).max(1) as usize;
     let start = (app.selected / visible) * visible;
-    let end = (start + visible).min(functions.len());
+    let end = (start + visible).min(count);
 
     let mut lines: Vec<Line> = Vec::new();
-    for (index, function) in functions.iter().enumerate().take(end).skip(start) {
+    for index in start..end {
         let selected = index == app.selected;
         let bg = if selected { AURA.pill } else { AURA.card };
-        let marker = if selected { "▸" } else { " " };
+        let select = if selected { "▸" } else { " " };
+        let (line_no, ccn, name, identity, delta) = if let Some(live) = live_rows {
+            match live.functions.get(index) {
+                Some(row) => (
+                    row.function.line,
+                    row.function.ccn,
+                    row.function.name.clone(),
+                    row.function.identity.clone(),
+                    delta_text(row),
+                ),
+                None => continue,
+            }
+        } else if let Some(view) = scan_rows {
+            match view.functions.get(index) {
+                Some(function) => (
+                    function.line,
+                    function.ccn,
+                    function.name.clone(),
+                    function.identity.clone(),
+                    String::new(),
+                ),
+                None => continue,
+            }
+        } else {
+            continue;
+        };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{marker}{:>4} ", function.line),
+                format!("{select}{line_no:>4} "),
                 Style::default().fg(AURA.muted).bg(bg),
             ),
             Span::styled(
-                format!("{:>3} ", function.ccn),
+                format!("{ccn:>3} "),
                 Style::default()
-                    .fg(ccn_color(function.ccn))
+                    .fg(ccn_color(ccn))
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                function.name.clone(),
+                format!("{delta:>4} "),
+                Style::default()
+                    .fg(delta_color(&delta))
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                name,
                 Style::default()
                     .fg(if selected { AURA.accent } else { AURA.text })
                     .bg(bg)
@@ -327,7 +479,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("      {} ", function.identity),
+            format!("      {identity} "),
             Style::default().fg(AURA.muted).bg(bg),
         )));
     }
@@ -338,24 +490,53 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Compact delta column: `+n` new, `~n` worsened, `-n` improved.
+fn delta_text(row: &crate::LiveRow) -> String {
+    if row.is_new {
+        format!("+{}", row.delta.max(0))
+    } else if row.delta > 0 {
+        format!("~{}", row.delta)
+    } else if row.delta < 0 {
+        format!("-{}", row.delta.unsigned_abs())
+    } else {
+        String::new()
+    }
+}
+
+fn delta_color(delta: &str) -> Color {
+    match delta.chars().next() {
+        Some('+') => AURA.danger,
+        Some('~') => AURA.warn,
+        Some('-') => AURA.ok,
+        _ => AURA.muted,
+    }
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let keys = match app.focus {
         Focus::Editor => {
             " F10 quit · F9 focus sidebar · typing goes to the editor · r rescans in the sidebar "
         }
-        Focus::Sidebar => " F10 quit · F9 back to editor · j/k move · g/G top/bottom · r rescan ",
+        Focus::Sidebar => " F10 quit · F9 back · Enter/o jump · j/k move · g/G · r rescan ",
     };
     let status_style = if app.status_is_error() {
         Style::default().fg(AURA.danger)
     } else {
         Style::default().fg(AURA.ok)
     };
+    let mut status_spans = vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(app.status.clone(), status_style),
+    ];
+    if let Some(note) = &app.rpc_note {
+        status_spans.push(Span::styled(
+            format!("  · rpc: {note}"),
+            Style::default().fg(AURA.danger),
+        ));
+    }
     let content = Paragraph::new(vec![
         Line::from(Span::styled(keys, Style::default().fg(AURA.muted))),
-        Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(app.status.clone(), status_style),
-        ]),
+        Line::from(status_spans),
     ])
     .style(Style::default().bg(AURA.canvas));
     frame.render_widget(content, area);

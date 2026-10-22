@@ -3,34 +3,45 @@
 First spike for a Neovim-centric workbench: a real Neovim TUI runs inside a
 ratatui pane next to ccn's per-file complexity sidebar.
 
-Status: **Windows full TUI verified; Linux (WSL/Ubuntu 26.04) PTY and smoke paths
-verified.** No RPC, no extmarks, no file picker.
-`src/bin/ccn-workbench/` is the only code.
+Status: **Workbench v1: PTY editor + live RPC verified on Windows and WSL
+Ubuntu 26.04 (Neovim 0.12.6).** EPEL Neovim 0.8 is covered by the
+version-limited RPC calls but not run in this environment. Still no file picker
+or multi-file session. `src/bin/ccn-workbench/` plus `rpc.rs` is the only code.
 
 ## What works
 
 - Spawns the editor in a PTY (`portable-pty`; ConPTY on Windows) sized to the
-  editor pane, not the whole terminal.
+  editor pane, not the whole terminal. Neovim is started with
+  `--listen 127.0.0.1:<free port>`.
 - Reads PTY output in 8 KiB chunks into a shared `vt100::Parser`; renders it
   with `tui-term`.
 - Forwards keystrokes byte-for-byte: UTF-8 chars, Enter, Esc, Tab/BackTab,
   Backspace, arrows, Home/End, Insert/Delete, PageUp/PageDown, F1-F8/F11-F12,
   `Ctrl+<letter>` as `0x01..0x1a`, and Alt as an `ESC` prefix.
-- Header shows path, scan status/latency, LOC, function count, CCN max/p90/sum,
-  tier, a max-CCN heuristic grade, and focus.
-- Right sidebar lists the scanned file's functions worst-first with line, CCN,
-  name, and identity; the selected entry is highlighted.
-- Save detection: mtime is checked every 500 ms; a change re-runs
-  `ccn::loc::scan` on that file and refreshes header + sidebar.
+- RPC worker (own thread + current-thread tokio runtime) reads the live buffer
+  every ~150 ms when `nvim_buf_get_changedtick` changes, measures CCN with
+  `ccn::ccn::analyze_file`, and streams snapshots to the UI.
+- Header shows path, `rpc live (N ms)` / `rpc connecting` / `rpc off`, `unsaved`
+  when the buffer tick differs from connect time, LOC, live vs initial function
+  count, CCN max/sum, tier, grade, `delta +N`, and focus.
+- Right sidebar renders the live buffer (same worst-first layout: line, CCN,
+  name, identity). Deltas against the initial file scan are shown in a compact
+  column: `+new`, `~worsened`, `-improved`.
+- Inline extmarks in namespace `ccn_workbench`: one end-of-line
+  ` CCN <n> ` (plus ` (+<d>)` for new/worsened) per function, with
+  `DiagnosticWarn` above 10 and `DiagnosticError` above 20.
+- Sidebar `Enter`/`o` jumps Neovim's cursor to the selected function and runs
+  `normal! zz`, then focuses the editor.
 - Focus model: editor by default. `F9` toggles sidebar; `j/k`, `g/G` move,
   `r` rescans, `F9`/`Esc` returns. While the editor is focused, every key
   except `F9`/`F10` goes to Neovim.
 - Window resize calls `MasterPty::resize` and `vt100::Parser::set_size`.
-- Child exit leaves the workbench open, marks `[editor exited]`, and `F10`
-  quits.
-- `--smoke`, `--smoke-nvim`, and `--smoke-utf8` run PTY + vt100 without an
-  interactive terminal. The UTF-8 smoke types Korean through `encode_key`,
-  saves with `:wq`, and asserts the file bytes.
+- Child exit leaves the workbench open, marks `[editor exited]`, stops the RPC
+  worker, and `F10` quits.
+- `--no-rpc`, a non-Neovim editor, or a failed connection keeps the existing
+  mtime-based refresh. When RPC is live, mtime polling is skipped.
+- `--smoke`, `--smoke-nvim`, `--smoke-utf8`, `--smoke-rpc`, and
+  `--smoke-rpc-edit` run without an interactive terminal.
 
 ## Run
 
@@ -42,13 +53,18 @@ cargo run --release --features workbench --bin ccn-workbench -- --smoke-nvim
 cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-nvim
 cargo run --release --features workbench --bin ccn-workbench -- --smoke-utf8
 cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-utf8
+cargo run --release --features workbench --bin ccn-workbench -- --smoke-rpc
+cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-rpc
+cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-rpc-edit
+cargo run --release --features workbench --bin ccn-workbench -- --no-rpc path/to/file.c
 ```
 
 `--editor` defaults to `nvim`. A command with arguments must be quoted at the
 shell level; the spike understands double quotes inside it but performs no
 shell expansion. A directory argument is rejected with an explicit message
-(this spike opens one file). `--smoke-nvim` and `--smoke-utf8` exit 0 with a
-`skip:` line when the editor is not found.
+(this spike opens one file). `--smoke-*` modes exit 0 with a `skip:` line when
+the editor is not found. `--no-rpc` (or a non-Neovim editor) uses mtime polling
+only.
 
 The UTF-8 smoke is the byte-path test, suitable for CI:
 
@@ -57,47 +73,100 @@ The UTF-8 smoke is the byte-path test, suitable for CI:
 cargo run --release --features workbench --bin ccn-workbench -- --smoke-utf8 --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
 
 # WSL Ubuntu: build, then run under a PTY
-wsl -d Ubuntu -- bash -c 'export PATH=/home/jcpuk/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/user/source/CCN; CARGO_TARGET_DIR=/home/jcpuk/ccn-target cargo build --release --locked --bin ccn-workbench'
+wsl -d Ubuntu -- bash -c 'export PATH=/home/jcpuk/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/user/source/CCN; CARGO_TARGET_DIR=/home/jcpuk/ccn-target cargo build --release --locked --features workbench --bin ccn-workbench'
 wsl -d Ubuntu -- bash -c 'export PATH=/usr/local/bin:/usr/bin:/bin; script -qec "/home/jcpuk/ccn-target/release/ccn-workbench --smoke-utf8 --editor /home/jcpuk/tools/nvim-linux-x86_64/bin/nvim" /dev/null'
 ```
 
-Gates:
+RPC smoke commands:
 
 ```text
-cargo build --release --bin ccn-workbench
-cargo clippy --release --locked --bin ccn-workbench -- -D warnings
+# Windows
+cargo run --release --features workbench --bin ccn-workbench -- --smoke-rpc --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
+
+# WSL
+wsl -d Ubuntu -- bash -c 'export PATH=/usr/local/bin:/usr/bin:/bin; script -qec "/home/jcpuk/ccn-target/release/ccn-workbench --smoke-rpc --editor /home/jcpuk/tools/nvim-linux-x86_64/bin/nvim" /dev/null'
+```
+
+Gates (with the feature enabled):
+
+```text
+cargo build --release --locked --features workbench --bin ccn-workbench
+cargo test --release --locked --features workbench --bin ccn-workbench
+cargo clippy --release --locked --features workbench --all-targets -- -D warnings
 cargo fmt --check
-cargo test --release --bin ccn-workbench
-cargo run --release --features workbench --bin ccn-workbench -- --smoke
 ```
 
-## Layout (condensed ASCII capture, 130x40 host)
+## Layout (condensed ASCII capture, 130x40 host, live RPC)
 
 ```text
- ccn workbench  manual.c                              scan ok - 2 ms
- C - 11 LOC (total 13) - 3 functions - CCN max 3 - p90 0 - sum 6 - tier exact
- grade A - low complexity - focus: editor - scan 2.0 ms
- + editor - nvim ------------------------------+ functions - F9 back -------+
- | int low_one(int x) { return x + 1; }        | manual.c - 11 LOC          |
- |                                             | 3 functions - max 3 - p90 0|
- | int big_one(int x) {                        | tier exact - grade A       |
- |     if (x > 0) {                            | sorted by CCN              |
- |         for (int i = 0; i < x; i++) {       | >  8   3 big_one           |
- |             x += i;                         |       big_one(int)         |
- |         }                                   |    3   2 fresh_save        |
- |     }                                       |       fresh_save(int)      |
- |     return x;                               |    1   1 low_one           |
- | }                                           |       low_one(int)         |
- |                                             |                            |
- | ~                                           |                            |
- |~\AppData\Local\Temp\...\manual.c   1,1 All  |                            |
- +---------------------------------------------+----------------------------+
+ ccn workbench  manual.c                     rpc live (1 ms)  unsaved
+ C - 6 LOC - 2 functions live - CCN max 2 - sum 3 - tier exact
+ grade A - low complexity - focus: editor - scan 6.0 ms  d +1
+ + editor - nvim -----------------------------+ functions - live - F9 back -+
+ | int one(int x) {                 CCN 2 (+1)| manual.c - 6 LOC              |
+ |     return x;                             | 2 functions live - max 2 ...  |
+ |     if (x) x++;                           | tier exact - grade A - d +1   |
+ | }                                         | unsaved buffer - +new ~worse  |
+ | int two(int x) {                 CCN 1     | >  1   2   ~1 one             |
+ |     return x;                             |       one(int)                |
+ | }                                         |    5   1      two             |
+ |                                           |       two(int)                |
+ |~                                          |                               |
+ |~\AppData\Local\Temp\...\manual.c   3,15 All|                              |
+ +-------------------------------------------+-------------------------------+
  F10 quit - F9 focus sidebar - typing goes to the editor - r rescans in the sidebar
- scan: 3 functions - 11 LOC - 2 ms
+ jump -> line 1
 ```
 
-Real render uses box-drawing borders and the Aura palette; `>` marks the
-selected function. The identity line under each name is `FunctionCcn::identity`.
+The screen capture is condensed; the real render uses box-drawing borders and
+the Aura palette. `CCN 2 (+1)` is the extmark, `~1` is the sidebar delta, and
+`d +1` is the sum of positive CCN changes (`delta` in the UI, kept ASCII here).
+
+## RPC architecture
+
+- A free loopback port is reserved by binding `127.0.0.1:0`, released, and
+  passed as `nvim --listen 127.0.0.1:<port> <existing args> <file>`. Only an
+  editor basename containing `nvim` gets this flag; `--no-rpc` or another
+  editor skips it.
+- A dedicated OS thread owns a current-thread tokio runtime and one
+  `nvim-rs` TCP connection. It retries every 500 ms for up to 10 s, reports
+  `connecting` then `live`, and keeps retrying quietly after the initial
+  window while the PTY child is alive. UI channel closure, `F10`, or child exit
+  stops it.
+- Every 150 ms the worker reads `nvim_buf_get_changedtick`. A changed tick (or
+  the first connection) triggers `nvim_buf_get_name` +
+  `nvim_buf_get_lines(0,-1,false)`, `ccn::ccn::analyze_file`, and a snapshot
+  `{name, tier, functions, sum, max, changedtick, base_tick, read_ms, error}`.
+  `base_tick` is captured on connect and drives the `unsaved` label; saves are
+  not fabricated.
+- Snapshots go to the UI through `std::sync::mpsc`; the crossterm loop drains
+  them with `try_recv` and never waits on RPC. A dropped receiver cannot panic
+  the worker; it exits.
+- The UI compares live functions to the initial file scan by
+  `FunctionCcn.identity` (falling back to the name when identity is empty).
+  New/worsened/improved deltas are displayed and the sum of positive changes is
+  shown as `delta +N`. The scan snapshot remains the initial value until the
+  session ends; a reconnect also keeps it.
+- Extmarks are written after every successful changedtick snapshot. The Lua
+  script receives the buffer handle and an argument array; it creates/clears
+  only namespace `ccn_workbench`, then sets one `virt_text` mark at `line - 1`
+  with `virt_text_pos = "eol"`. User marks and other namespaces are untouched.
+  A Lua error becomes a non-fatal `rpc:` note while the sidebar keeps its data.
+- `Enter`/`o` in the sidebar sends a `Jump { line }` command. The worker calls
+  `nvim_win_set_cursor(0, {line, 0})` and `normal! zz`; the UI switches focus
+  back to the editor. Without a live connection the footer says so instead.
+- When RPC is live, the 500 ms mtime poll is disabled. On `off`, `--no-rpc`, a
+  non-Neovim editor, or a dropped connection, the scan/mtime fallback runs
+  again. A manual `r` still rescans while live (the sidebar keeps using the
+  live buffer).
+
+Neovim version matrix:
+
+| Version | Platform | Result |
+| --- | --- | --- |
+| 0.12.6 | Windows (portable, ConPTY) | `--smoke-rpc` and `--smoke-rpc-edit` pass |
+| 0.12.6 | WSL Ubuntu 26.04 | both RPC smokes pass under `script` |
+| 0.8 EPEL | AlmaLinux CI | not run here; only APIs present in 0.8 are used (`get_current_buf`, `get/set lines`, `changedtick`, `exec_lua`, `create_namespace`, `clear_namespace`, `set/get extmarks`, `win_set_cursor`) |
 
 ## Windows result
 
@@ -109,8 +178,8 @@ Verified with Neovim 0.12.6 (portable) under a ConPTY-driven harness at
 - Typing `i ... <Esc> :w` into the pane saved the file; the sidebar refreshed
   to the new function list and footer showed
   `saved -> rescanned: 3 functions - 7 LOC - 5 ms`.
-- Editing the file from another process while Neovim was open also triggered
-  the 500 ms mtime rescan and showed the new function.
+- Editing the file from another process while Neovim was open triggered the
+  500 ms mtime rescan in `--no-rpc` mode and showed the new function.
 - `F9` changed focus to the sidebar, `j` moved the selection, `F9` returned.
 - Resizing to 100x30 and to 12x10 redrew correctly and did not panic; `F10`
   exited.
@@ -120,6 +189,17 @@ Verified with Neovim 0.12.6 (portable) under a ConPTY-driven harness at
   `ccn_workbench_smoke.c   1,1   All` and then `smoke-nvim ok` (exit 0).
 - `--smoke-utf8` printed `smoke-utf8 ok` (exit 0): the Korean text typed via
   `encode_key` survived ConPTY and was saved to the file.
+- Interactive ConPTY harness (Neovim 0.12.6, 130x40): header showed
+  `rpc live (0-1 ms)` and `unsaved` after typing `o` + `if (x) x++;` without
+  saving. The editor showed `CCN 2  (+1)` at the function's line; the sidebar
+  refreshed to `max 2 - sum 3`, `d +1`, and the row `1  2  ~1 one`. The file on
+  disk was byte-identical afterwards. `Enter` in the sidebar moved Neovim from
+  `3,15` to the selected function's `1,1`, and `F10` exited.
+- `--smoke-rpc`: 2 functions, `read_ms` 0.8, 2 extmarks placed/dumped, 1.4 ms
+  post-connect, exit 0.
+- `--smoke-rpc-edit`: changedtick 3 -> 14, sum 3 -> 4 without any `:w`, disk
+  unchanged, extmark `CCN 2  (+1)`; 397 ms post-connect including typing
+  delays, exit 0.
 
 ### Linux (WSL Ubuntu 26.04, Neovim 0.12.6)
 
@@ -135,6 +215,15 @@ smoke-nvim ok
 
 $ script -qec ".../ccn-workbench --smoke-utf8 --editor .../nvim" /dev/null
 smoke-utf8 ok
+
+$ script -qec ".../ccn-workbench --smoke-rpc --editor .../nvim" /dev/null
+... read_ms: 0.6 ...
+extmarks placed: 2  dumped: 2
+smoke-rpc ok
+
+$ script -qec ".../ccn-workbench --smoke-rpc-edit --editor .../nvim" /dev/null
+edit: changedtick 3 -> 14  sum 3 -> 4 (disk unchanged)
+smoke-rpc-edit ok
 ```
 
 Before the query bridge, Neovim logged
@@ -219,38 +308,62 @@ Windows/ConPTY details worth keeping:
 - Save detection trusts mtime only (the scan itself uses `verify_cache:
   false`). A same-mtime rewrite can be missed, same as the scanner's warm path.
 
-## Remaining for the RPC spike
+## RPC work now done vs remaining
 
-- Replace the byte pipe with `nvim --embed` + `nvim-rs` (RPC probe is a
-  separate agent's `src/bin/ccn-nvim-probe`).
-- Attach to the buffer and use `nvim_buf_set_extmark` for per-function CCN
-  severity, virtual text, and a sign column, instead of a separate sidebar.
-- `Enter` on a sidebar function -> move the Neovim cursor to `FunctionCcn.line`
-  and reveal it (`nvim_win_set_cursor` + `zz`), without `:` command typing.
-- Use `nvim_buf_attach` / `BufWritePost` instead of 500 ms mtime polling, and
-  scan the unsaved buffer (or write-then-scan) rather than the file on disk.
-- Draw real health/CCN summaries across files, open a file picker for directory
-  arguments, and persist panel focus/width.
-- Re-evaluate cursor rendering with RPC (`nvim_ui_attach` gives mode info), and
-  add bracketed paste / mouse if the editor stays PTY-based.
-- Linux: the PTY, terminal-query bridge, Neovim startup, UTF-8 byte path, and
-  `script`/alternate-screen paths are verified under WSL Ubuntu 26.04. Resize
-  (SIGWINCH) and interactive keyboard handling were not exercised there; the
-  full key loop was only driven on Windows.
+Done in Workbench v1:
+
+- Live buffer over `--listen` + msgpack-RPC; no disk reads while live.
+- Per-function CCN extmarks in `ccn_workbench` with severity highlight and
+  `(+delta)` for new/worsened functions.
+- Sidebar deltas vs the initial file scan, worst-first, with identity preserved
+  across refreshes.
+- `Enter`/`o` jump to a function, `normal! zz`, focus returned to the editor.
+- `unsaved` from changedtick; connect-time tick captured, no fake save events.
+- `--no-rpc`/non-Neovim/connection failure falls back to mtime scanning.
+- Terminal probes (OSC/DSR/DA/DECRQM/kitty) answered in the PTY bridge.
+
+Remaining limitations / next steps:
+
+- The baseline is the *initial* scan for the whole session. Saving does not
+  reset it, so deltas keep accumulating relative to startup; a deliberate
+  baseline reset (`BufWritePost` or a key) is still needed.
+- Polling changedtick every 150 ms is simple but not event-driven. Replace with
+  `nvim_buf_attach` notifications when the workbench moves to a real RPC UI
+  loop; keep 150 ms as a safety net.
+- One file/one window. Multi-file sessions, a file picker for directory
+  arguments, and cross-file health summaries are not implemented.
+- Reconnect resets `base_tick` to the new connect tick; edits made while the
+  connection was down can temporarily appear "saved". Edits made before the
+  first successful connect are likewise the baseline, because `unsaved` is
+  changedtick-since-connect, not changedtick-since-last-disk-write.
+- If the initial file scan produced no function detail (heuristic or unreadable
+  file), the delta baseline is empty and every live function appears `+new`
+  with its full CCN as the delta.
+- Extmarks use fixed priority 200 and no sign column; they are deliberately
+  limited to our namespace and cleared every snapshot.
+- Neovim 0.8 was not run in this environment; only 0.8-compatible API calls are
+  used. The AlmaLinux CI is the authoritative 0.8 check.
+- Linux interactive keyboard handling and SIGWINCH resize were not manually
+  exercised; Windows drove the full key loop, WSL covered RPC/PTY smokes under
+  `script`.
+- `nvim_ui_attach`/mode-aware cursor rendering, bracketed paste, and mouse are
+  still out of scope while the editor stays byte-forwarded PTY.
 
 ## Compatibility matrix (2026-10-22)
 
 | Host / toolchain | Editor | PTY render | UTF-8 byte path | RPC + extmarks |
 |---|---|---|---|---|
-| Windows 11 (ConPTY) | portable Neovim 0.12.6 | pass | pass | pass (probe) |
-| Ubuntu 26.04 (WSL, glibc 2.43) | portable Neovim 0.12.6 | pass | pass | pass (probe) |
-| AlmaLinux 8 (glibc 2.28) | EPEL `neovim` 0.8.0 | pass | pass | pass (probe) |
+| Windows 11 (ConPTY) | portable Neovim 0.12.6 | pass | pass | pass (workbench) |
+| Ubuntu 26.04 (WSL, glibc 2.43) | portable Neovim 0.12.6 | pass | pass | pass (workbench) |
+| AlmaLinux 8 (glibc 2.28) | EPEL `neovim` 0.8.0 | pass | pass | 0.8-compatible calls; CI only |
 | AlmaLinux 8 | official Neovim 0.12 tarball | **not runnable** | - | - |
 
 The official Neovim Linux tarball requires **GLIBC_2.34**; AlmaLinux 8 ships
 2.28. Use the EPEL 8 `neovim` package (0.8.0) or a locally built Neovim on EL8.
-The workbench's PTY path works with 0.8; the RPC probe's
-`nvim_buf_set_extmark` path was verified against 0.8, and `ccn.nvim`'s
+The workbench's PTY path works with 0.8, and the workbench RPC worker uses only
+APIs present in 0.8 (`nvim_buf_get_lines`, `nvim_buf_get_changedtick`,
+`nvim_exec_lua`, `nvim_buf_set_extmark`/`get_extmarks`, `nvim_win_set_cursor`);
+the AlmaLinux CI is the authoritative 0.8 runtime check. `ccn.nvim`'s
 `jobstart` fallback produced a `source = "ccn"` diagnostic on 0.8.
 
 Verification is in `.github/workflows/workbench-linux-check.yml`:

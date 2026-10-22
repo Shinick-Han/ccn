@@ -67,6 +67,12 @@ jobs:
             echo "--- workbench UTF-8 byte path (EPEL nvim) ---"
             script -qec "./target/release/ccn-workbench --smoke-utf8 --editor /usr/bin/nvim" /dev/null
 
+            echo "--- workbench RPC live buffer (EPEL nvim 0.8) ---"
+            script -qec "./target/release/ccn-workbench --smoke-rpc --editor /usr/bin/nvim" /dev/null
+
+            echo "--- workbench RPC unsaved edit (EPEL nvim 0.8) ---"
+            script -qec "./target/release/ccn-workbench --smoke-rpc-edit --editor /usr/bin/nvim" /dev/null
+
             echo "--- RPC probe against EPEL nvim 0.8 ---"
             tmp=$(mktemp -d)
             printf "%s\n" \
