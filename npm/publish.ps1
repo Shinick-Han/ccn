@@ -30,6 +30,7 @@ if (-not [string]::IsNullOrWhiteSpace($Otp)) {
 }
 
 $published = @()
+$toVerify = @()
 $platforms = @(
     'platforms/linux-x64',
     'platforms/darwin-x64',
@@ -43,10 +44,11 @@ $targets += $root
 foreach ($dir in $targets) {
     $manifest = Get-Content (Join-Path $dir 'package.json') -Raw | ConvertFrom-Json
     $name = $manifest.name
-    $existing = npm view $name version 2>$null
+    $existing = npm view "$name@$version" version 2>$null
     if ($LASTEXITCODE -eq 0 -and $existing -eq $version) {
         Write-Host "already published: $name@$version (skipping)"
         $published += $name
+        $toVerify += $name
         continue
     }
     if ($manifest.version -ne $version) {
@@ -66,13 +68,32 @@ foreach ($dir in $targets) {
         Pop-Location
     }
 
-    $seen = npm view $name version 2>$null
-    if ($LASTEXITCODE -ne 0 -or $seen -ne $version) {
-        throw "published $name but the registry reports '$seen' (expected $version)"
-    }
+    Write-Host "accepted: $name@$version (registry processing; verified at the end)"
     $published += $name
+    $toVerify += $name
+}
+
+# npm returns 202 "being processed" for large packages; metadata can lag by
+# 1-3 minutes. Poll the exact version rather than the `latest` tag, which may
+# still point at the previous release while the upload is queued.
+$deadline = (Get-Date).AddMinutes(3)
+$pending = @($toVerify)
+while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
+    $still = @()
+    foreach ($name in $pending) {
+        $seen = npm view "$name@$version" version 2>$null
+        if ($LASTEXITCODE -ne 0 -or $seen -ne $version) { $still += $name }
+    }
+    $pending = $still
+    if ($pending.Count -gt 0) { Start-Sleep -Seconds 10 }
+}
+
+if ($pending.Count -gt 0) {
+    throw ("npm accepted the upload but the registry still lacks " +
+        "$version for: $($pending -join ', '). Wait a minute and rerun; " +
+        "already-published packages are skipped.")
 }
 
 Write-Host ""
-Write-Host "published: $($published -join ', ')"
+Write-Host "published and verified: $($published -join ', ')"
 Write-Host "verify: npx @shinick/ccn@$version --version"
