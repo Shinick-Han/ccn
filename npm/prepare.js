@@ -55,7 +55,21 @@ async function main() {
     const destination = path.join(dir, target.file);
     const url = "https://github.com/" + REPO + "/releases/download/v" + VERSION + "/" + target.asset;
     process.stdout.write("downloading " + target.asset + " ... ");
-    await download(url, destination, 0);
+    let lastError;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        await download(url, destination, 0);
+        if (fs.statSync(destination).size === 0) throw new Error("empty asset");
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt === 5) break;
+        process.stdout.write("retry " + attempt + " ... ");
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    }
+    if (lastError) throw lastError;
     fs.chmodSync(destination, 0o755);
     console.log(fs.statSync(destination).size + " bytes");
   }

@@ -33,6 +33,33 @@ The exit code is the CLI's exit code, so it works as a CI gate:
 Intel Macs, Linux arm64 and Windows arm64 have no prebuilt package; build from
 source (`https://github.com/Shinick-Han/ccn`).
 
+## Publishing (maintainers)
+
+Local automation uses an npm **Automation/Granular token with bypass 2FA** so
+publishing no longer stops at an OTP prompt. Create it once:
+
+```console
+$ npm token create --name ccn-automation --packages-all \
+    --packages-and-scopes-permission read-write --bypass-2fa
+$ npm config set //registry.npmjs.org/:_authToken <token>
+```
+
+Then release locally:
+
+```powershell
+node npm\prepare.js          # download v<version> assets
+pwsh -File npm\publish.ps1  # publish missing packages (idempotent)
+pwsh -File npm\publish.ps1 -Check
+```
+
+`publish.js` skips versions already on the registry, publishes platform
+packages before the main package, and polls the exact versions afterwards.
+Without an automation token, `-Otp <code>` still works but the OTP expires
+quickly across five packages.
+
+GitHub Actions npm publishing is not used because the workflow requires hosted
+runner minutes; the local script is the supported path.
+
 ## Offline / custom binary
 
 ```console

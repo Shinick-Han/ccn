@@ -95,7 +95,8 @@ async function main() {
 
   if (missing.length > 0) {
     console.error("\nrelease incomplete for " + VERSION + ": " + missing.join(", "));
-    console.error("rerun: pwsh -File npm/publish.ps1 -Otp <fresh-code>");
+    console.error("create a bypass-2FA automation token, set //registry.npmjs.org/:_authToken,");
+    console.error("then rerun: pwsh -File npm/publish.ps1");
     process.exit(1);
   }
   console.log("\nnpm release " + VERSION + " is consistent.");
