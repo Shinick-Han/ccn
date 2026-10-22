@@ -7,6 +7,7 @@ pub mod baseline;
 pub mod cache;
 pub mod ccn;
 pub mod cli;
+pub mod fuzzy;
 pub mod generated;
 pub mod git;
 pub mod history;
@@ -16,8 +17,10 @@ pub mod model;
 pub mod p4;
 pub mod report;
 pub mod sarif;
+pub mod session;
 pub mod terminal;
 pub mod theme;
+pub mod tree;
 pub mod tui;
 pub mod vcs;
 

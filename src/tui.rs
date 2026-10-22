@@ -25,6 +25,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(feature = "workbench")]
+use crate::fuzzy::FuzzyState;
+#[cfg(feature = "workbench")]
+use crate::tree::{Tree, TreeAction};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -139,6 +143,68 @@ fn split_ratio_from_x(x: u16, width: u16) -> u16 {
     ((u32::from(x) * 100) / width).clamp(20, 70) as u16
 }
 
+/// Files shown in the split view's tree: every measured source file, not only
+/// the ones that received a CCN pass.
+#[cfg(feature = "workbench")]
+fn tree_paths(result: &ScanResult) -> Vec<String> {
+    result
+        .files
+        .iter()
+        .filter(|file| !file.is_generated && !file.is_vendored)
+        .map(|file| file.path.replace('\\', "/"))
+        .collect()
+}
+
+/// Convert an absolute tab path back to the scan-relative, `/`-separated form
+/// the session file stores. Paths outside the scan root are not persisted.
+#[cfg(feature = "workbench")]
+fn relative_to_root(root: &str, path: &Path) -> Option<String> {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+    let relative = path
+        .strip_prefix(&canonical_root)
+        .or_else(|_| path.strip_prefix(root))
+        .ok()?;
+    let text = relative.to_string_lossy().replace('\\', "/");
+    if text.is_empty() || text == "." {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Persist split ratio, dashboard state and open buffers. Errors are non-fatal:
+/// a read-only cache must never take the TUI down.
+#[cfg(feature = "workbench")]
+fn save_workspace(
+    root: &str,
+    split_ratio: u16,
+    state: &Option<DashboardState>,
+    session: Option<&crate::workbench::WorkbenchSession>,
+) {
+    let mut saved = crate::session::Session {
+        split_ratio,
+        ..crate::session::Session::default()
+    };
+    if let Some(state) = state {
+        saved.selected_path = state.selected_path.clone();
+        saved.sort = state.sort.persisted().to_string();
+        saved.sort_desc = state.sort_desc;
+        saved.filter = state.filter.clone();
+        saved.left_tab = state.left_tab.persisted().to_string();
+    }
+    if let Some(session) = session {
+        for path in session.tabs().paths() {
+            if let Some(relative) = relative_to_root(root, &path) {
+                saved.open_files.push(relative);
+            }
+        }
+        saved.active_file = session
+            .active_tab()
+            .and_then(|tab| relative_to_root(root, &tab.path));
+    }
+    let _ = crate::session::save(root, &saved);
+}
+
 /// Run the dashboard and workbench in one terminal and one event loop.
 ///
 /// The dashboard is rebuilt after a workbench session so the scan/report and
@@ -164,7 +230,22 @@ pub fn run_unified(
     #[cfg(feature = "workbench")]
     let mut session: Option<crate::workbench::WorkbenchSession> = None;
     #[cfg(feature = "workbench")]
-    let mut split_ratio: u16 = 38;
+    let saved = crate::session::load(&result.root);
+    #[cfg(feature = "workbench")]
+    let mut split_ratio: u16 = saved.split_ratio;
+    #[cfg(feature = "workbench")]
+    let mut fuzzy = FuzzyState::new();
+    #[cfg(feature = "workbench")]
+    let mut tree_state: Option<Tree> = None;
+    #[cfg(feature = "workbench")]
+    let mut dashboard_state: Option<DashboardState> = Some(DashboardState {
+        selected_path: saved.selected_path.clone(),
+        sort: SortKey::from_persisted(&saved.sort),
+        sort_desc: saved.sort_desc,
+        filter: saved.filter.clone(),
+        left_tab: LeftTab::from_persisted(&saved.left_tab),
+    });
+    #[cfg(not(feature = "workbench"))]
     let mut dashboard_state: Option<DashboardState> = None;
 
     loop {
@@ -173,12 +254,20 @@ pub fn run_unified(
             if let Some(state) = &dashboard_state {
                 app.restore_state(state);
             }
+            #[cfg(feature = "workbench")]
+            let fuzzy_paths = tree_paths(result);
             loop {
                 #[cfg(feature = "workbench")]
                 if let Some(session) = session.as_mut() {
                     session.tick();
                 }
-                guard.terminal.draw(|frame| render(frame, &mut app))?;
+                guard.terminal.draw(|frame| {
+                    render(frame, &mut app);
+                    #[cfg(feature = "workbench")]
+                    if fuzzy.is_open() {
+                        crate::fuzzy::render(frame, frame.area(), &fuzzy, &fuzzy_paths);
+                    }
+                })?;
                 if app.quit {
                     let action = app
                         .pending_edit
@@ -188,6 +277,69 @@ pub fn run_unified(
                 }
                 if event::poll(Duration::from_millis(50))? {
                     if let Event::Key(key) = event::read()? {
+                        #[cfg(feature = "workbench")]
+                        if fuzzy.is_open() {
+                            match key.code {
+                                KeyCode::Esc => fuzzy.close(),
+                                KeyCode::Up => fuzzy.move_selection(-1),
+                                KeyCode::Down => fuzzy.move_selection(1),
+                                KeyCode::Enter => {
+                                    if let Some(index) = fuzzy.selected() {
+                                        if let Some(path) = fuzzy_paths.get(index) {
+                                            app.pending_edit = Some(PathBuf::from(path));
+                                            app.quit = true;
+                                        }
+                                    }
+                                    fuzzy.close();
+                                }
+                                KeyCode::Backspace => fuzzy.backspace(&fuzzy_paths),
+                                KeyCode::Char(ch)
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    fuzzy.type_char(ch, &fuzzy_paths)
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        #[cfg(feature = "workbench")]
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('p' | 'P'))
+                        {
+                            fuzzy.open(&fuzzy_paths);
+                            continue;
+                        }
+                        #[cfg(feature = "workbench")]
+                        {
+                            let ctrl_c = key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL);
+                            let destructive = key.code == KeyCode::Char('q')
+                                || key.code == KeyCode::Esc
+                                || ctrl_c;
+                            let blocked_by_overlay =
+                                app.overlay != Overlay::None || app.filter_input.is_some();
+                            // Ctrl+C is always destructive; q/Esc only when no
+                            // overlay or filter owns that key.
+                            if session.is_some() && destructive && (ctrl_c || !blocked_by_overlay) {
+                                if app.notice.is_some() && key.code == KeyCode::Char('q') {
+                                    // Second q: explicit discard, fall through.
+                                } else if app.notice.is_none() {
+                                    app.notice = Some(
+                                        "live editor session: save unsaved buffers, then press q again to exit"
+                                            .to_string(),
+                                    );
+                                    continue;
+                                } else {
+                                    continue;
+                                }
+                            }
+                            if app.notice.is_some()
+                                && key.code != KeyCode::Char('q')
+                                && !destructive
+                            {
+                                app.notice = None;
+                            }
+                        }
                         app.handle_key(key);
                     }
                 }
@@ -198,8 +350,16 @@ pub fn run_unified(
         match action {
             TuiAction::Quit => {
                 #[cfg(feature = "workbench")]
-                if let Some(session) = session.take() {
-                    session.close();
+                {
+                    save_workspace(
+                        &result.root,
+                        split_ratio,
+                        &dashboard_state,
+                        session.as_ref(),
+                    );
+                    if let Some(session) = session.take() {
+                        session.close();
+                    }
                 }
                 return Ok(());
             }
@@ -208,10 +368,25 @@ pub fn run_unified(
                 {
                     let target = Path::new(&result.root).join(&path);
                     let target = std::fs::canonicalize(&target).unwrap_or(target);
-                    let restart = session.as_ref().is_none_or(|session| {
-                        session.app.target != target || session.app.exited.is_some()
-                    });
-                    if restart {
+                    let needs_restart = session
+                        .as_ref()
+                        .is_none_or(|session| session.app.exited.is_some());
+                    let mut open_error = None;
+                    if needs_restart {
+                        if let Some(old) = session.take() {
+                            old.close();
+                        }
+                    } else if session.as_ref().is_some_and(|s| s.app.target != target) {
+                        if let Some(session) = session.as_mut() {
+                            if let Err(e) = session.open_file(&target) {
+                                open_error = Some(e);
+                            }
+                        }
+                    }
+                    if let Some(error) = &open_error {
+                        eprintln!("ccn: {error}; keeping the current editor session");
+                    }
+                    if needs_restart {
                         if let Some(old) = session.take() {
                             old.close();
                         }
@@ -225,7 +400,22 @@ pub fn run_unified(
                             right.width,
                             right.height,
                         ) {
-                            Ok(open) => session = Some(open),
+                            Ok(open) => {
+                                session = Some(open);
+                                if let Some(open) = session.as_mut() {
+                                    let restored: Vec<(PathBuf, String)> = saved
+                                        .open_files
+                                        .iter()
+                                        .map(|relative| {
+                                            let joined = Path::new(&result.root).join(relative);
+                                            let path =
+                                                std::fs::canonicalize(&joined).unwrap_or(joined);
+                                            (path, relative.clone())
+                                        })
+                                        .collect();
+                                    open.adopt_tabs(&restored);
+                                }
+                            }
                             Err(e) => {
                                 eprintln!("ccn: {e}");
                                 continue;
@@ -234,10 +424,15 @@ pub fn run_unified(
                     }
 
                     if let Some(session) = session.as_mut() {
-                        let mut split_dashboard = App::new(result, report);
-                        if let Some(state) = &dashboard_state {
-                            split_dashboard.restore_state(state);
-                        }
+                        let mut tree = match tree_state.take() {
+                            Some(mut tree) => {
+                                tree.rebuild(tree_paths(result));
+                                tree
+                            }
+                            None => Tree::new(tree_paths(result)),
+                        };
+                        #[cfg(feature = "workbench")]
+                        let fuzzy_paths = tree_paths(result);
                         let mut focus = SplitFocus::Workbench;
                         let mut dragging = false;
                         let mut last_right = (0u16, 0u16);
@@ -252,12 +447,7 @@ pub fn run_unified(
                                 last_right = (right.width, right.height);
                             }
                             guard.terminal.draw(|frame| {
-                                render_right(
-                                    frame,
-                                    &mut split_dashboard,
-                                    left,
-                                    focus == SplitFocus::Files,
-                                );
+                                tree.render(frame, left, focus == SplitFocus::Files);
                                 session.draw_in(frame, right);
                                 let mut handle = String::new();
                                 for _ in 0..divider.height {
@@ -274,49 +464,87 @@ pub fn run_unified(
                                     ),
                                     divider,
                                 );
+                                if fuzzy.is_open() {
+                                    crate::fuzzy::render(frame, frame.area(), &fuzzy, &fuzzy_paths);
+                                }
                             })?;
                             if !event::poll(Duration::from_millis(16))? {
                                 continue;
                             }
                             match event::read()? {
-                                Event::Key(key) if key.kind != KeyEventKind::Release => match focus
-                                {
-                                    SplitFocus::Files => match key.code {
-                                        KeyCode::Char('q') => break,
-                                        KeyCode::Char('j') | KeyCode::Down => {
-                                            split_dashboard.move_selection(1)
+                                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                    if fuzzy.is_open() {
+                                        match key.code {
+                                            KeyCode::Esc => fuzzy.close(),
+                                            KeyCode::Up => fuzzy.move_selection(-1),
+                                            KeyCode::Down => fuzzy.move_selection(1),
+                                            KeyCode::Enter => {
+                                                let selected = fuzzy
+                                                    .selected()
+                                                    .and_then(|index| fuzzy_paths.get(index))
+                                                    .cloned();
+                                                fuzzy.close();
+                                                if let Some(path) = selected {
+                                                    let target =
+                                                        Path::new(&result.root).join(&path);
+                                                    if let Err(e) = session.open_file(&target) {
+                                                        eprintln!("ccn: {e}");
+                                                    } else {
+                                                        focus = SplitFocus::Workbench;
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Backspace => fuzzy.backspace(&fuzzy_paths),
+                                            KeyCode::Char(ch)
+                                                if !key
+                                                    .modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                fuzzy.type_char(ch, &fuzzy_paths)
+                                            }
+                                            _ => {}
                                         }
-                                        KeyCode::Char('k') | KeyCode::Up => {
-                                            split_dashboard.move_selection(-1)
-                                        }
-                                        KeyCode::Char('g') | KeyCode::Home => {
-                                            split_dashboard.select_first()
-                                        }
-                                        KeyCode::Char('G') | KeyCode::End => {
-                                            split_dashboard.select_last()
-                                        }
-                                        KeyCode::Char('e') | KeyCode::Enter | KeyCode::F(8) => {
-                                            focus = SplitFocus::Workbench
-                                        }
-                                        KeyCode::Char('[') => {
-                                            split_ratio = split_ratio.saturating_sub(2).max(20)
-                                        }
-                                        KeyCode::Char(']') => {
-                                            split_ratio = (split_ratio + 2).min(70)
-                                        }
-                                        KeyCode::F(10) => break,
-                                        _ => {}
-                                    },
-                                    SplitFocus::Workbench => {
-                                        if key.code == KeyCode::F(8) {
-                                            focus = SplitFocus::Files;
-                                            continue;
-                                        }
-                                        if session.handle_key(key) {
-                                            break;
+                                        continue;
+                                    }
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && matches!(key.code, KeyCode::Char('p' | 'P'))
+                                    {
+                                        fuzzy.open(&fuzzy_paths);
+                                        continue;
+                                    }
+                                    match focus {
+                                        SplitFocus::Files => match key.code {
+                                            KeyCode::Char('q') => break,
+                                            KeyCode::Char('[') => {
+                                                split_ratio = split_ratio.saturating_sub(2).max(20)
+                                            }
+                                            KeyCode::Char(']') => {
+                                                split_ratio = (split_ratio + 2).min(70)
+                                            }
+                                            KeyCode::F(8) => focus = SplitFocus::Workbench,
+                                            KeyCode::F(10) => break,
+                                            _ => {
+                                                if let TreeAction::Open(path) = tree.handle_key(key)
+                                                {
+                                                    let target = Path::new(&result.root).join(path);
+                                                    if let Err(e) = session.open_file(&target) {
+                                                        eprintln!("ccn: {e}");
+                                                    }
+                                                    focus = SplitFocus::Workbench;
+                                                }
+                                            }
+                                        },
+                                        SplitFocus::Workbench => {
+                                            if key.code == KeyCode::F(8) {
+                                                focus = SplitFocus::Files;
+                                                continue;
+                                            }
+                                            if session.handle_key(key) {
+                                                break;
+                                            }
                                         }
                                     }
-                                },
+                                }
                                 Event::Mouse(mouse) => match mouse.kind {
                                     MouseEventKind::Down(MouseButton::Left)
                                         if mouse.column >= divider.x
@@ -334,7 +562,19 @@ pub fn run_unified(
                                 _ => {}
                             }
                         }
-                        dashboard_state = Some(split_dashboard.capture_state());
+                        tree_state = Some(tree);
+                    }
+
+                    save_workspace(
+                        &result.root,
+                        split_ratio,
+                        &dashboard_state,
+                        session.as_ref(),
+                    );
+                    if session.as_ref().is_some_and(|s| s.tabs().is_empty()) {
+                        if let Some(empty) = session.take() {
+                            empty.close();
+                        }
                     }
 
                     match crate::loc::scan(options) {
@@ -436,6 +676,22 @@ enum LeftTab {
 }
 
 impl LeftTab {
+    #[cfg(feature = "workbench")]
+    fn from_persisted(value: &str) -> Self {
+        match value {
+            "loc" => LeftTab::Loc,
+            _ => LeftTab::Ccn,
+        }
+    }
+
+    #[cfg(feature = "workbench")]
+    fn persisted(self) -> &'static str {
+        match self {
+            LeftTab::Ccn => "ccn",
+            LeftTab::Loc => "loc",
+        }
+    }
+
     fn next(self) -> Self {
         match self {
             LeftTab::Ccn => LeftTab::Loc,
@@ -469,6 +725,28 @@ enum SortKey {
 }
 
 impl SortKey {
+    #[cfg(feature = "workbench")]
+    fn from_persisted(value: &str) -> Self {
+        match value {
+            "loc" => SortKey::Loc,
+            "max-ccn" => SortKey::MaxCcn,
+            "over-10" => SortKey::Over10,
+            "path" => SortKey::Path,
+            _ => SortKey::Risk,
+        }
+    }
+
+    #[cfg(feature = "workbench")]
+    fn persisted(self) -> &'static str {
+        match self {
+            SortKey::Risk => "risk",
+            SortKey::Loc => "loc",
+            SortKey::MaxCcn => "max-ccn",
+            SortKey::Over10 => "over-10",
+            SortKey::Path => "path",
+        }
+    }
+
     fn next(self) -> Self {
         match self {
             SortKey::Risk => SortKey::Loc,
@@ -543,6 +821,8 @@ pub struct App<'a> {
     overlay: Overlay,
     /// Set by `e`; consumed by `run` after the terminal is restored.
     pending_edit: Option<PathBuf>,
+    /// Transient dashboard warning (e.g. unsaved buffers blocking quit).
+    notice: Option<String>,
     quit: bool,
 }
 
@@ -590,6 +870,7 @@ impl<'a> App<'a> {
             left_tab: LeftTab::Ccn,
             overlay: Overlay::None,
             pending_edit: None,
+            notice: None,
             quit: false,
         };
         app.rebuild();
@@ -919,6 +1200,18 @@ pub fn render(frame: &mut Frame, app: &mut App<'_>) {
 /// One line of key hints. Navigation targets the list, so the list is the
 /// focused panel; the chart panel keeps the quiet border.
 fn render_footer(frame: &mut Frame, app: &App<'_>, area: Rect) {
+    if let Some(notice) = &app.notice {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                notice.as_str(),
+                Style::default()
+                    .fg(AURA.danger)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            area,
+        );
+        return;
+    }
     let key = Style::default().fg(AURA.accent);
     let chrome = Style::default().fg(AURA.muted);
     let mut spans = vec![
@@ -2026,6 +2319,22 @@ mod tests {
                 "cell ({x}, {y}) must use the pill background"
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "workbench")]
+    fn tree_paths_include_every_measured_source_file() {
+        let (mut result, _) = fixture();
+        // A file without a CCN summary is still a measured source file.
+        result.files[0].ccn = None;
+        result.files[1].is_generated = true;
+        result.files[2].is_vendored = true;
+
+        let paths = tree_paths(&result);
+        assert!(paths.contains(&"src/alpha.rs".to_string()), "{paths:?}");
+        assert!(paths.contains(&"src/zeta.rs".to_string()), "{paths:?}");
+        assert!(!paths.contains(&"src/beta.rs".to_string()), "{paths:?}");
+        assert!(!paths.contains(&"src/tui_app.py".to_string()), "{paths:?}");
     }
 
     #[test]

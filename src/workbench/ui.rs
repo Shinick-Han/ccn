@@ -70,6 +70,27 @@ pub fn render_area(frame: &mut Frame, app: &App, screen: &Screen, area: Rect) {
     render_footer(frame, app, rects.footer);
 }
 
+/// Compact tab bar: `[1 engine.cpp●] [2 util.c]`, active tab highlighted.
+fn tab_spans(app: &App) -> Vec<Span<'static>> {
+    let active = app.tabs.active_index();
+    app.tabs
+        .titles()
+        .into_iter()
+        .enumerate()
+        .map(|(index, title)| {
+            let style = if Some(index) == active {
+                Style::default()
+                    .fg(AURA.canvas)
+                    .bg(AURA.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(AURA.muted)
+            };
+            Span::styled(format!(" [{} {}] ", index + 1, title), style)
+        })
+        .collect()
+}
+
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let view = app.view.as_ref();
     let mut path_spans = vec![
@@ -80,20 +101,24 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
-        Span::styled(
+    ];
+    if app.tabs.is_empty() {
+        path_spans.push(Span::styled(
             app.display.as_str(),
             Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("   ", Style::default()),
-        Span::styled(
-            app.rpc_label(),
-            Style::default().fg(match app.rpc_status {
-                RpcStatus::Live => AURA.ok,
-                RpcStatus::Connecting => AURA.warn,
-                RpcStatus::Off => AURA.muted,
-            }),
-        ),
-    ];
+        ));
+    } else {
+        path_spans.extend(tab_spans(app));
+    }
+    path_spans.push(Span::styled("   ", Style::default()));
+    path_spans.push(Span::styled(
+        app.rpc_label(),
+        Style::default().fg(match app.rpc_status {
+            RpcStatus::Live => AURA.ok,
+            RpcStatus::Connecting => AURA.warn,
+            RpcStatus::Off => AURA.muted,
+        }),
+    ));
     if app.unsaved() {
         path_spans.push(Span::styled(
             "  unsaved ",
@@ -520,7 +545,7 @@ fn delta_color(delta: &str) -> Color {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let keys = match app.focus {
         Focus::Editor => {
-            " F10 back/quit · F9 focus sidebar · typing goes to the editor · r rescans in the sidebar "
+            " F10 back/quit · F9 focus sidebar · F2/F3 tabs · F4 close tab · typing goes to the editor · r rescans in the sidebar "
         }
         Focus::Sidebar => " F10 back/quit · F9 back · Enter/o jump · j/k move · g/G · r rescan ",
     };
@@ -591,7 +616,7 @@ mod tests {
             "int one(int x) { if (x) { return 1; } return 0; }\nint two(int y) {\n    if (y) { return 2; }\n    return 0;\n}\n",
         )
         .expect("write sample");
-        let app = App::new(file.clone(), file.display().to_string(), "nvim".to_string());
+        let app = App::new(file.clone(), "sample.c".to_string(), "nvim".to_string());
 
         let mut parser = vt100::Parser::new(24, 60, 0);
         parser.process(b"NVIM-EDITOR-CONTENT");
@@ -602,6 +627,7 @@ mod tests {
         let rendered = buffer_text(terminal.backend().buffer());
 
         assert!(rendered.contains("ccn workbench"), "{rendered}");
+        assert!(rendered.contains("[1 sample.c]"), "{rendered}");
         assert!(rendered.contains("NVIM-EDITOR-CONTENT"), "{rendered}");
         assert!(rendered.contains("functions"), "{rendered}");
         assert!(rendered.contains("F10 back/quit"), "{rendered}");

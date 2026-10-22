@@ -3,10 +3,12 @@
 First spike for a Neovim-centric workbench: a real Neovim TUI runs inside a
 ratatui pane next to ccn's per-file complexity sidebar.
 
-Status: **Workbench v1: PTY editor + live RPC verified on Windows, WSL
+Status: **Workbench v1.1: PTY editor + live RPC verified on Windows, WSL
 Ubuntu 26.04 (Neovim 0.12.6) and AlmaLinux 8 (EPEL Neovim 0.8, CI).**
-Still no file picker or multi-file session. `src/workbench/` is the
-implementation; the public entry point is `ccn workbench`.
+The unified dashboard now has a directory tree, `Ctrl+P` fuzzy open,
+multi-buffer tabs in one Neovim, and session restore. `src/workbench/` is the
+implementation; the public entry point is `ccn workbench` (single file) and
+`ccn . --tui` (dashboard + split).
 
 ## What works
 
@@ -34,7 +36,19 @@ implementation; the public entry point is `ccn workbench`.
   `normal! zz`, then focuses the editor.
 - Focus model: editor by default. `F9` toggles sidebar; `j/k`, `g/G` move,
   `r` rescans, `F9`/`Esc` returns. While the editor is focused, every key
-  except `F9`/`F10` goes to Neovim.
+  except `F9`/`F10` and the tab keys goes to Neovim.
+- Split navigation: the left pane is a collapsible directory tree (`j/k`,
+  `g/G`, `Enter`/Space toggles a directory, `e`/`Enter` opens a file). `F8`
+  switches tree/editor focus; `[`/`]` or dragging the divider changes the
+  split ratio (20-70%, minimum pane widths).
+- `Ctrl+P` fuzzy file picker ranks measured source paths with a dependency-free
+  subsequence scorer and opens the selected file as a tab.
+- Multi-buffer tabs use one Neovim process: a new file is opened with a Lua
+  `:edit` RPC (modified buffers are hidden, not discarded), and `F2`/`F3`
+  switch, `F4` closes a clean buffer (`:bdelete`), dirty buffers must be saved.
+- Session state (split ratio, dashboard sort/filter/selection/tab, open and
+  active buffers) is stored in the OS cache sidecar, never in the scanned tree.
+  Restored tabs are lazy: the first switch issues `:edit`.
 - Window resize calls `MasterPty::resize` and `vt100::Parser::set_size`.
 - Child exit leaves the workbench open, marks `[editor exited]`, stops the RPC
   worker, and `F10` quits.
@@ -330,8 +344,11 @@ Remaining limitations / next steps:
 - Polling changedtick every 150 ms is simple but not event-driven. Replace with
   `nvim_buf_attach` notifications when the workbench moves to a real RPC UI
   loop; keep 150 ms as a safety net.
-- One file/one window. Multi-file sessions, a file picker for directory
-  arguments, and cross-file health summaries are not implemented.
+- One Neovim process with a ccn tab bar over its buffers. Neovim window splits,
+  multiple tabpages, cross-file health summaries and project-wide symbol search
+  are not managed by ccn.
+- Mouse input is captured by ccn for the divider drag; clicks inside the editor
+  are not forwarded to Neovim yet. Scrollback is also still zero rows.
 - Reconnect resets `base_tick` to the new connect tick; edits made while the
   connection was down can temporarily appear "saved". Edits made before the
   first successful connect are likewise the baseline, because `unsaved` is

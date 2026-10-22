@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.10.0 (2026-10-22)
+
+The P1 IDE-feel slice: navigation, buffers and workspace restore.
+
+- **Directory file tree** in the split view's left pane: collapsible
+  directories, recursive counts, `j/k`/`g/G`, `Enter`/Space to toggle, `e`/`Enter`
+  to open a file. The full dashboard table is unchanged.
+- **`Ctrl+P` fuzzy open**: dependency-free subsequence ranking with
+  path/word-boundary bonuses, a centered overlay, `Up/Down`, `Enter` to open,
+  `Esc` to close. Works from the dashboard and the split.
+- **Multi-buffer tabs in one Neovim**: opening a file from the tree or fuzzy
+  picker reuses the live session and `:edit`s the buffer instead of restarting
+  nvim. Tab bar shows `[1 path]`, dirty `●`; `F2` previous, `F3` next, `F4`
+  close (dirty buffers are refused), `:bdelete` only for clean buffers.
+- **Session restore**: split ratio, dashboard sort/filter/selection/tab, open
+  buffers and active buffer persist in the OS cache sidecar (never inside the
+  scanned tree); restored tabs issue `:edit` lazily on first switch.
+- Tree and tab integration verified in WSL+tmux: opening `src/util.c` from the
+  tree, `Ctrl+P` to switch, F2/F3/F4, and restoring two tabs on the next run.
+- 473 lib + 17 CLI tests, 4-OS matrix, clippy/fmt clean (default and lean).
+
 ## 0.9.1 (2026-10-22)
 
 Resizable split panes.

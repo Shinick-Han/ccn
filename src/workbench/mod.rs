@@ -7,6 +7,7 @@
 
 mod pty;
 mod rpc;
+mod tabs;
 mod ui;
 
 use std::ffi::OsString;
@@ -33,9 +34,13 @@ use crate::model::{CcnSkip, FileLoc};
 
 use pty::Pty;
 use rpc::{LiveSnapshot, RpcEvent, RpcHandle, RpcStatus};
+use tabs::{path_key, Tab, Tabs};
 
 /// Re-scan the open file at most this often.
 const MTIME_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Re-query dirty state for every tab at most this often.
+const DIRTY_INTERVAL: Duration = Duration::from_millis(1000);
 
 const SMOKE_SOURCE: &str = r#"/* ccn workbench smoke file */
 int smoke_choice(int x) {
@@ -92,6 +97,13 @@ struct Cli {
 pub(crate) enum Focus {
     Editor,
     Sidebar,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TabAction {
+    Prev,
+    Next,
+    Close,
 }
 
 impl Focus {
@@ -220,6 +232,13 @@ pub(crate) struct App {
     pub rpc_disabled: bool,
     /// True when rendered as the right pane of the dashboard split.
     pub split: bool,
+    /// Ordered open files; the active tab mirrors `target`/`display`.
+    pub tabs: Tabs,
+    /// Set while an async `:bdelete` request is in flight.
+    pending_close: Option<PathBuf>,
+    /// Async `:edit` rollback: (path, previous active index, tab was new).
+    pending_switch: Option<(PathBuf, Option<usize>, bool)>,
+    last_dirty_check: Instant,
 }
 
 impl App {
@@ -247,7 +266,13 @@ impl App {
             child_alive: Arc::new(AtomicBool::new(true)),
             rpc_disabled: false,
             split: false,
+            tabs: Tabs::new(),
+            pending_close: None,
+            pending_switch: None,
+            last_dirty_check: Instant::now(),
         };
+        app.tabs
+            .open_or_select_named(&app.target, app.display.clone());
         app.rescan("scan");
         app.initial = app
             .view
@@ -346,6 +371,16 @@ impl App {
                 }
                 RpcEvent::Snapshot(snapshot) => self.apply_snapshot(snapshot),
                 RpcEvent::Note(note) => self.rpc_note = Some(note),
+                RpcEvent::Modified { path, modified } => {
+                    self.tabs.set_modified_loose(&path, modified);
+                }
+                RpcEvent::Closed {
+                    path,
+                    ok,
+                    error,
+                    current,
+                } => self.apply_closed(path, ok, error, current),
+                RpcEvent::Edited { path, ok, error } => self.apply_edited(path, ok, error),
             }
         }
         if disconnected {
@@ -470,6 +505,269 @@ impl App {
         handle.jump(line);
         self.focus = Focus::Editor;
         self.set_status(format!("jump → line {line}"), false);
+    }
+
+    /// Open a file in the existing Neovim process, or select it when already
+    /// open. Requires a live RPC connection: the PTY stream cannot reliably
+    /// tell us which buffer is current.
+    #[allow(dead_code)] // Wired by the split UI; the standalone session calls it through `open_file`.
+    pub(crate) fn open_file(&mut self, path: &Path) -> Result<(), String> {
+        let target =
+            fs::canonicalize(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        if target.is_dir() {
+            return Err(format!(
+                "{} is a directory; the workbench opens source files",
+                target.display()
+            ));
+        }
+        if !target.is_file() {
+            return Err(format!("{} is not a regular file", target.display()));
+        }
+
+        if self.tabs.active_path() == Some(target.as_path()) {
+            self.set_status(format!("tab: {} is already active", self.display), false);
+            return Ok(());
+        }
+        if self.rpc_status != RpcStatus::Live || self.rpc.is_none() {
+            return Err("tab switching needs a live Neovim RPC connection".to_string());
+        }
+
+        let display = display_path(&target);
+        let was_new = !self.tabs.contains(&target);
+        let previous = self.tabs.active_index();
+        let index = self.tabs.open_or_select_named(&target, display.clone());
+        match self.switch_to_index(index) {
+            Ok(()) => {
+                self.pending_switch = Some((target, previous, was_new));
+                Ok(())
+            }
+            Err(error) => {
+                if was_new {
+                    self.tabs.remove_path_loose(&target);
+                }
+                if let Some(previous) = previous {
+                    let _ = self.tabs.select(previous);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// F2: previous tab (wraps).
+    pub(crate) fn prev_tab(&mut self) -> Result<(), String> {
+        if self.tabs.len() < 2 {
+            self.set_status("only one tab is open".to_string(), false);
+            return Ok(());
+        }
+        match self.tabs.prev_index() {
+            Some(index) => self.switch_to_index(index),
+            None => Err("no tabs are open".to_string()),
+        }
+    }
+
+    /// F3: next tab (wraps).
+    pub(crate) fn next_tab(&mut self) -> Result<(), String> {
+        if self.tabs.len() < 2 {
+            self.set_status("only one tab is open".to_string(), false);
+            return Ok(());
+        }
+        match self.tabs.next_index() {
+            Some(index) => self.switch_to_index(index),
+            None => Err("no tabs are open".to_string()),
+        }
+    }
+
+    /// F4: close the active tab.
+    ///
+    /// Dirty buffers are never discarded implicitly: a modified tab is left
+    /// open and the footer tells the user to save first. Clean buffers get an
+    /// async `:bdelete`; the tab is removed when Neovim confirms it.
+    pub(crate) fn close_tab(&mut self) -> Result<(), String> {
+        let Some(tab) = self.tabs.active().cloned() else {
+            return Err("no tabs are open".to_string());
+        };
+        if tab.modified {
+            self.set_status(
+                format!(
+                    "{} has unsaved changes — save it before closing (F4 does not force)",
+                    tab.display
+                ),
+                true,
+            );
+            return Ok(());
+        }
+        if self.pending_close.is_some() {
+            return Err("a tab close is already in progress".to_string());
+        }
+        if self.pending_switch.is_some() {
+            return Err("a tab switch is in progress; close after it completes".to_string());
+        }
+        if self.rpc_status != RpcStatus::Live || self.rpc.is_none() {
+            return Err("closing a buffer needs a live Neovim RPC connection".to_string());
+        }
+        if let Some(handle) = &self.rpc {
+            handle.delete(tab.path.clone());
+        }
+        self.pending_close = Some(tab.path.clone());
+        self.set_status(format!("closing {} …", tab.display), false);
+        Ok(())
+    }
+
+    fn switch_to_index(&mut self, index: usize) -> Result<(), String> {
+        if self.pending_switch.is_some() {
+            return Err("a tab switch is already in progress".to_string());
+        }
+        if self.pending_close.is_some() {
+            return Err("a tab close is in progress".to_string());
+        }
+        let Some(tab) = self.tabs.tab(index).cloned() else {
+            return Err(format!("tab {} does not exist", index + 1));
+        };
+        if self.rpc_status != RpcStatus::Live || self.rpc.is_none() {
+            return Err("tab switching needs a live Neovim RPC connection".to_string());
+        }
+        let previous = self.tabs.active_index();
+        if let Some(handle) = &self.rpc {
+            handle.edit(tab.path.clone());
+        }
+        self.tabs.select(index);
+        self.pending_switch = Some((tab.path.clone(), previous, false));
+        self.sync_active_tab();
+        self.set_status(
+            format!("tab {}/{} · {}", index + 1, self.tabs.len(), self.display),
+            false,
+        );
+        Ok(())
+    }
+
+    /// Point the scan/sidebar at the selected tab and reset the live baseline
+    /// so deltas always compare against the file being shown.
+    fn sync_active_tab(&mut self) {
+        let Some(tab) = self.tabs.active().cloned() else {
+            self.set_status(
+                "all tabs closed — F10 returns to the dashboard".to_string(),
+                false,
+            );
+            return;
+        };
+        self.target = tab.path;
+        self.display = tab.display;
+        self.live = None;
+        self.rpc_read_ms = None;
+        self.selected = 0;
+        self.rescan("tab");
+        self.initial = self
+            .view
+            .as_ref()
+            .map_or_else(Vec::new, |view| view.functions.clone());
+        self.mtime = file_mtime(&self.target);
+    }
+
+    fn apply_closed(
+        &mut self,
+        path: PathBuf,
+        ok: bool,
+        error: Option<String>,
+        current: Option<PathBuf>,
+    ) {
+        let pending = self
+            .pending_close
+            .as_deref()
+            .is_some_and(|pending| path_key(pending) == path_key(&path));
+        if !ok {
+            if pending {
+                self.pending_close = None;
+            }
+            let message = error.unwrap_or_else(|| "unknown error".to_string());
+            // Neovim's E89 means the buffer is modified; keep the dirty marker
+            // in sync so the next F4 does not retry blindly.
+            if message.contains("E89") || message.to_ascii_lowercase().contains("modified") {
+                self.tabs.set_modified_loose(&path, true);
+            }
+            self.set_status(format!("close failed: {message}"), true);
+            return;
+        }
+        if !pending {
+            return;
+        }
+        self.pending_close = None;
+        if self.tabs.remove_path_loose(&path).is_none() {
+            return;
+        }
+        if self.tabs.is_empty() {
+            self.set_status(
+                "all tabs closed — F10 returns to the dashboard".to_string(),
+                false,
+            );
+            return;
+        }
+        // `:bdelete` chooses the next buffer itself; follow that exact buffer
+        // instead of guessing a neighbour. Otherwise an autocmd that blocks an
+        // explicit `:edit` leaves the tab bar and Neovim on different files.
+        if let Some(current) = current {
+            if let Some(index) = self.tabs.index_of_loose(&current) {
+                self.tabs.select(index);
+                self.sync_active_tab();
+                self.set_status(
+                    format!("closed {path_display}", path_display = path.display()),
+                    false,
+                );
+                return;
+            }
+        }
+        // No usable current-buffer name (non-file buffer or RPC hiccup): fall
+        // back to a tracked switch so an async failure can still roll back.
+        if let Some(index) = self.tabs.active_index() {
+            if let Err(error) = self.switch_to_index(index) {
+                self.set_status(format!("tab switch failed: {error}"), true);
+                return;
+            }
+        }
+        self.set_status(
+            format!("closed {path_display}", path_display = path.display()),
+            false,
+        );
+    }
+
+    fn apply_edited(&mut self, path: PathBuf, ok: bool, error: Option<String>) {
+        let matches = self
+            .pending_switch
+            .as_ref()
+            .is_some_and(|(pending, _, _)| path_key(pending) == path_key(&path));
+        if !matches {
+            return;
+        }
+        let (_, previous, was_new) = self.pending_switch.take().expect("checked above");
+        if ok {
+            return;
+        }
+
+        if was_new {
+            self.tabs.remove_path_loose(&path);
+        }
+        if let Some(index) = previous {
+            let _ = self.tabs.select(index);
+        }
+        if self.tabs.active_index().is_some() {
+            self.sync_active_tab();
+        }
+        let message = error.unwrap_or_else(|| "unknown error".to_string());
+        self.set_status(format!("tab switch failed: {message}"), true);
+    }
+
+    /// Periodically ask Neovim which listed buffers are modified.
+    pub(crate) fn maybe_query_modified(&mut self) {
+        if self.rpc_status != RpcStatus::Live || self.last_dirty_check.elapsed() < DIRTY_INTERVAL {
+            return;
+        }
+        self.last_dirty_check = Instant::now();
+        let paths = self.tabs.paths();
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(handle) = &self.rpc {
+            handle.query_modified(paths);
+        }
     }
 
     pub(crate) fn grade(&self) -> (char, &'static str) {
@@ -740,6 +1038,7 @@ impl WorkbenchSession {
 
     pub(crate) fn tick(&mut self) {
         self.app.poll_rpc();
+        self.app.maybe_query_modified();
         if self.app.exited.is_none() {
             if let Some(note) = self.child.exit_status() {
                 let empty = self.child.screen_text().trim().is_empty();
@@ -774,6 +1073,50 @@ impl WorkbenchSession {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         handle_key(&mut self.app, &mut self.child, key)
+    }
+
+    /// Tabs currently open, in order.
+    #[allow(dead_code)] // Public surface for the split UI / orchestrator.
+    pub(crate) fn tabs(&self) -> &Tabs {
+        &self.app.tabs
+    }
+
+    /// The active tab, or `None` after the last tab was closed.
+    #[allow(dead_code)] // Public surface for the split UI / orchestrator.
+    pub(crate) fn active_tab(&self) -> Option<&Tab> {
+        self.app.tabs.active()
+    }
+
+    /// Open another file in the same Neovim instance.
+    #[allow(dead_code)] // Public surface for the split UI / orchestrator.
+    pub(crate) fn open_file(&mut self, path: &Path) -> Result<(), String> {
+        self.app.open_file(path)
+    }
+
+    /// Restore the ordered buffer list from a saved session without opening
+    /// each file in Neovim yet. The first switch to a restored tab issues the
+    /// normal RPC `:edit`, so startup stays cheap.
+    pub(crate) fn adopt_tabs(&mut self, paths: &[(PathBuf, String)]) {
+        for (path, display) in paths {
+            if path.is_file() {
+                self.app.tabs.add_inactive(path, display.clone());
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Public surface for the split UI / orchestrator.
+    pub(crate) fn next_tab(&mut self) -> Result<(), String> {
+        self.app.next_tab()
+    }
+
+    #[allow(dead_code)] // Public surface for the split UI / orchestrator.
+    pub(crate) fn prev_tab(&mut self) -> Result<(), String> {
+        self.app.prev_tab()
+    }
+
+    #[allow(dead_code)] // Public surface for the split UI / orchestrator.
+    pub(crate) fn close_tab(&mut self) -> Result<(), String> {
+        self.app.close_tab()
     }
 
     pub(crate) fn resize(&mut self, width: u16, height: u16) {
@@ -909,6 +1252,7 @@ fn event_loop(
     let mut last_mtime_check = Instant::now();
     loop {
         app.poll_rpc();
+        app.maybe_query_modified();
         if event::poll(Duration::from_millis(16)).map_err(|e| format!("poll failed: {e}"))? {
             match event::read().map_err(|e| format!("read event failed: {e}"))? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -978,6 +1322,26 @@ fn handle_key(app: &mut App, child: &mut Pty, key: KeyEvent) -> bool {
     if key.code == KeyCode::F(9) {
         if key.kind == KeyEventKind::Press {
             app.toggle_focus();
+        }
+        return false;
+    }
+    // Tab keys are owned by the workbench and are never forwarded to Neovim.
+    let tab_action = match key.code {
+        KeyCode::F(2) => Some(TabAction::Prev),
+        KeyCode::F(3) => Some(TabAction::Next),
+        KeyCode::F(4) => Some(TabAction::Close),
+        _ => None,
+    };
+    if let Some(action) = tab_action {
+        if key.kind == KeyEventKind::Press {
+            let result = match action {
+                TabAction::Prev => app.prev_tab(),
+                TabAction::Next => app.next_tab(),
+                TabAction::Close => app.close_tab(),
+            };
+            if let Err(e) = result {
+                app.set_status(e, true);
+            }
         }
         return false;
     }
@@ -1282,6 +1646,9 @@ fn run_smoke_rpc(cli: &Cli, edit: bool) -> Result<(), String> {
     let file = temp.path.join("ccn_workbench_rpc.c");
     let source = "int simple(int x) {\n    return x;\n}\n\nint branchy(int x) {\n    if (x > 0) {\n        return 1;\n    }\n    return 0;\n}\n";
     fs::write(&file, source).map_err(|e| format!("cannot write the RPC smoke file: {e}"))?;
+    let other = temp.path.join("ccn_workbench_rpc_other.c");
+    fs::write(&other, "int other(int x) {\n    return x;\n}\n")
+        .map_err(|e| format!("cannot write the second RPC smoke file: {e}"))?;
 
     let parts = pty::parse_command(&cli.editor)?;
     let program = parts[0].clone();
@@ -1299,7 +1666,7 @@ fn run_smoke_rpc(cli: &Cli, edit: bool) -> Result<(), String> {
     args.push(native_path(&file));
     let mut child = Pty::spawn(&program, &args, &temp.path, 30, 100)?;
 
-    let result = smoke_rpc_session(&address, &file, &mut child, edit);
+    let result = smoke_rpc_session(&address, &file, &other, &mut child, edit);
     child.kill();
     result
 }
@@ -1307,6 +1674,7 @@ fn run_smoke_rpc(cli: &Cli, edit: bool) -> Result<(), String> {
 fn smoke_rpc_session(
     address: &str,
     file: &Path,
+    other: &Path,
     child: &mut Pty,
     edit: bool,
 ) -> Result<(), String> {
@@ -1401,6 +1769,31 @@ fn smoke_rpc_session(
     if marks.iter().any(|mark| !mark.text.contains("CCN")) {
         io.abort();
         return Err("an extmark is missing its CCN virtual text".to_string());
+    }
+
+    // Multi-buffer: switch to a second file in the same Neovim process and
+    // verify the active buffer name follows `:edit`.
+    runtime.block_on(rpc::edit_file(&nvim, other))?;
+    let switched = runtime.block_on(async {
+        let buffer = nvim.get_current_buf().await?;
+        buffer.get_name().await
+    });
+    let switched = switched.map_err(|e| format!("cannot read the active buffer: {e}"))?;
+    println!("tab switch active buffer: {switched}");
+    let expected = other
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if Path::new(&switched).file_name() != Some(std::ffi::OsStr::new(&expected)) {
+        io.abort();
+        return Err(format!(
+            "expected the active buffer to be {expected}, got {switched}"
+        ));
+    }
+    let modified = runtime.block_on(rpc::buffer_modified(&nvim, other))?;
+    if modified {
+        io.abort();
+        return Err("the freshly opened second buffer should not be modified".to_string());
     }
 
     io.abort();

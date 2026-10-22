@@ -74,10 +74,34 @@ pub enum RpcEvent {
     Snapshot(LiveSnapshot),
     /// Non-fatal problem (annotation, jump). The sidebar keeps its data.
     Note(String),
+    /// Result of a `nvim_buf_get_option(buf, "modified")` probe.
+    Modified {
+        path: PathBuf,
+        modified: bool,
+    },
+    /// Result of a `:bdelete` request. `ok == false` means the buffer is still
+    /// open (usually because it has unsaved changes).
+    Closed {
+        path: PathBuf,
+        ok: bool,
+        error: Option<String>,
+        /// Buffer Neovim selected after a successful `:bdelete`.
+        current: Option<PathBuf>,
+    },
+    /// Result of an async `:edit` request. The UI rolls the tab model back when
+    /// the switch did not reach Neovim.
+    Edited {
+        path: PathBuf,
+        ok: bool,
+        error: Option<String>,
+    },
 }
 
 pub enum RpcCommand {
     Jump { line: usize },
+    Edit { path: PathBuf },
+    Delete { path: PathBuf },
+    QueryModified { paths: Vec<PathBuf> },
     Shutdown,
 }
 
@@ -89,6 +113,20 @@ pub struct RpcHandle {
 impl RpcHandle {
     pub fn jump(&self, line: usize) {
         let _ = self.tx.send(RpcCommand::Jump { line });
+    }
+
+    /// `:edit` another file in the same Neovim process.
+    pub fn edit(&self, path: PathBuf) {
+        let _ = self.tx.send(RpcCommand::Edit { path });
+    }
+
+    /// `:bdelete` without `!`: Neovim refuses when the buffer is modified.
+    pub fn delete(&self, path: PathBuf) {
+        let _ = self.tx.send(RpcCommand::Delete { path });
+    }
+
+    pub fn query_modified(&self, paths: Vec<PathBuf>) {
+        let _ = self.tx.send(RpcCommand::QueryModified { paths });
     }
 
     pub fn shutdown(&self) {
@@ -147,7 +185,7 @@ pub fn spawn(
             };
             runtime.block_on(worker(
                 &address,
-                &fallback_path,
+                fallback_path,
                 &baseline,
                 &child_alive,
                 &cmd_rx,
@@ -160,7 +198,7 @@ pub fn spawn(
 
 async fn worker(
     address: &str,
-    fallback_path: &Path,
+    mut fallback_path: PathBuf,
     baseline: &HashMap<String, u32>,
     child_alive: &AtomicBool,
     cmd_rx: &Receiver<RpcCommand>,
@@ -190,7 +228,15 @@ async fn worker(
         };
 
         send_status(events, &mut status, RpcStatus::Live);
-        let end = session(&nvim, fallback_path, baseline, child_alive, cmd_rx, events).await;
+        let end = session(
+            &nvim,
+            &mut fallback_path,
+            baseline,
+            child_alive,
+            cmd_rx,
+            events,
+        )
+        .await;
         io.abort();
         match end {
             SessionEnd::Shutdown | SessionEnd::ChannelClosed | SessionEnd::ChildGone => break,
@@ -241,7 +287,7 @@ enum SessionEnd {
 
 async fn session(
     nvim: &Rpc,
-    fallback_path: &Path,
+    fallback_path: &mut PathBuf,
     baseline: &HashMap<String, u32>,
     child_alive: &AtomicBool,
     cmd_rx: &Receiver<RpcCommand>,
@@ -258,6 +304,63 @@ async fn session(
                 RpcCommand::Jump { line } => {
                     if let Err(e) = jump(nvim, line).await {
                         let _ = events.send(RpcEvent::Note(format!("jump: {e}")));
+                    }
+                }
+                RpcCommand::Edit { path } => match edit_file(nvim, &path).await {
+                    Ok(()) => {
+                        // The current buffer changed; force a fresh read even
+                        // if the new buffer's changedtick equals the old one.
+                        fallback_path.clone_from(&path);
+                        last_tick = None;
+                        base_tick = None;
+                        let modified = buffer_modified(nvim, &path).await.unwrap_or(false);
+                        let _ = events.send(RpcEvent::Modified {
+                            path: path.clone(),
+                            modified,
+                        });
+                        let _ = events.send(RpcEvent::Edited {
+                            path,
+                            ok: true,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = events.send(RpcEvent::Edited {
+                            path,
+                            ok: false,
+                            error: Some(e.clone()),
+                        });
+                        let _ = events.send(RpcEvent::Note(format!("edit: {e}")));
+                    }
+                },
+                RpcCommand::Delete { path } => match delete_buffer(nvim, &path).await {
+                    Ok(()) => {
+                        last_tick = None;
+                        base_tick = None;
+                        let current = current_buffer_path(nvim).await;
+                        let _ = events.send(RpcEvent::Closed {
+                            path,
+                            ok: true,
+                            error: None,
+                            current,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = events.send(RpcEvent::Closed {
+                            path,
+                            ok: false,
+                            error: Some(error),
+                            current: None,
+                        });
+                    }
+                },
+                RpcCommand::QueryModified { paths } => {
+                    for path in paths {
+                        if let Ok(modified) = buffer_modified(nvim, &path).await {
+                            if events.send(RpcEvent::Modified { path, modified }).is_err() {
+                                return SessionEnd::ChannelClosed;
+                            }
+                        }
                     }
                 }
             }
@@ -283,8 +386,18 @@ async fn session(
                 last_tick = Some(tick);
                 let snapshot = read_snapshot(nvim, fallback_path, base_tick.unwrap_or(tick)).await;
                 let failed = snapshot.error.is_some();
+                let snapshot_name = snapshot.name.clone();
+                let modified = buffer_modified(nvim, Path::new(&snapshot_name))
+                    .await
+                    .unwrap_or(false);
                 if events.send(RpcEvent::Snapshot(snapshot.clone())).is_err() {
                     return SessionEnd::ChannelClosed;
+                }
+                if !failed && !snapshot_name.is_empty() {
+                    let _ = events.send(RpcEvent::Modified {
+                        path: PathBuf::from(&snapshot_name),
+                        modified,
+                    });
                 }
                 if !failed {
                     let _ = annotate(nvim, &snapshot.functions, baseline)
@@ -548,6 +661,86 @@ pub async fn dump_marks(nvim: &Rpc) -> Result<Vec<MarkInfo>, String> {
                 .to_string(),
         })
         .collect())
+}
+
+const EDIT_LUA: &str = r#"
+local path = ...
+-- `hide` keeps an unsaved current buffer alive instead of failing with E37.
+local ok, err = pcall(vim.cmd, 'hide edit ' .. vim.fn.fnameescape(path))
+if not ok then error(err) end
+"#;
+
+/// Switch the current window to `path` inside the same Neovim process.
+///
+/// The path is passed as a Lua argument and escaped with `fnameescape`, so a
+/// filename containing spaces or command characters cannot become a command.
+/// The edit is prefixed with `hide`, so switching away from a modified buffer
+/// keeps it in memory instead of raising E37 or discarding it.
+/// Current buffer path reported by Neovim, or `None` for an unnamed buffer.
+async fn current_buffer_path(nvim: &Rpc) -> Option<PathBuf> {
+    let buffer = nvim.get_current_buf().await.ok()?;
+    let name = buffer.get_name().await.ok()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(name))
+    }
+}
+
+pub async fn edit_file(nvim: &Rpc, path: &Path) -> Result<(), String> {
+    let path = lua_path(path);
+    nvim.exec_lua(EDIT_LUA, vec![nvim_rs::Value::from(path)])
+        .await
+        .map_err(|e| format!("exec_lua edit: {e}"))?;
+    Ok(())
+}
+
+const DELETE_LUA: &str = r#"
+local path = ...
+local buf = vim.fn.bufnr(path)
+if buf == -1 then return false end
+local ok, err = pcall(vim.api.nvim_buf_delete, buf, { force = false })
+if not ok then error(err) end
+return true
+"#;
+
+/// `:bdelete` a buffer by path without forcing.
+///
+/// A modified buffer is refused by Neovim; the caller must decide explicitly
+/// (save it or run `:bdelete!` itself). This keeps unsaved work intact.
+pub async fn delete_buffer(nvim: &Rpc, path: &Path) -> Result<(), String> {
+    let path = lua_path(path);
+    nvim.exec_lua(DELETE_LUA, vec![nvim_rs::Value::from(path)])
+        .await
+        .map_err(|e| format!("exec_lua bdelete: {e}"))?;
+    Ok(())
+}
+
+const MODIFIED_LUA: &str = r#"
+local path = ...
+local buf = vim.fn.bufnr(path)
+if buf == -1 then return 0 end
+local ok, value = pcall(vim.api.nvim_buf_get_option, buf, 'modified')
+if not ok then return 0 end
+if value then return 1 end
+return 0
+"#;
+
+/// Query `nvim_buf_get_option(buf, "modified")` for a file on disk path.
+pub async fn buffer_modified(nvim: &Rpc, path: &Path) -> Result<bool, String> {
+    let path = lua_path(path);
+    let value = nvim
+        .exec_lua(MODIFIED_LUA, vec![nvim_rs::Value::from(path)])
+        .await
+        .map_err(|e| format!("exec_lua modified: {e}"))?;
+    Ok(value.as_i64() == Some(1))
+}
+
+/// Neovim reports and accepts the native path, not the Windows `\\?\`
+/// verbatim form produced by `fs::canonicalize`.
+fn lua_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
 }
 
 async fn jump(nvim: &Rpc, line: usize) -> Result<(), String> {
