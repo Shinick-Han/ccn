@@ -17,6 +17,11 @@ The P1 IDE-feel slice: navigation, buffers and workspace restore.
 - **Session restore**: split ratio, dashboard sort/filter/selection/tab, open
   buffers and active buffer persist in the OS cache sidecar (never inside the
   scanned tree); restored tabs issue `:edit` lazily on first switch.
+- **Quit safety**: with a live editor session, destructive dashboard keys
+  (`q`, `Esc`, `Ctrl+C`) require a second `q`; tab open/switch/close RPC
+  transitions are serialized and roll back on an async `:edit` failure.
+- Atomic session replacement keeps the previous file as `.old` on Windows if
+  the rename fails, and `load` falls back to it after a crash.
 - Tree and tab integration verified in WSL+tmux: opening `src/util.c` from the
   tree, `Ctrl+P` to switch, F2/F3/F4, and restoring two tabs on the next run.
 - 473 lib + 17 CLI tests, 4-OS matrix, clippy/fmt clean (default and lean).
