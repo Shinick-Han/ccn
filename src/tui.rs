@@ -135,6 +135,7 @@ struct DiffPane {
     rows: Vec<DiffLine>,
     selected: usize,
     hunk: Option<Hunk>,
+    side_by_side: bool,
     title: String,
 }
 
@@ -318,6 +319,7 @@ fn build_diff_pane(
         rows,
         selected: 0,
         hunk: None,
+        side_by_side: false,
         title: format!("{} - {} @ {}", change.name, change.path, rev),
     })
 }
@@ -646,7 +648,7 @@ pub fn run_unified(
                                         || format!("{} - all files", base.rev),
                                         |path| format!("{} - {path}", base.rev),
                                     );
-                                    crate::workbench::review_ui::render_filtered(
+                                    crate::workbench::review_ui::render_filtered_with_reviewed(
                                         frame,
                                         right,
                                         queue.changes(),
@@ -655,6 +657,7 @@ pub fn run_unified(
                                         &title,
                                         base.threshold,
                                         queue.kind_filter(),
+                                        queue.reviewed_keys(),
                                     );
                                 }
                                 if let Some((items, selected)) = &diagnostics {
@@ -670,15 +673,27 @@ pub fn run_unified(
                                 }
                                 if let Some(pane) = &diff {
                                     frame.render_widget(Clear, right);
-                                    crate::workbench::diff_ui::render_with_hunks(
-                                        frame,
-                                        right,
-                                        &pane.rows,
-                                        pane.selected,
-                                        true,
-                                        &pane.title,
-                                        pane.hunk,
-                                    );
+                                    if pane.side_by_side {
+                                        crate::workbench::diff_ui::render_side_by_side(
+                                            frame,
+                                            right,
+                                            &pane.rows,
+                                            pane.selected,
+                                            true,
+                                            &pane.title,
+                                            pane.hunk,
+                                        );
+                                    } else {
+                                        crate::workbench::diff_ui::render_with_hunks(
+                                            frame,
+                                            right,
+                                            &pane.rows,
+                                            pane.selected,
+                                            true,
+                                            &pane.title,
+                                            pane.hunk,
+                                        );
+                                    }
                                 }
                                 if symbols.is_open() {
                                     crate::symbols::render(frame, frame.area(), &symbols);
@@ -884,6 +899,9 @@ pub fn run_unified(
                                             KeyCode::PageUp => {
                                                 pane.selected = pane.selected.saturating_sub(10)
                                             }
+                                            KeyCode::Char('s') => {
+                                                pane.side_by_side = !pane.side_by_side
+                                            }
                                             KeyCode::Char('g') | KeyCode::Home => pane.selected = 0,
                                             KeyCode::Char('G') | KeyCode::End => {
                                                 pane.selected = pane.rows.len().saturating_sub(1)
@@ -991,6 +1009,9 @@ pub fn run_unified(
                                                 crate::baseline::Kind::Worsened,
                                             )),
                                             KeyCode::Char('u') => queue.set_kind_filter(None),
+                                            KeyCode::Char('x') | KeyCode::Char(' ') => {
+                                                queue.toggle_selected_reviewed();
+                                            }
                                             KeyCode::Char('f') => {
                                                 if let Some(base) = report.baseline.as_ref() {
                                                     review_current_only = !review_current_only;

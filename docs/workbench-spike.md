@@ -48,9 +48,9 @@ implementation; the public entry point is `ccn workbench` (single file) and
   switch, `F4` closes a clean buffer (`:bdelete`), dirty buffers must be saved.
 - With `--baseline <rev>`, `F6` opens the baseline review panel. `f` toggles
   current-file/all-files, `a`/`w`/`u` filter added/worsened/all, `{`/`}` jump
-  between files, `n/p` or `j/k` move, `d` opens a unified baseline-vs-live line
-  diff for the selected function, Enter opens the owning tab and jumps to the
-  line. It consumes `crate::baseline::Change` rows already produced by the
+  between files, `n/p` or `j/k` move, `d` opens the baseline-vs-live line diff
+  (`s` toggles side-by-side), `x` marks the selected finding reviewed, Enter
+  opens the owning tab and jumps to the line. It consumes `crate::baseline::Change` rows already produced by the
   scanner; the diff reads baseline bytes via `vcs::file_at` and live bytes from
   the RPC snapshot, so unsaved edits are included and no file is written.
 - `F7` opens diagnostics: scan read errors/oversize/no-grammar and

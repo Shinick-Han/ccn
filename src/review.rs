@@ -13,6 +13,7 @@
 //! [`Change`]: crate::baseline::Change
 
 use crate::baseline::{Change, Kind};
+use std::collections::BTreeSet;
 
 /// A selectable list of baseline changes, optionally restricted to one path.
 #[derive(Debug, Clone)]
@@ -29,6 +30,9 @@ pub struct ReviewQueue {
     path_filter: Option<String>,
     /// Optional kind filter composed with `path_filter`.
     kind_filter: Option<Kind>,
+    /// Session-only reviewed marks, keyed by [`key`]. Never pruned by filtering,
+    /// so marks survive path/kind changes and selection movement.
+    reviewed: BTreeSet<String>,
 }
 
 impl ReviewQueue {
@@ -44,6 +48,7 @@ impl ReviewQueue {
             selected: 0,
             path_filter: path_filter.map(normalize_path),
             kind_filter: None,
+            reviewed: BTreeSet::new(),
         };
         queue.refilter();
         queue
@@ -129,6 +134,50 @@ impl ReviewQueue {
         self.kind_filter
     }
 
+    /// Toggle the reviewed mark on the selected change.
+    ///
+    /// Returns the new state, or `false` when the queue is empty. The mark is
+    /// keyed by [`key`], so it stays attached to the function rather than to a
+    /// row index and survives filter changes and selection movement. Marks are
+    /// session-only and are never written anywhere.
+    pub fn toggle_selected_reviewed(&mut self) -> bool {
+        let Some(change) = self.selected_change() else {
+            return false;
+        };
+        let key = key(change);
+        if self.reviewed.remove(&key) {
+            false
+        } else {
+            self.reviewed.insert(key);
+            true
+        }
+    }
+
+    /// Whether the selected change is marked reviewed. `false` on an empty queue.
+    pub fn selected_reviewed(&self) -> bool {
+        self.selected_change()
+            .is_some_and(|change| self.reviewed.contains(&key(change)))
+    }
+
+    /// Number of marked changes among the currently filtered changes.
+    /// Session-only reviewed keys, for the panel renderer.
+    pub fn reviewed_keys(&self) -> &BTreeSet<String> {
+        &self.reviewed
+    }
+
+    pub fn reviewed_count(&self) -> usize {
+        self.changes
+            .iter()
+            .filter(|change| self.reviewed.contains(&key(change)))
+            .count()
+    }
+
+    /// Number of distinct functions marked reviewed this session, across every
+    /// path and kind filter.
+    pub fn total_reviewed(&self) -> usize {
+        self.reviewed.len()
+    }
+
     /// Unique paths among the filtered changes, in first-appearance order.
     ///
     /// Paths are compared after normalizing separators; the first spelling seen
@@ -197,7 +246,9 @@ impl ReviewQueue {
     ///
     /// For example `3 changes - +2 added - +14 CCN`. An empty queue is
     /// `no changes`. When a kind filter is active, ` - worsened-only` or
-    /// ` - added-only` is appended.
+    /// ` - added-only` is appended. Once anything is marked reviewed for the
+    /// session, ` \u{b7} reviewed N/M` is appended, where `N` counts marked
+    /// changes in the current filter and `M` is the filtered length.
     pub fn summary(&self) -> String {
         if self.changes.is_empty() {
             return "no changes".to_string();
@@ -212,6 +263,13 @@ impl ReviewQueue {
             Some(Kind::Added) => summary.push_str(" - added-only"),
             Some(Kind::Worsened) => summary.push_str(" - worsened-only"),
             None => {}
+        }
+        if self.total_reviewed() > 0 {
+            summary.push_str(&format!(
+                " \u{b7} reviewed {}/{}",
+                self.reviewed_count(),
+                self.changes.len()
+            ));
         }
         summary
     }
@@ -266,6 +324,20 @@ impl ReviewQueue {
             .filter(|change| change.kind == kind)
             .count()
     }
+}
+
+/// Stable reviewed-state key for a change: normalized path, a NUL separator,
+/// then the function identity (or the name when the identity is empty).
+///
+/// The path is normalized with `\` -> `/` so the Windows and Unix spellings of
+/// the same file share one mark. The key is otherwise exact and case-sensitive.
+pub fn key(change: &Change) -> String {
+    let identity = if change.identity.is_empty() {
+        change.name.as_str()
+    } else {
+        change.identity.as_str()
+    };
+    format!("{}\0{identity}", normalize_path(&change.path))
 }
 
 /// Normalize path separators to `/` so Windows and Unix spellings of the same
@@ -611,5 +683,146 @@ mod tests {
 
         let empty = ReviewQueue::new(&[], None);
         assert_eq!(empty.summary(), "no changes");
+    }
+
+    #[test]
+    fn key_is_stable_across_separators_and_falls_back_to_name() {
+        let mut change = change("src\\a.rs", "big", 10, 30, Some(20));
+        change.identity = "Widget::draw(int)".to_string();
+        let by_unix = key(&change);
+        change.path = "src/a.rs".to_string();
+        assert_eq!(by_unix, key(&change));
+        assert!(by_unix.starts_with("src/a.rs\0"));
+        assert!(by_unix.ends_with("Widget::draw(int)"));
+
+        // An unknown identity (old data) falls back to the function name.
+        change.identity.clear();
+        assert_eq!(key(&change), "src/a.rs\0big");
+    }
+
+    #[test]
+    fn toggling_marks_the_selected_change_and_returns_the_new_state() {
+        let mut queue = ReviewQueue::new(&sample(), None);
+
+        assert!(!queue.selected_reviewed());
+        assert_eq!(queue.reviewed_count(), 0);
+        assert_eq!(queue.total_reviewed(), 0);
+
+        assert!(queue.toggle_selected_reviewed(), "first toggle marks it");
+        assert!(queue.selected_reviewed());
+        assert_eq!(queue.reviewed_count(), 1);
+        assert_eq!(queue.total_reviewed(), 1);
+
+        assert!(
+            !queue.toggle_selected_reviewed(),
+            "second toggle unmarks it"
+        );
+        assert!(!queue.selected_reviewed());
+        assert_eq!(queue.reviewed_count(), 0);
+        assert_eq!(queue.total_reviewed(), 0);
+    }
+
+    #[test]
+    fn reviewed_marks_follow_the_function_not_the_selection() {
+        let mut queue = ReviewQueue::new(&sample(), None);
+        queue.toggle_selected_reviewed(); // "big" at selected 0
+
+        queue.next();
+        assert_eq!(
+            queue.selected_change().map(|c| c.name.as_str()),
+            Some("new")
+        );
+        assert!(
+            !queue.selected_reviewed(),
+            "a different function is selected"
+        );
+        assert_eq!(
+            queue.reviewed_count(),
+            1,
+            "the mark stays on the filtered change"
+        );
+
+        queue.prev();
+        assert!(queue.selected_reviewed(), "back on the marked function");
+    }
+
+    #[test]
+    fn reviewed_count_only_covers_the_current_filter() {
+        let mut queue = ReviewQueue::new(&sample(), None);
+        queue.toggle_selected_reviewed(); // "big" (src/a.rs)
+        queue.select(2);
+        queue.toggle_selected_reviewed(); // "worse" (src/b.rs)
+        assert_eq!(queue.reviewed_count(), 2);
+        assert_eq!(queue.total_reviewed(), 2);
+
+        queue.set_path_filter(Some("src/a.rs"));
+        assert_eq!(queue.reviewed_count(), 1, "only visible marks are counted");
+        assert_eq!(
+            queue.total_reviewed(),
+            2,
+            "the other mark persists outside the filter"
+        );
+        assert_eq!(
+            queue.summary(),
+            "2 changes - +1 added - +24 CCN \u{b7} reviewed 1/2"
+        );
+
+        queue.set_path_filter(Some("src/b.rs"));
+        assert_eq!(queue.reviewed_count(), 1);
+        assert_eq!(queue.total_reviewed(), 2);
+
+        queue.set_path_filter(Some("src/zzz.rs"));
+        assert_eq!(queue.reviewed_count(), 0);
+        assert!(queue.summary().starts_with("no changes"));
+    }
+
+    #[test]
+    fn reviewed_marks_survive_kind_filter_composition() {
+        let mut queue = ReviewQueue::new(&sample(), None);
+        queue.select(1); // "new", added
+        assert!(queue.toggle_selected_reviewed());
+
+        queue.set_kind_filter(Some(Kind::Worsened));
+        assert_eq!(
+            queue.reviewed_count(),
+            0,
+            "the mark is hidden by the filter"
+        );
+        assert_eq!(queue.total_reviewed(), 1);
+        assert_eq!(
+            queue.summary(),
+            "3 changes - +0 added - +16 CCN - worsened-only \u{b7} reviewed 0/3"
+        );
+
+        queue.set_kind_filter(Some(Kind::Added));
+        assert_eq!(queue.reviewed_count(), 1);
+        assert!(queue.selected_reviewed());
+
+        queue.set_kind_filter(None);
+        assert_eq!(queue.reviewed_count(), 1);
+        assert_eq!(queue.total_reviewed(), 1);
+    }
+
+    #[test]
+    fn reviewed_operations_on_an_empty_queue_are_no_ops() {
+        let mut queue = ReviewQueue::new(&[], None);
+
+        assert!(!queue.toggle_selected_reviewed());
+        assert!(!queue.selected_reviewed());
+        assert_eq!(queue.reviewed_count(), 0);
+        assert_eq!(queue.total_reviewed(), 0);
+        assert_eq!(queue.summary(), "no changes");
+    }
+
+    #[test]
+    fn summary_reports_reviewed_progress_after_a_mark() {
+        let mut queue = ReviewQueue::new(&sample(), None);
+        assert_eq!(queue.summary(), "4 changes - +1 added - +30 CCN");
+
+        queue.toggle_selected_reviewed();
+        assert_eq!(
+            queue.summary(),
+            "4 changes - +1 added - +30 CCN \u{b7} reviewed 1/4"
+        );
     }
 }

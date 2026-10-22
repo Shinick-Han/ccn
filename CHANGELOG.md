@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.18.0 (2026-10-22)
+
+Review polish.
+
+- Baseline diff has a **side-by-side** mode (`s`) with old/new line numbers and
+  aligned replacement rows; unified mode remains the default.
+- Review rows can be marked **reviewed** with `x` or Space; the panel shows
+  `[x]`/`[ ]`, the subtitle shows reviewed progress, and marks survive filters.
+- Diff hunk navigation from 0.17 (`[`/`]`) is highlighted in both modes.
+- 643 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; WSL+tmux
+  verified review -> diff -> side-by-side.
+
 ## 0.17.0 (2026-10-22)
 
 Workspace polish.

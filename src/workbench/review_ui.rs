@@ -5,12 +5,14 @@
 //! every frame and the renderer derives a local scroll window from it.
 
 use crate::baseline::{Change, Kind};
+use crate::review::key;
 use crate::theme::AURA;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use std::collections::BTreeSet;
 
 /// Title shown in the panel border.
 fn title_text(rev: &str) -> String {
@@ -52,6 +54,25 @@ fn summary_line_filtered(changes: &[Change], threshold: u32, kind: Option<Kind>)
         Some(Kind::Added) => line.push_str(" \u{b7} added-only"),
         Some(Kind::Worsened) => line.push_str(" \u{b7} worsened-only"),
         None => {}
+    }
+    line
+}
+
+/// Subtitle that additionally reports reviewed progress when the caller
+/// supplies reviewed state. With `None` the line is unchanged.
+fn summary_line_with_reviewed(
+    changes: &[Change],
+    threshold: u32,
+    kind: Option<Kind>,
+    reviewed: Option<&BTreeSet<String>>,
+) -> String {
+    let mut line = summary_line_filtered(changes, threshold, kind);
+    if let Some(reviewed) = reviewed {
+        let count = changes
+            .iter()
+            .filter(|change| reviewed.contains(&key(change)))
+            .count();
+        line.push_str(&format!(" \u{b7} reviewed {count}/{}", changes.len()));
     }
     line
 }
@@ -131,7 +152,21 @@ fn marker_style(change: &Change) -> Style {
 }
 
 /// Build one styled row. The caller guarantees `width > 0`.
+#[allow(dead_code)]
 fn row_line(change: &Change, width: u16, selected: bool) -> Line<'static> {
+    row_line_with_check(change, width, selected, None)
+}
+
+/// Build one styled row, optionally prefixing the reviewed checkbox.
+///
+/// `checked == None` keeps the original row untouched; `Some` renders `[x]` or
+/// `[ ]` before the kind marker. The selected pill background still wins.
+fn row_line_with_check(
+    change: &Change,
+    width: u16,
+    selected: bool,
+    checked: Option<bool>,
+) -> Line<'static> {
     let bg = if selected { AURA.pill } else { AURA.card };
     let text_style = if selected {
         Style::default()
@@ -144,15 +179,20 @@ fn row_line(change: &Change, width: u16, selected: bool) -> Line<'static> {
     let muted = Style::default().fg(AURA.muted).bg(bg);
     let width_chars = usize::from(width);
 
+    let check_text = match checked {
+        Some(true) => "[x] ",
+        Some(false) => "[ ] ",
+        None => "",
+    };
     let mark = marker(change);
-    let prefix = format!("{mark} {:>5} ", change.line);
+    let prefix = format!("{check_text}{mark} {:>5} ", change.line);
     let suffix = format!(" {} {}", ccn_text(change), delta_text(change));
     let base_len = prefix.chars().count() + suffix.chars().count();
 
     // At very narrow widths a single truncated span is the only sane output.
     if width_chars <= base_len + 1 {
         return Line::from(Span::styled(
-            truncate_chars(&change_line(change), width),
+            truncate_chars(&format!("{check_text}{}", change_line(change)), width),
             text_style,
         ));
     }
@@ -173,7 +213,21 @@ fn row_line(change: &Change, width: u16, selected: bool) -> Line<'static> {
     let name_budget = width_chars.saturating_sub(base_len + reason_len).max(1);
     let name = truncate_chars(&change.name, u16::try_from(name_budget).unwrap_or(u16::MAX));
 
-    let mut spans = vec![
+    let mut spans: Vec<Span> = Vec::with_capacity(6);
+    if let Some(checked) = checked {
+        spans.push(Span::styled(
+            check_text,
+            if checked {
+                Style::default()
+                    .fg(AURA.ok)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                muted
+            },
+        ));
+    }
+    spans.extend([
         Span::styled(format!("{mark} "), marker_style(change).bg(bg)),
         Span::styled(format!("{:>5} ", change.line), muted),
         Span::styled(name, text_style),
@@ -187,7 +241,7 @@ fn row_line(change: &Change, width: u16, selected: bool) -> Line<'static> {
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
+    ]);
     if !reason_text.is_empty() {
         spans.push(Span::styled(format!("  {reason_text}"), muted));
     }
@@ -271,8 +325,8 @@ pub(crate) fn render(
     rev: &str,
     threshold: u32,
 ) {
-    render_filtered(
-        frame, area, changes, selected, focused, rev, threshold, None,
+    render_impl(
+        frame, area, changes, selected, focused, rev, threshold, None, None,
     );
 }
 
@@ -291,6 +345,57 @@ pub(crate) fn render_filtered(
     rev: &str,
     threshold: u32,
     kind: Option<Kind>,
+) {
+    render_impl(
+        frame, area, changes, selected, focused, rev, threshold, kind, None,
+    );
+}
+
+/// Render the review panel with kind filter and session reviewed marks.
+///
+/// `reviewed` holds [`crate::review::key`] values; rows gain a `[x]`/`[ ]`
+/// checkbox and the subtitle gains `reviewed N/M`. Passing an empty set still
+/// shows the checkbox column and `reviewed 0/M`, because the caller has opted
+/// into reviewed state.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_filtered_with_reviewed(
+    frame: &mut Frame,
+    area: Rect,
+    changes: &[Change],
+    selected: usize,
+    focused: bool,
+    rev: &str,
+    threshold: u32,
+    kind: Option<Kind>,
+    reviewed: &BTreeSet<String>,
+) {
+    render_impl(
+        frame,
+        area,
+        changes,
+        selected,
+        focused,
+        rev,
+        threshold,
+        kind,
+        Some(reviewed),
+    );
+}
+
+/// Shared renderer. `reviewed` is `None` for the legacy API, which keeps the
+/// old rows and subtitle byte-for-byte identical.
+#[allow(clippy::too_many_arguments)]
+fn render_impl(
+    frame: &mut Frame,
+    area: Rect,
+    changes: &[Change],
+    selected: usize,
+    focused: bool,
+    rev: &str,
+    threshold: u32,
+    kind: Option<Kind>,
+    reviewed: Option<&BTreeSet<String>>,
 ) {
     let border = if focused {
         AURA.border_focus
@@ -316,7 +421,7 @@ pub(crate) fn render_filtered(
 
     // Row 0 is always the subtitle; the list gets what remains.
     let subtitle = truncate_chars(
-        &summary_line_filtered(changes, threshold, kind),
+        &summary_line_with_reviewed(changes, threshold, kind, reviewed),
         inner.width,
     );
     frame.render_widget(
@@ -379,7 +484,12 @@ pub(crate) fn render_filtered(
         .iter()
         .map(|row| match row {
             Row::Header { path, count } => header_line(path, *count, list_area.width),
-            Row::Change(index) => row_line(&changes[*index], list_area.width, *index == selected),
+            Row::Change(index) => row_line_with_check(
+                &changes[*index],
+                list_area.width,
+                *index == selected,
+                reviewed.map(|set| set.contains(&key(&changes[*index]))),
+            ),
         })
         .collect();
     frame.render_widget(
@@ -595,6 +705,130 @@ mod tests {
         for (w, h) in [(1, 1), (1, 3), (5, 2), (12, 3), (19, 4)] {
             draw(w, h, &sample(), 1);
             draw(w, h, &[], 0);
+        }
+    }
+
+    fn reviewed_set(changes: &[Change], indices: &[usize]) -> BTreeSet<String> {
+        indices.iter().map(|index| key(&changes[*index])).collect()
+    }
+
+    fn reviewed_rows(
+        width: u16,
+        height: u16,
+        changes: &[Change],
+        selected: usize,
+        reviewed: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_filtered_with_reviewed(
+                    frame,
+                    frame.area(),
+                    changes,
+                    selected,
+                    true,
+                    "main",
+                    10,
+                    None,
+                    reviewed,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reviewed_rows_show_checked_and_unchecked_markers() {
+        let changes = multifile();
+        let reviewed = reviewed_set(&changes, &[0]);
+        let joined = reviewed_rows(100, 8, &changes, 2, &reviewed).join("\n");
+
+        assert!(joined.contains("[x]"), "rows: {joined}");
+        assert!(joined.contains("[ ]"), "rows: {joined}");
+        // The selected pill still wins over the checkbox decoration.
+        assert!(joined.contains("b_worse"), "rows: {joined}");
+    }
+
+    #[test]
+    fn reviewed_subtitle_reports_the_checked_count() {
+        let changes = multifile();
+        let reviewed = reviewed_set(&changes, &[0, 1]);
+        let joined = reviewed_rows(100, 8, &changes, 0, &reviewed).join("\n");
+
+        assert!(joined.contains("reviewed 2/3"), "rows: {joined}");
+    }
+
+    #[test]
+    fn grouping_still_works_with_reviewed_state() {
+        let changes = multifile();
+        let reviewed = reviewed_set(&changes, &[0, 1, 2]);
+        let joined = reviewed_rows(100, 8, &changes, 0, &reviewed).join("\n");
+
+        assert!(joined.contains("src/a.rs (2)"), "rows: {joined}");
+        assert!(joined.contains("src/b.rs (1)"), "rows: {joined}");
+        assert!(joined.contains("reviewed 3/3"), "rows: {joined}");
+    }
+
+    #[test]
+    fn legacy_render_is_unchanged_by_reviewed_support() {
+        let changes = multifile();
+        let mut terminal = Terminal::new(TestBackend::new(48, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_filtered(frame, frame.area(), &changes, 0, true, "main", 10, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..8 {
+            for x in 0..48 {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            !text.contains("[x]"),
+            "legacy rows have no checkbox: {text}"
+        );
+        assert!(
+            !text.contains("[ ]"),
+            "legacy rows have no checkbox: {text}"
+        );
+        assert!(
+            !text.contains("reviewed"),
+            "legacy subtitle is unchanged: {text}"
+        );
+    }
+
+    #[test]
+    fn summary_with_reviewed_is_opt_in() {
+        let changes = sample();
+        assert_eq!(
+            summary_line_with_reviewed(&changes, 10, None, None),
+            summary_line(&changes, 10)
+        );
+        let reviewed = reviewed_set(&changes, &[1]);
+        assert_eq!(
+            summary_line_with_reviewed(&changes, 10, Some(Kind::Worsened), Some(&reviewed)),
+            "3 changes \u{b7} added 1 \u{b7} worsened 2 \u{b7} +18 CCN \u{b7} threshold 10 \u{b7} worsened-only \u{b7} reviewed 1/3"
+        );
+    }
+
+    #[test]
+    fn tiny_areas_render_with_reviewed_state_without_panicking() {
+        let changes = multifile();
+        let reviewed = reviewed_set(&changes, &[2]);
+        for (w, h) in [(1, 1), (1, 3), (5, 2), (12, 3), (19, 4)] {
+            let _ = reviewed_rows(w, h, &changes, 2, &reviewed);
+            let _ = reviewed_rows(w, h, &[], 0, &reviewed);
         }
     }
 

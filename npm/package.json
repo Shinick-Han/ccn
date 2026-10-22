@@ -1,6 +1,6 @@
 {
   "name": "@shinick/ccn",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Repository code-health scanner: per-file LOC, per-function CCN, histograms, trend and hotspot ranking",
   "keywords": [
     "cyclomatic-complexity",
@@ -30,10 +30,10 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@shinick/ccn-linux-x64": "0.17.0",
-    "@shinick/ccn-darwin-x64": "0.17.0",
-    "@shinick/ccn-darwin-arm64": "0.17.0",
-    "@shinick/ccn-win32-x64": "0.17.0"
+    "@shinick/ccn-linux-x64": "0.18.0",
+    "@shinick/ccn-darwin-x64": "0.18.0",
+    "@shinick/ccn-darwin-arm64": "0.18.0",
+    "@shinick/ccn-win32-x64": "0.18.0"
   },
   "engines": {
     "node": ">=14"
