@@ -1,6 +1,6 @@
 {
   "name": "@shinick/ccn-darwin-arm64",
-  "version": "0.7.8",
+  "version": "0.7.9",
   "description": "ccn binary for macOS Apple Silicon",
   "license": "MIT",
   "homepage": "https://github.com/Shinick-Han/ccn",

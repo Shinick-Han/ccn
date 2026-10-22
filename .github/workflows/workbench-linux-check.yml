@@ -139,3 +139,70 @@ jobs:
             ccn-nvim-probe-linux-x64
           if-no-files-found: error
           retention-days: 14
+
+  macos-x64:
+    name: build + smoke workbench (macOS Intel)
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build and smoke
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          cargo build --release --locked --features workbench --bin ccn-workbench
+          ./target/release/ccn-workbench --smoke
+
+  macos-arm64:
+    name: build + smoke workbench (macOS arm64)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build and smoke
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          cargo build --release --locked --features workbench --bin ccn-workbench
+          ./target/release/ccn-workbench --smoke
+
+  windows:
+    name: build + smoke workbench (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Build and smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --features workbench --bin ccn-workbench
+          ./target/release/ccn-workbench.exe --smoke
+

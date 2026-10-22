@@ -47,6 +47,27 @@ the repo has history. No CDN, no chart library, no telemetry — ~27 KB.
 `--tui` keys: `j/k` move, `Tab` chart, `s` sort, `/` filter, `Enter` detail,
 `?` help, `q` quit. On a non-TTY it falls back to the summary.
 
+### Experimental: ccn-workbench (embedded Neovim)
+
+A workbench build keeps the real editor (Neovim in a PTY) and adds a live ccn
+sidebar: per-function CCN, unsaved deltas, inline `CCN n (+d)` extmarks, and
+`Enter` to jump to a function. It is **not** part of the npm package or the
+scanner release path; download `ccn-workbench-<platform>` from a release or
+build it:
+
+```console
+$ cargo build --release --features workbench --bin ccn-workbench
+$ ./target/release/ccn-workbench file.c --editor nvim
+```
+
+Requirements: `nvim` on `PATH` or `--editor <path>`. On AlmaLinux/RHEL 8 use
+the EPEL `neovim` (0.8 works; the official Neovim Linux tarball requires glibc
+2.34 and cannot run on EL8). Use `--no-rpc` for PTY-only editing with the
+mtime-based sidebar. See [`docs/workbench-spike.md`](docs/workbench-spike.md)
+for the compatibility matrix, keys, and limitations. The workbench is
+experimental; the scanner binary is unchanged.
+
+
 ```
 ccn 0.1.0
   C:/work/project-c

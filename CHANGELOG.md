@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.9 (2026-10-22)
+
+Experimental workbench integration and packaging. The scanner behavior is
+unchanged; this release adds a separate, feature-gated editor workbench.
+
+### ccn-workbench (RPC)
+
+- Spawns Neovim with a free `--listen` port and reads the **live buffer**
+  through `nvim-rs`, every 150 ms when `changedtick` moves.
+- Sidebar compares the live functions to the initial scan by identity and shows
+  `+new` / `~worsened` / `-improved`, a positive-delta sum, and `unsaved`.
+- Inline extmarks in the `ccn_workbench` namespace show `CCN n (+d)` with
+  warn/error severity; `Enter`/`o` jumps the editor to the function line.
+- `--no-rpc`, non-Neovim editors, and connection loss fall back to the
+  mtime-based PTY-only path. The RPC work runs off the UI thread.
+- `--smoke-rpc` and `--smoke-rpc-edit` verify the live path; Windows, WSL
+  Ubuntu and AlmaLinux 8 (EPEL Neovim 0.8) pass, with the file on disk
+  unchanged after an unsaved edit.
+
+### Packaging and compatibility
+
+- Workbench binaries are behind the `workbench` Cargo feature and are **not**
+  compiled by the default scanner build. Release assets gain
+  `ccn-workbench-{linux-x64,macos-x64,macos-arm64,windows-x64.exe}`; the
+  scanner assets and npm packages are otherwise unchanged.
+- `SHA256SUMS` covers all eight binaries.
+- Linux compatibility is verified in CI on AlmaLinux 8 / glibc 2.28 with EPEL
+  Neovim 0.8 (PTY, UTF-8, RPC extmarks, plugin). The official Neovim Linux
+  tarball requires GLIBC 2.34, so EL8 uses the distro/EPEL package.
+- The `ccn.nvim` plugin is verified on Neovim 0.12 (`vim.system`) and 0.8
+  (`jobstart` fallback).
+
 ## 0.7.8 (2026-10-22)
 
 The trust-contract release: the reproduced P0/P1 holes from the second review
