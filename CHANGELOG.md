@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.14.1 (2026-10-22)
+
+Patch-level UX polish on top of 0.14.0.
+
+- Pane switch is now **Alt+W** (left-hand, terminal-safe, no Neovim default
+  conflict); `Ctrl+Shift+E` and `F8` remain compatibility aliases.
+- Mouse-first split: click a tree file to open it, click either pane to focus,
+  drag the divider to resize.
+- `F8`/`F9` removed from the primary footer/help; both remain advanced.
+- Added the versioning/release policy in `docs/versioning.md`.
+- 560 lib + 17 CLI tests.
+
 ## 0.14.0 (2026-10-22)
 
 UX simplification: fewer visible keys, same power.
