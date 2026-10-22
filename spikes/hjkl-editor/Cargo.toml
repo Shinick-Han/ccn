@@ -1,0 +1,31 @@
+[package]
+name = "hjkl-spike"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+# Standalone spike: deliberately NOT a member of the main CCN workspace.
+[workspace]
+
+[features]
+default = ["syntax"]
+# Tree-sitter highlighting is opt-in at build time so the cost of carrying
+# hjkl-bonsai + tree-sitter can be measured (and skipped) independently.
+syntax = ["dep:hjkl-bonsai"]
+
+[dependencies]
+# Pinned exactly: 0.43.x is pre-1.0 and breaks between minors (see README).
+hjkl-buffer = "=0.43.4"
+hjkl-buffer-tui = "=0.43.4"
+hjkl-bonsai = { version = "=0.43.4", optional = true }
+hjkl-engine = "=0.43.4"
+hjkl-engine-tui = "=0.43.4"
+hjkl-vim = "=0.43.4"
+hjkl-ex = "=0.43.4"
+ratatui = "0.30"
+crossterm = "0.29"
+
+[profile.release]
+opt-level = "s"
+strip = true
