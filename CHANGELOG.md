@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.2 (2026-10-22)
+
+Keep the workbench session and dashboard position across tab switches.
+
+- `F10` now **returns to the dashboard without closing the workbench**. The
+  Neovim PTY and RPC connection stay alive while the dashboard is visible and
+  are reused when `e` opens the same file again; a different file (or an exited
+  editor) replaces the session. `q` on the dashboard closes it.
+- The dashboard preserves the selected path, sort key/direction, filter, and
+  chart tab across the workbench round trip and the rescan. If the selected
+  path disappeared, the nearest index is retained.
+- The dashboard still ticks the hidden workbench (RPC/PTY/mtime) so the live
+  state does not stall while it is in the background.
+- WSL+tmux check: dashboard -> `e` -> nvim (PID 93625) -> `F10` -> `e` reuses
+  the same PID -> `F10` -> `q` closes it; no nvim process remains.
+- 439 lib + 17 CLI tests, clippy/fmt clean (default and lean builds).
+
 ## 0.8.1 (2026-10-22)
 
 Unified dashboard + workbench tab.

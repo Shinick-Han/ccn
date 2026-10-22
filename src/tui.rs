@@ -92,6 +92,16 @@ pub fn run(result: &ScanResult, report: &Report) -> std::io::Result<TuiAction> {
     }
 }
 
+/// Dashboard navigation state that survives a workbench round trip and rescan.
+#[derive(Clone)]
+struct DashboardState {
+    selected_path: Option<String>,
+    sort: SortKey,
+    sort_desc: bool,
+    filter: Option<String>,
+    left_tab: LeftTab,
+}
+
 /// Run the dashboard and workbench in one terminal and one event loop.
 ///
 /// The dashboard is rebuilt after a workbench session so the scan/report and
@@ -114,17 +124,28 @@ pub fn run_unified(
     let _ = (options, hotspots, history_limit, editor);
 
     let mut guard = TerminalGuard::enter()?;
+    #[cfg(feature = "workbench")]
+    let mut session: Option<crate::workbench::WorkbenchSession> = None;
+    let mut dashboard_state: Option<DashboardState> = None;
 
     loop {
-        let action = {
+        let (action, state) = {
             let mut app = App::new(result, report);
+            if let Some(state) = &dashboard_state {
+                app.restore_state(state);
+            }
             loop {
+                #[cfg(feature = "workbench")]
+                if let Some(session) = session.as_mut() {
+                    session.tick();
+                }
                 guard.terminal.draw(|frame| render(frame, &mut app))?;
                 if app.quit {
-                    break app
+                    let action = app
                         .pending_edit
                         .take()
                         .map_or(TuiAction::Quit, TuiAction::Edit);
+                    break (action, app.capture_state());
                 }
                 if event::poll(Duration::from_millis(50))? {
                     if let Event::Key(key) = event::read()? {
@@ -133,48 +154,61 @@ pub fn run_unified(
                 }
             }
         };
+        dashboard_state = Some(state);
 
         match action {
-            TuiAction::Quit => return Ok(()),
+            TuiAction::Quit => {
+                #[cfg(feature = "workbench")]
+                if let Some(session) = session.take() {
+                    session.close();
+                }
+                return Ok(());
+            }
             TuiAction::Edit(path) => {
                 #[cfg(feature = "workbench")]
-                let target = Path::new(&result.root).join(&path);
-                #[cfg(feature = "workbench")]
-                let size = guard.terminal.size()?;
-
-                #[cfg(feature = "workbench")]
                 {
-                    use crate::workbench::WorkbenchSession;
-
-                    let mut session = match WorkbenchSession::open(
-                        &target,
-                        editor,
-                        false,
-                        size.width,
-                        size.height,
-                    ) {
-                        Ok(session) => session,
-                        Err(e) => {
-                            eprintln!("ccn: {e}");
-                            continue;
+                    let target = Path::new(&result.root).join(&path);
+                    let target = std::fs::canonicalize(&target).unwrap_or(target);
+                    let restart = session.as_ref().map_or(true, |session| {
+                        session.app.target != target || session.app.exited.is_some()
+                    });
+                    if restart {
+                        if let Some(old) = session.take() {
+                            old.close();
                         }
-                    };
-                    loop {
-                        session.tick();
-                        guard.terminal.draw(|frame| session.draw(frame))?;
-                        if event::poll(Duration::from_millis(16))? {
-                            match event::read()? {
-                                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                                    if session.handle_key(key) {
-                                        break;
-                                    }
-                                }
-                                Event::Resize(width, height) => session.resize(width, height),
-                                _ => {}
+                        let size = guard.terminal.size()?;
+                        match crate::workbench::WorkbenchSession::open(
+                            &target,
+                            editor,
+                            false,
+                            size.width,
+                            size.height,
+                        ) {
+                            Ok(open) => session = Some(open),
+                            Err(e) => {
+                                eprintln!("ccn: {e}");
+                                continue;
                             }
                         }
                     }
-                    session.close();
+
+                    if let Some(session) = session.as_mut() {
+                        loop {
+                            session.tick();
+                            guard.terminal.draw(|frame| session.draw(frame))?;
+                            if event::poll(Duration::from_millis(16))? {
+                                match event::read()? {
+                                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                        if session.handle_key(key) {
+                                            break;
+                                        }
+                                    }
+                                    Event::Resize(width, height) => session.resize(width, height),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
 
                     match crate::loc::scan(options) {
                         Ok(updated) => {
@@ -194,7 +228,6 @@ pub fn run_unified(
         }
     }
 }
-
 /// Whether a dashboard can be shown on this terminal.
 pub fn is_interactive() -> bool {
     std::io::stdout().is_tty()
@@ -439,6 +472,37 @@ impl<'a> App<'a> {
         self.view
             .get(self.selected)
             .map(|&index| &self.files[index])
+    }
+
+    /// Snapshot the navigation state before leaving the dashboard for the
+    /// workbench; the scan may change while we are away.
+    fn capture_state(&self) -> DashboardState {
+        DashboardState {
+            selected_path: self.selected_row().map(|row| row.path.clone()),
+            sort: self.sort,
+            sort_desc: self.sort_desc,
+            filter: self.filter.clone(),
+            left_tab: self.left_tab,
+        }
+    }
+
+    /// Restore sort/filter/tab and re-select the same path after a rescan.
+    fn restore_state(&mut self, state: &DashboardState) {
+        self.sort = state.sort;
+        self.sort_desc = state.sort_desc;
+        self.filter = state.filter.clone();
+        self.left_tab = state.left_tab;
+        self.rebuild();
+        if let Some(path) = &state.selected_path {
+            if let Some(position) = self
+                .view
+                .iter()
+                .position(|&index| &self.files[index].path == path)
+            {
+                self.selected = position;
+            }
+        }
+        self.selected = self.selected.min(self.view.len().saturating_sub(1));
     }
 
     /// Recompute the visible order. Cheap enough to run on every keystroke:
@@ -1709,6 +1773,31 @@ mod tests {
         assert_eq!(
             app.pending_edit.as_deref(),
             Some(std::path::Path::new(&selected))
+        );
+    }
+
+    #[test]
+    fn dashboard_state_survives_a_workbench_round_trip() {
+        let (result, report) = fixture();
+        let mut app = App::new(&result, &report);
+        app.sort = SortKey::Loc;
+        app.sort_desc = false;
+        app.filter = Some("src".to_string());
+        app.left_tab = LeftTab::Loc;
+        app.rebuild();
+        let selected = app.selected_row().expect("a selected row").path.clone();
+        let state = app.capture_state();
+
+        let mut fresh = App::new(&result, &report);
+        fresh.restore_state(&state);
+
+        assert_eq!(fresh.sort, SortKey::Loc);
+        assert!(!fresh.sort_desc);
+        assert_eq!(fresh.filter.as_deref(), Some("src"));
+        assert_eq!(fresh.left_tab, LeftTab::Loc);
+        assert_eq!(
+            fresh.selected_row().map(|row| row.path.as_str()),
+            Some(selected.as_str())
         );
     }
 
