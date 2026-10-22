@@ -26,7 +26,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+#[cfg(feature = "workbench")]
+use crossterm::event::{MouseButton, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -112,17 +117,26 @@ enum SplitFocus {
 /// Left dashboard table + right workbench pane. The left pane shrinks first
 /// on narrow terminals, leaving at least ~40 columns for the editor.
 #[cfg(feature = "workbench")]
-fn split_areas(size: Rect) -> (Rect, Rect) {
-    let max_left = size.width.saturating_sub(40).max(20);
-    let left_width = ((u32::from(size.width) * 38) / 100).clamp(24, u32::from(max_left)) as u16;
+fn split_areas(size: Rect, ratio: u16) -> (Rect, Rect, Rect) {
+    let max_left = size.width.saturating_sub(31).max(20);
+    let left_width =
+        ((u32::from(size.width) * u32::from(ratio)) / 100).clamp(20, u32::from(max_left)) as u16;
     let left = Rect::new(size.x, size.y, left_width, size.height);
+    let divider = Rect::new(size.x + left_width, size.y, 1, size.height);
     let right = Rect::new(
-        size.x + left_width,
+        size.x + left_width + 1,
         size.y,
-        size.width.saturating_sub(left_width),
+        size.width.saturating_sub(left_width + 1),
         size.height,
     );
-    (left, right)
+    (left, divider, right)
+}
+
+/// Convert a mouse x position into a clamped split percentage.
+#[cfg(feature = "workbench")]
+fn split_ratio_from_x(x: u16, width: u16) -> u16 {
+    let width = u32::from(width.max(1));
+    ((u32::from(x) * 100) / width).clamp(20, 70) as u16
 }
 
 /// Run the dashboard and workbench in one terminal and one event loop.
@@ -149,6 +163,8 @@ pub fn run_unified(
     let mut guard = TerminalGuard::enter()?;
     #[cfg(feature = "workbench")]
     let mut session: Option<crate::workbench::WorkbenchSession> = None;
+    #[cfg(feature = "workbench")]
+    let mut split_ratio: u16 = 38;
     let mut dashboard_state: Option<DashboardState> = None;
 
     loop {
@@ -201,7 +217,7 @@ pub fn run_unified(
                         }
                         let size = guard.terminal.size()?;
                         let area = Rect::new(0, 0, size.width, size.height);
-                        let (_, right) = split_areas(area);
+                        let (_, _, right) = split_areas(area, split_ratio);
                         match crate::workbench::WorkbenchSession::open(
                             &target,
                             editor,
@@ -223,13 +239,14 @@ pub fn run_unified(
                             split_dashboard.restore_state(state);
                         }
                         let mut focus = SplitFocus::Workbench;
+                        let mut dragging = false;
                         let mut last_right = (0u16, 0u16);
                         loop {
                             session.tick();
                             session.app.split = true;
                             let size = guard.terminal.size()?;
                             let area = Rect::new(0, 0, size.width, size.height);
-                            let (left, right) = split_areas(area);
+                            let (left, divider, right) = split_areas(area, split_ratio);
                             if last_right != (right.width, right.height) {
                                 session.resize(right.width, right.height);
                                 last_right = (right.width, right.height);
@@ -242,6 +259,21 @@ pub fn run_unified(
                                     focus == SplitFocus::Files,
                                 );
                                 session.draw_in(frame, right);
+                                let mut handle = String::new();
+                                for _ in 0..divider.height {
+                                    handle.push('│');
+                                    handle.push('\n');
+                                }
+                                frame.render_widget(
+                                    Paragraph::new(handle).style(
+                                        Style::default().fg(if dragging {
+                                            AURA.accent
+                                        } else {
+                                            AURA.border
+                                        }),
+                                    ),
+                                    divider,
+                                );
                             })?;
                             if !event::poll(Duration::from_millis(16))? {
                                 continue;
@@ -266,6 +298,12 @@ pub fn run_unified(
                                         KeyCode::Char('e') | KeyCode::Enter | KeyCode::F(8) => {
                                             focus = SplitFocus::Workbench
                                         }
+                                        KeyCode::Char('[') => {
+                                            split_ratio = split_ratio.saturating_sub(2).max(20)
+                                        }
+                                        KeyCode::Char(']') => {
+                                            split_ratio = (split_ratio + 2).min(70)
+                                        }
                                         KeyCode::F(10) => break,
                                         _ => {}
                                     },
@@ -278,6 +316,19 @@ pub fn run_unified(
                                             break;
                                         }
                                     }
+                                },
+                                Event::Mouse(mouse) => match mouse.kind {
+                                    MouseEventKind::Down(MouseButton::Left)
+                                        if mouse.column >= divider.x
+                                            && mouse.column < divider.x + divider.width =>
+                                    {
+                                        dragging = true;
+                                    }
+                                    MouseEventKind::Drag(MouseButton::Left) if dragging => {
+                                        split_ratio = split_ratio_from_x(mouse.column, area.width);
+                                    }
+                                    MouseEventKind::Up(MouseButton::Left) => dragging = false,
+                                    _ => {}
                                 },
                                 Event::Resize(_, _) => {}
                                 _ => {}
@@ -337,7 +388,7 @@ impl TerminalGuard {
         enable_raw_mode()?;
 
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, Hide) {
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -345,7 +396,12 @@ impl TerminalGuard {
         match Terminal::new(CrosstermBackend::new(stdout)) {
             Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
-                let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                let _ = execute!(
+                    io::stdout(),
+                    LeaveAlternateScreen,
+                    DisableMouseCapture,
+                    Show
+                );
                 let _ = disable_raw_mode();
                 Err(error)
             }
@@ -358,7 +414,12 @@ impl Drop for TerminalGuard {
         // Best effort: each step is independent so one failure cannot skip the
         // rest of the restoration.
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            Show
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -1835,6 +1896,24 @@ mod tests {
         // Also safe below the layout minimums in each dimension separately.
         let _ = draw(&mut app, 100, 4);
         let _ = draw(&mut app, 10, 40);
+    }
+
+    #[test]
+    #[cfg(feature = "workbench")]
+    fn split_ratio_moves_the_divider_and_keeps_both_panes_usable() {
+        let size = Rect::new(0, 0, 140, 40);
+        let (left, divider, right) = split_areas(size, 38);
+        assert_eq!(left.width + divider.width + right.width, size.width);
+        assert_eq!(divider.width, 1);
+        assert!(left.width >= 20, "left pane too small");
+        assert!(right.width >= 30, "right pane too small");
+
+        let (wider, _, narrower) = split_areas(size, 60);
+        assert!(wider.width > left.width, "dragging right widens the table");
+        assert!(narrower.width < right.width, "and narrows the editor");
+
+        assert_eq!(split_ratio_from_x(0, 140), 20);
+        assert_eq!(split_ratio_from_x(140, 140), 70);
     }
 
     #[test]

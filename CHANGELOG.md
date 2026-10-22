@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.1 (2026-10-22)
+
+Resizable split panes.
+
+- The split divider is now **draggable with the mouse** (left-click and drag),
+  highlighted while dragging. Terminal mouse capture is enabled only while ccn
+  owns the screen and is restored on exit.
+- `[` / `]` in the file-table focus also resizes the split by 2% steps.
+- The ratio is clamped to 20–70% and by minimum pane widths (left ≥20 columns,
+  right ≥30), so the editor and table stay usable on small terminals.
+- The ratio persists across full-dashboard/split switches for the session; the
+  PTY is resized to the new editor pane.
+- WSL+tmux keyboard resize verified (divider moved and the screen redrew);
+  mouse drag uses standard crossterm SGR mouse events.
+- 440 lib + 17 CLI tests, clippy/fmt clean (default and lean builds).
+
 ## 0.9.0 (2026-10-22)
 
 Split-screen dashboard + editor.
