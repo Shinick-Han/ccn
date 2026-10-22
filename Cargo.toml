@@ -1,6 +1,6 @@
 [package]
 name = "ccn"
-version = "0.7.9"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.90"
@@ -8,7 +8,7 @@ autobins = false
 description = "Repository code-health scanner: per-file LOC, per-function CCN, distribution histograms"
 
 [features]
-default = []
+default = ["workbench"]
 workbench = [
     "dep:tui-term",
     "dep:portable-pty",
@@ -20,16 +20,6 @@ workbench = [
 [[bin]]
 name = "ccn"
 path = "src/main.rs"
-
-[[bin]]
-name = "ccn-workbench"
-path = "src/bin/ccn-workbench/main.rs"
-required-features = ["workbench"]
-
-[[bin]]
-name = "ccn-nvim-probe"
-path = "src/bin/ccn-nvim-probe/main.rs"
-required-features = ["workbench"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

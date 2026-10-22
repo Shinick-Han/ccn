@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.8.0 (2026-10-22)
+
+The workbench is merged into the main `ccn` binary.
+
+### One binary, one command
+
+- `ccn workbench <file>` opens the embedded-Neovim workbench. The
+  `workbench` Cargo feature is now **on by default**; release assets are the
+  four usual `ccn-*` binaries (no separate `ccn-workbench-*` assets).
+- `cargo build --release --locked --no-default-features` still produces a
+  lean scanner; `ccn workbench` then prints an explicit "built without"
+  message.
+- The merged binary grows by about 1 MB (19.3 MB -> 20.3 MB locally) and adds
+  the PTY/RPC dependencies to the default build. Neovim stays an external
+  runtime dependency (`nvim` or `--editor`).
+- The scanner CLI, npm packages and GitHub action are otherwise unchanged.
+
+### Dashboard integration
+
+- `ccn . --tui` now accepts `e` on the selected file: the dashboard restores
+  the terminal, runs `ccn workbench` on that file, then rescans and reopens the
+  dashboard. Gates (`--fail-over`, `--fail-on-new`) run on the final state.
+- `--editor <cmd>` selects the editor used by the dashboard's `e` key.
+- The dashboard key help and footer document `e`.
+
+### Workbench RPC (carried from 0.7.9)
+
+- Neovim is spawned with `--listen`; a worker thread reads the live buffer on
+  `changedtick`, parses CCN off the UI thread, shows unsaved deltas in the
+  sidebar, writes `CCN n (+d)` extmarks, and jumps to a function with `Enter`.
+- `--no-rpc` and non-Neovim editors keep the PTY/mtime fallback.
+- `ccn workbench --smoke`, `--smoke-nvim`, `--smoke-utf8`, `--smoke-rpc` and
+  `--smoke-rpc-edit` remain available for CI.
+
 ## 0.7.9 (2026-10-22)
 
 Experimental workbench integration and packaging. The scanner behavior is

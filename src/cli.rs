@@ -4,7 +4,13 @@ use clap::Parser;
 
 /// Repository code-health scanner: per-file LOC now, per-function CCN next.
 #[derive(Debug, Parser)]
-#[command(name = "ccn", version, about, long_about = None)]
+#[command(
+    name = "ccn",
+    version,
+    about,
+    long_about = None,
+    after_help = "Run `ccn workbench <file>` for the embedded-Neovim workbench.\nRun `ccn . --tui` for the file dashboard; press `e` there to open the workbench."
+)]
 pub struct Cli {
     /// Directory to scan.
     #[arg(default_value = ".")]
@@ -166,6 +172,10 @@ pub struct Cli {
     /// Open the interactive terminal dashboard instead of printing the summary.
     #[arg(long, conflicts_with_all = ["json", "report_json", "ci", "view"])]
     pub tui: bool,
+
+    /// Editor command used by the dashboard's `e` key (default: nvim).
+    #[arg(long, default_value = "nvim")]
+    pub editor: String,
 
     /// Write the report to a temp file and open it, leaving the repo clean.
     #[arg(

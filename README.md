@@ -47,25 +47,24 @@ the repo has history. No CDN, no chart library, no telemetry — ~27 KB.
 `--tui` keys: `j/k` move, `Tab` chart, `s` sort, `/` filter, `Enter` detail,
 `?` help, `q` quit. On a non-TTY it falls back to the summary.
 
-### Experimental: ccn-workbench (embedded Neovim)
+### Experimental: embedded workbench (ccn workbench)
 
-A workbench build keeps the real editor (Neovim in a PTY) and adds a live ccn
+The single `ccn` binary can host a real Neovim (in a PTY) with a live ccn
 sidebar: per-function CCN, unsaved deltas, inline `CCN n (+d)` extmarks, and
-`Enter` to jump to a function. It is **not** part of the npm package or the
-scanner release path; download `ccn-workbench-<platform>` from a release or
-build it:
+`Enter` to jump to a function. It is part of the normal binary; `nvim` is the
+only external runtime requirement:
 
 ```console
-$ cargo build --release --features workbench --bin ccn-workbench
-$ ./target/release/ccn-workbench file.c --editor nvim
+$ ccn workbench file.c --editor nvim
+$ ccn . --tui   # press e on a file to open it here
 ```
 
-Requirements: `nvim` on `PATH` or `--editor <path>`. On AlmaLinux/RHEL 8 use
+Requirements: `nvim` on `PATH` or `--editor <path>`. In the dashboard, `e` opens the selected file in the workbench and returns to a refreshed dashboard when you quit it. On AlmaLinux/RHEL 8 use
 the EPEL `neovim` (0.8 works; the official Neovim Linux tarball requires glibc
 2.34 and cannot run on EL8). Use `--no-rpc` for PTY-only editing with the
 mtime-based sidebar. See [`docs/workbench-spike.md`](docs/workbench-spike.md)
 for the compatibility matrix, keys, and limitations. The workbench is
-experimental; the scanner binary is unchanged.
+experimental; the scanner behavior is unchanged.
 
 
 ```

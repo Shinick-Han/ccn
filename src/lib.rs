@@ -20,3 +20,6 @@ pub mod terminal;
 pub mod theme;
 pub mod tui;
 pub mod vcs;
+
+#[cfg(feature = "workbench")]
+pub mod workbench;

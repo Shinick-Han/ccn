@@ -3,10 +3,10 @@
 First spike for a Neovim-centric workbench: a real Neovim TUI runs inside a
 ratatui pane next to ccn's per-file complexity sidebar.
 
-Status: **Workbench v1: PTY editor + live RPC verified on Windows and WSL
-Ubuntu 26.04 (Neovim 0.12.6).** EPEL Neovim 0.8 is covered by the
-version-limited RPC calls but not run in this environment. Still no file picker
-or multi-file session. `src/bin/ccn-workbench/` plus `rpc.rs` is the only code.
+Status: **Workbench v1: PTY editor + live RPC verified on Windows, WSL
+Ubuntu 26.04 (Neovim 0.12.6) and AlmaLinux 8 (EPEL Neovim 0.8, CI).**
+Still no file picker or multi-file session. `src/workbench/` is the
+implementation; the public entry point is `ccn workbench`.
 
 ## What works
 
@@ -46,17 +46,17 @@ or multi-file session. `src/bin/ccn-workbench/` plus `rpc.rs` is the only code.
 ## Run
 
 ```text
-cargo run --release --features workbench --bin ccn-workbench -- path/to/file.c
-cargo run --release --features workbench --bin ccn-workbench -- --editor "<path-to-nvim>" file.cpp
-cargo run --release --features workbench --bin ccn-workbench -- --smoke
-cargo run --release --features workbench --bin ccn-workbench -- --smoke-nvim
-cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-nvim
-cargo run --release --features workbench --bin ccn-workbench -- --smoke-utf8
-cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-utf8
-cargo run --release --features workbench --bin ccn-workbench -- --smoke-rpc
-cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-rpc
-cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-rpc-edit
-cargo run --release --features workbench --bin ccn-workbench -- --no-rpc path/to/file.c
+cargo run --release -- workbench path/to/file.c
+cargo run --release -- workbench --editor "<path-to-nvim>" file.cpp
+cargo run --release -- workbench --smoke
+cargo run --release -- workbench --smoke-nvim
+cargo run --release -- workbench --editor "<path>" --smoke-nvim
+cargo run --release -- workbench --smoke-utf8
+cargo run --release -- workbench --editor "<path>" --smoke-utf8
+cargo run --release -- workbench --smoke-rpc
+cargo run --release -- workbench --editor "<path>" --smoke-rpc
+cargo run --release -- workbench --editor "<path>" --smoke-rpc-edit
+cargo run --release -- workbench --no-rpc path/to/file.c
 ```
 
 `--editor` defaults to `nvim`. A command with arguments must be quoted at the
@@ -70,29 +70,29 @@ The UTF-8 smoke is the byte-path test, suitable for CI:
 
 ```text
 # Windows
-cargo run --release --features workbench --bin ccn-workbench -- --smoke-utf8 --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
+cargo run --release -- workbench --smoke-utf8 --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
 
 # WSL Ubuntu: build, then run under a PTY
-wsl -d Ubuntu -- bash -c 'export PATH=/home/jcpuk/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/user/source/CCN; CARGO_TARGET_DIR=/home/jcpuk/ccn-target cargo build --release --locked --features workbench --bin ccn-workbench'
-wsl -d Ubuntu -- bash -c 'export PATH=/usr/local/bin:/usr/bin:/bin; script -qec "/home/jcpuk/ccn-target/release/ccn-workbench --smoke-utf8 --editor /home/jcpuk/tools/nvim-linux-x86_64/bin/nvim" /dev/null'
+wsl -d Ubuntu -- bash -c 'export PATH=/home/jcpuk/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/user/source/CCN; CARGO_TARGET_DIR=/home/jcpuk/ccn-target cargo build --release --locked'
+wsl -d Ubuntu -- bash -c 'export PATH=/usr/local/bin:/usr/bin:/bin; script -qec "/home/jcpuk/ccn-target/release/ccn workbench --smoke-utf8 --editor /home/jcpuk/tools/nvim-linux-x86_64/bin/nvim" /dev/null'
 ```
 
 RPC smoke commands:
 
 ```text
 # Windows
-cargo run --release --features workbench --bin ccn-workbench -- --smoke-rpc --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
+cargo run --release -- workbench --smoke-rpc --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
 
 # WSL
-wsl -d Ubuntu -- bash -c 'export PATH=/usr/local/bin:/usr/bin:/bin; script -qec "/home/jcpuk/ccn-target/release/ccn-workbench --smoke-rpc --editor /home/jcpuk/tools/nvim-linux-x86_64/bin/nvim" /dev/null'
+wsl -d Ubuntu -- bash -c 'export PATH=/usr/local/bin:/usr/bin:/bin; script -qec "/home/jcpuk/ccn-target/release/ccn workbench --smoke-rpc --editor /home/jcpuk/tools/nvim-linux-x86_64/bin/nvim" /dev/null'
 ```
 
 Gates (with the feature enabled):
 
 ```text
-cargo build --release --locked --features workbench --bin ccn-workbench
-cargo test --release --locked --features workbench --bin ccn-workbench
-cargo clippy --release --locked --features workbench --all-targets -- -D warnings
+cargo build --release --locked
+cargo test --release --locked
+cargo clippy --release --locked --all-targets -- -D warnings
 cargo fmt --check
 ```
 
@@ -206,22 +206,22 @@ Verified with Neovim 0.12.6 (portable) under a ConPTY-driven harness at
 Run under `script` (a real PTY, no host terminal answering probes):
 
 ```text
-$ script -qec ".../ccn-workbench --smoke-nvim --editor .../nvim" /dev/null
+$ script -qec ".../ccn workbench --smoke-nvim --editor .../nvim" /dev/null
 --- nvim screen tail ---
 ~
 ...
 ccn_workbench_smoke.c                                         1,1            All
 smoke-nvim ok
 
-$ script -qec ".../ccn-workbench --smoke-utf8 --editor .../nvim" /dev/null
+$ script -qec ".../ccn workbench --smoke-utf8 --editor .../nvim" /dev/null
 smoke-utf8 ok
 
-$ script -qec ".../ccn-workbench --smoke-rpc --editor .../nvim" /dev/null
+$ script -qec ".../ccn workbench --smoke-rpc --editor .../nvim" /dev/null
 ... read_ms: 0.6 ...
 extmarks placed: 2  dumped: 2
 smoke-rpc ok
 
-$ script -qec ".../ccn-workbench --smoke-rpc-edit --editor .../nvim" /dev/null
+$ script -qec ".../ccn workbench --smoke-rpc-edit --editor .../nvim" /dev/null
 edit: changedtick 3 -> 14  sum 3 -> 4 (disk unchanged)
 smoke-rpc-edit ok
 ```
@@ -366,7 +366,7 @@ APIs present in 0.8 (`nvim_buf_get_lines`, `nvim_buf_get_changedtick`,
 the AlmaLinux CI is the authoritative 0.8 runtime check. `ccn.nvim`'s
 `jobstart` fallback produced a `source = "ccn"` diagnostic on 0.8.
 
-Verification is in `.github/workflows/workbench-linux-check.yml`:
+Verification is in `.github/workflows/workbench-check.yml`:
 AlmaLinux 8 build (glibc 2.28 symbol gate), PTY smoke, EPEL-nvim render,
 UTF-8 smoke, RPC probe, and the plugin. Artifacts are retained for 14 days.
 Linux interactive resize/keyboard was exercised only on Windows and via
@@ -375,17 +375,22 @@ open.
 
 ## Packaging status
 
-The workbench is behind the `workbench` feature and is **not** part of the
-`ccn` release assets:
+The workbench is merged into the single `ccn` binary and is enabled by the
+default `workbench` feature:
 
 ```text
-cargo build --release --locked                       # scanner only
-cargo run --release --features workbench --bin ccn-workbench -- file.c
-cargo build --release --features workbench --bin ccn-nvim-probe
+cargo build --release --locked                       # ccn with workbench
+cargo run --release -- workbench file.c               # from source
+ccn workbench file.c                                 # installed binary
+cargo build --release --locked --no-default-features # lean scanner only
 ```
 
-The default `cargo test`/`cargo build` does not compile `tui-term`,
-`portable-pty`, `vt100`, `nvim-rs` or `tokio`. The AlmaLinux workflow builds
-`ccn-workbench-linux-x64` and `ccn-nvim-probe-linux-x64` as CI artifacts;
-promoting them to GitHub release assets needs a separate packaging decision
-(and a story for the Neovim dependency: system/EPEL vs bundled).
+The lean build prints a clear message if `ccn workbench` is invoked. Release
+artifacts are the four usual `ccn-*` binaries; there are no separate workbench
+assets. Neovim remains an external runtime dependency (`nvim` on `PATH` or
+`--editor <path>`): EPEL 0.8 on AlmaLinux 8, a normal install on Windows/macOS.
+`--no-rpc` keeps PTY editing and the mtime-based sidebar when Neovim cannot be
+reached.
+
+The AlmaLinux workflow builds the merged `ccn`, checks glibc 2.28, and runs
+PTY, UTF-8, RPC and plugin smokes against EPEL Neovim 0.8.

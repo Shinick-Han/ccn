@@ -3,7 +3,35 @@ use std::process::Command;
 
 use clap::Parser;
 
+/// `ccn workbench ...` is dispatched before clap: the normal CLI has a
+/// positional scan root, and a path literally named `workbench` would otherwise
+/// be ambiguous. `ccn ./workbench` still scans that directory.
+fn dispatch_workbench() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("workbench")) {
+        return None;
+    }
+
+    #[cfg(feature = "workbench")]
+    {
+        let mut forwarded = vec![std::ffi::OsString::from("ccn workbench")];
+        forwarded.extend(args);
+        Some(ccn::workbench::run(forwarded))
+    }
+
+    #[cfg(not(feature = "workbench"))]
+    {
+        eprintln!("ccn: this build has no workbench support (rebuild with --features workbench)");
+        Some(2)
+    }
+}
+
 fn main() {
+    if let Some(code) = dispatch_workbench() {
+        std::process::exit(code);
+    }
+
     let cli = ccn::cli::Cli::parse();
 
     // Usage checks run before the scan and before any output, so a bad
@@ -23,7 +51,7 @@ fn main() {
         ));
     }
 
-    let result = match ccn::loc::scan(&cli.scan_options()) {
+    let mut result = match ccn::loc::scan(&cli.scan_options()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("ccn: {e}");
@@ -32,6 +60,48 @@ fn main() {
     };
 
     let mut report = ccn::metrics::build_with(&result, cli.hotspots, cli.history_limit);
+
+    // The dashboard runs before history/baseline/rendering, so files edited in
+    // the workbench are rescanned and the final gates see the new state.
+    let sarif_owns_stdout = cli.sarif.as_deref() == Some("-");
+    let mut tui_handled = false;
+    if cli.tui && !cli.report_json && !cli.json && !sarif_owns_stdout {
+        loop {
+            match ccn::tui::run(&result, &report) {
+                Ok(ccn::tui::TuiAction::Quit) => {
+                    tui_handled = true;
+                    break;
+                }
+                Ok(ccn::tui::TuiAction::Edit(path)) => {
+                    #[cfg(feature = "workbench")]
+                    {
+                        let target = Path::new(&result.root).join(&path);
+                        let _ = ccn::workbench::run_path(&target, &cli.editor);
+                    }
+                    #[cfg(not(feature = "workbench"))]
+                    {
+                        let _ = path;
+                        eprintln!("ccn: this build has no workbench support");
+                    }
+                    match ccn::loc::scan(&cli.scan_options()) {
+                        Ok(updated) => {
+                            result = updated;
+                            report =
+                                ccn::metrics::build_with(&result, cli.hotspots, cli.history_limit);
+                        }
+                        Err(e) => {
+                            eprintln!("ccn: {e}");
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("ccn: dashboard unavailable ({e}); showing the summary instead");
+                    break;
+                }
+            }
+        }
+    }
 
     // Every failure that is independent of the gate outcome sets this flag.
     // The exit status is decided exactly once, after rendering and after the
@@ -92,7 +162,7 @@ fn main() {
 
     // `--sarif -` makes SARIF the sole document on stdout, so the terminal
     // summary and path notices are suppressed (or moved to stderr).
-    let sarif_owns_stdout = cli.sarif.as_deref() == Some("-");
+    // (`sarif_owns_stdout` is set before the dashboard loop.)
 
     // SARIF is written before any machine-readable output so that
     // `--json --sarif out.sarif` still produces the file.
@@ -113,7 +183,6 @@ fn main() {
 
     // Machine-readable modes render their document and then fall through to
     // the gates; they must not return early.
-    let mut tui_handled = false;
     if cli.report_json {
         match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),
@@ -123,15 +192,10 @@ fn main() {
             }
         }
     } else if cli.tui {
-        match ccn::tui::run(&result, &report) {
-            // The user quitting the dashboard is not an exit: gates still run.
-            Ok(()) => tui_handled = true,
-            Err(e) => {
-                eprintln!("ccn: dashboard unavailable ({e}); showing the summary instead");
-                if !sarif_owns_stdout {
-                    print_summary(&cli, &result, &report);
-                }
-            }
+        // The early dashboard loop already handled this (and may have run the
+        // workbench). Only fall back to the text summary when it was not shown.
+        if !tui_handled && !sarif_owns_stdout {
+            print_summary(&cli, &result, &report);
         }
     } else if cli.json {
         match serde_json::to_string_pretty(&result) {

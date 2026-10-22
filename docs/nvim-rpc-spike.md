@@ -1,10 +1,10 @@
-# Neovim RPC spike (ccn-nvim-probe)
+# Neovim RPC (integrated into ccn workbench)
 
 Status: spike, 2026-10-22. Scope: prove that ccn can measure the buffer the
 user is editing, before it is saved, and paint the result back into Neovim.
 
-Binary: `src/bin/ccn-nvim-probe/` (`main.rs`, `client.rs`, `annotate.rs`,
-`report.rs`). No changes to the library or the workbench.
+Integrated entry point: `ccn workbench` (`src/workbench/`). The standalone
+probe was a spike and has been removed after the RPC path was merged.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ Binary: `src/bin/ccn-nvim-probe/` (`main.rs`, `client.rs`, `annotate.rs`,
 nvim (--listen 127.0.0.1:PORT)
   |  msgpack-RPC over TCP
   v
-ccn-nvim-probe
+ccn workbench
   client.rs   new_tcp -> get_current_buf -> buf_get_name / buf_get_lines
   main.rs     Lang::from_path -> ccn::ccn::analyze_file(bytes from RPC)
   annotate.rs nvim_exec_lua -> nvim_buf_clear_namespace + nvim_buf_set_extmark
@@ -27,14 +27,14 @@ disk is never opened, written, or stat'ed by the probe.
 Build:
 
 ```
-cargo build --release --features workbench --bin ccn-nvim-probe
+cargo build --release --locked
 ```
 
 Run against any Neovim started with a listen address:
 
 ```
-ccn-nvim-probe --server 127.0.0.1:7777 [--annotate] [--json] [--dump-marks]
-ccn-nvim-probe --server 127.0.0.1:7777 --test-insert 1
+ccn workbench --smoke-rpc --server 127.0.0.1:7777 [--annotate] [--json] [--dump-marks]
+ccn workbench --smoke-rpc --server 127.0.0.1:7777 --test-insert 1
 ```
 
 `--test-insert N` inserts `if (x) x++;` after 1-based line N (in memory only)
@@ -49,7 +49,7 @@ Headless test setup on Windows:
     --listen 127.0.0.1:7777 "$env:TEMP\a.cpp"
 ```
 
-The probe exits 1 and prints `ccn-nvim-probe: ...` for RPC errors, unnamed
+The probe exits 1 and prints `ccn workbench: ...` for RPC errors, unnamed
 buffers, unsupported languages, and non-UTF-8 lines.
 
 ## Observed result (unsaved buffer)
@@ -58,7 +58,7 @@ Fixture (`a.cpp`), measured through the live buffer:
 
 ```json
 {
-  "file": "C:\\Users\\user\\AppData\\Local\\Temp\\ccn-nvim-probe-test\\a.cpp",
+  "file": "C:\\Users\\user\\AppData\\Local\\Temp\\ccn workbench-test\\a.cpp",
   "tier": "exact",
   "functions": [
     {"name": "add", "identity": "add(int,int)", "line": 1, "ccn": 2,
@@ -188,7 +188,7 @@ run, so they include process startup in the shell measurement only, not in
 
 ## AlmaLinux 8 / EPEL Neovim 0.8 evidence (2026-10-22)
 
-The same probe was run in `.github/workflows/workbench-linux-check.yml` inside
+The same probe was run in `.github/workflows/workbench-check.yml` inside
 `almalinux:8` with EPEL's `neovim` 0.8.0:
 
 ```text

@@ -1,6 +1,6 @@
 {
   "name": "@shinick/ccn-win32-x64",
-  "version": "0.7.9",
+  "version": "0.8.0",
   "description": "ccn binary for Windows x86_64",
   "license": "MIT",
   "homepage": "https://github.com/Shinick-Han/ccn",

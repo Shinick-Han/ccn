@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ccn::ccn::{analyze_file, CcnTier, FunctionCcn, Lang};
+use crate::ccn::{analyze_file, CcnTier, FunctionCcn, Lang};
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::error::LoopError;
 use nvim_rs::Neovim;

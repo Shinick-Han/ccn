@@ -4,7 +4,7 @@
 //! editor pane is a real vt100 screen rendered by `tui-term`; everything else
 //! is plain ratatui.
 
-use ccn::theme::{grade_color, AURA};
+use crate::theme::{grade_color, AURA};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,7 +13,7 @@ use ratatui::Frame;
 use tui_term::widget::PseudoTerminal;
 use vt100::Screen;
 
-use crate::{App, Focus, RpcStatus};
+use super::{App, Focus, LiveRow, RpcStatus};
 
 /// Named regions of the workbench, recomputed on every resize.
 pub struct LayoutRects {
@@ -364,7 +364,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(Span::styled(
                 format!(
                     " tier {} · grade {}",
-                    v.tier.map_or("n/a", ccn::ccn::types::CcnTier::as_str),
+                    v.tier.map_or("n/a", crate::ccn::types::CcnTier::as_str),
                     app.grade().0
                 ),
                 Style::default().fg(AURA.muted),
@@ -491,7 +491,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Compact delta column: `+n` new, `~n` worsened, `-n` improved.
-fn delta_text(row: &crate::LiveRow) -> String {
+fn delta_text(row: &LiveRow) -> String {
     if row.is_new {
         format!("+{}", row.delta.max(0))
     } else if row.delta > 0 {

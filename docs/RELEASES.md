@@ -81,17 +81,9 @@ Raw single-file binaries, no archives:
 | `ccn-macos-x64`        | `macos-15-intel`       | x86_64       | `target/release/ccn`     |
 | `ccn-macos-arm64`      | `macos-latest`   | arm64        | `target/release/ccn`     |
 | `ccn-windows-x64.exe`  | `windows-latest` | x86_64       | `target/release/ccn.exe` |
-| `ccn-workbench-linux-x64` | `ubuntu-latest` (AlmaLinux 8 container) | x86_64 | `target/release/ccn-workbench` |
-| `ccn-workbench-macos-x64` | `macos-15-intel` | x86_64 | `target/release/ccn-workbench` |
-| `ccn-workbench-macos-arm64` | `macos-latest` | arm64 | `target/release/ccn-workbench` |
-| `ccn-workbench-windows-x64.exe` | `windows-latest` | x86_64 | `target/release/ccn-workbench.exe` |
 
-Install by downloading the asset, `chmod +x` on Unix, and putting it on `PATH`.
-`SHA256SUMS` is published by the `checksums` job after all eight binaries, so it
-never lists an asset that does not exist.
-
-The four `ccn-workbench-*` assets are **experimental** and require Neovim at
-runtime (`nvim` on `PATH` or `--editor <path>`):
+The single `ccn` binary includes the experimental workbench (`ccn workbench`).
+It requires Neovim at runtime (`nvim` on `PATH` or `--editor <path>`):
 
 - AlmaLinux / RHEL 8: use the EPEL `neovim` package (0.8 works). The official
   Neovim Linux tarball requires GLIBC 2.34 and cannot run on EL8.
@@ -99,9 +91,9 @@ runtime (`nvim` on `PATH` or `--editor <path>`):
 - `--no-rpc` keeps PTY editing and the mtime-based sidebar when Neovim cannot
   be reached.
 
-The workbench is behind the `workbench` Cargo feature. The default
-`cargo build --release --locked` still builds only the scanner, so the npm and
-action paths are unchanged.
+The workbench is behind the `workbench` Cargo feature, which is **on by
+default**. `cargo build --release --locked --no-default-features` produces a
+lean scanner without the editor/RPC dependencies.
 
 ## How the action uses these assets
 

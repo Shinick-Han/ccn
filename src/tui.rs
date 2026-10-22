@@ -20,6 +20,7 @@
 
 use std::io::{self, Stdout};
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -45,11 +46,20 @@ use crate::theme::{bin_color, grade_color, risk_color, AURA};
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 8;
 
-/// Run the dashboard. Returns `Ok(())` when the user quits.
+/// What the user asked for when leaving the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiAction {
+    /// Close the dashboard and finish the scan pipeline.
+    Quit,
+    /// Open the workbench on this scan-relative file, then rerun the dashboard.
+    Edit(PathBuf),
+}
+
+/// Run the dashboard. Returns the user's requested next action on quit.
 ///
 /// Fails when stdout is not a TTY so the caller can fall back to the plain
 /// terminal block instead of painting escape codes into a pipe.
-pub fn run(result: &ScanResult, report: &Report) -> std::io::Result<()> {
+pub fn run(result: &ScanResult, report: &Report) -> std::io::Result<TuiAction> {
     if !is_interactive() {
         return Err(io::Error::other(
             "ccn: the interactive dashboard needs a terminal (stdout is not a TTY)",
@@ -70,7 +80,11 @@ pub fn run(result: &ScanResult, report: &Report) -> std::io::Result<()> {
     };
 
     match outcome {
-        Ok(result) => result,
+        Ok(result) => result.map(|()| {
+            app.pending_edit
+                .take()
+                .map_or(TuiAction::Quit, TuiAction::Edit)
+        }),
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
@@ -251,6 +265,8 @@ pub struct App<'a> {
     filter_input: Option<String>,
     left_tab: LeftTab,
     overlay: Overlay,
+    /// Set by `e`; consumed by `run` after the terminal is restored.
+    pending_edit: Option<PathBuf>,
     quit: bool,
 }
 
@@ -297,6 +313,7 @@ impl<'a> App<'a> {
             filter_input: None,
             left_tab: LeftTab::Ccn,
             overlay: Overlay::None,
+            pending_edit: None,
             quit: false,
         };
         app.rebuild();
@@ -484,6 +501,12 @@ impl<'a> App<'a> {
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => self.toggle_direction(),
             KeyCode::Char('/') => self.begin_filter(),
+            KeyCode::Char('e') => {
+                if let Some(path) = self.selected_row().map(|row| PathBuf::from(&row.path)) {
+                    self.pending_edit = Some(path);
+                    self.quit = true;
+                }
+            }
             KeyCode::Enter | KeyCode::Char('d') => {
                 if self.selected_row().is_some() {
                     self.overlay = Overlay::Detail;
@@ -606,6 +629,8 @@ fn render_footer(frame: &mut Frame, app: &App<'_>, area: Rect) {
         Span::styled(" help · ", chrome),
         Span::styled("q", key),
         Span::styled(" quit", chrome),
+        Span::styled("  e", key),
+        Span::styled(" workbench", chrome),
     ];
     if let Some(filter) = app.active_filter() {
         spans.push(Span::styled("  ", chrome));
@@ -1110,6 +1135,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ("S", "reverse the sort direction"),
         ("/", "filter paths (Enter applies, Esc cancels)"),
         ("Enter / d", "file detail"),
+        ("e", "open the workbench on this file"),
         ("?", "this help (keys)"),
         ("q / Esc", "quit"),
     ];
@@ -1563,6 +1589,21 @@ mod tests {
         // Also safe below the layout minimums in each dimension separately.
         let _ = draw(&mut app, 100, 4);
         let _ = draw(&mut app, 10, 40);
+    }
+
+    #[test]
+    fn e_requests_the_selected_file_for_the_workbench() {
+        let (result, report) = fixture();
+        let mut app = App::new(&result, &report);
+        let selected = app.selected_row().expect("a selected row").path.clone();
+
+        press(&mut app, KeyCode::Char('e'));
+
+        assert!(app.quit, "e leaves the dashboard");
+        assert_eq!(
+            app.pending_edit.as_deref(),
+            Some(std::path::Path::new(&selected))
+        );
     }
 
     #[test]

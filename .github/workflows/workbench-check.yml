@@ -1,6 +1,6 @@
-name: workbench-linux-check
+name: workbench-check
 
-# Verifies the experimental workbench on the oldest supported userland
+# Verifies the merged ccn binary's workbench on the oldest supported userland
 # (AlmaLinux 8 / glibc 2.28), including the distro Neovim from EPEL 8.
 # The official Neovim Linux tarball requires GLIBC 2.34 and cannot be used
 # there, so this job is the compatibility gate for the embedded-editor path.
@@ -9,11 +9,12 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "src/bin/ccn-workbench/**"
-      - "src/bin/ccn-nvim-probe/**"
+      - "src/workbench/**"
+      - "src/main.rs"
+      - "src/tui.rs"
       - "Cargo.toml"
       - "Cargo.lock"
-      - ".github/workflows/workbench-linux-check.yml"
+      - ".github/workflows/workbench-check.yml"
 
 permissions:
   contents: read
@@ -43,15 +44,15 @@ jobs:
               | sh -s -- -y --profile minimal --default-toolchain stable
             . "$HOME/.cargo/env"
 
-            cargo build --release --locked --features workbench \
-              --bin ccn --bin ccn-workbench --bin ccn-nvim-probe
-            echo "--- glibc gate (workbench) ---"
-            max=$(objdump -T target/release/ccn-workbench \
+            cargo build --release --locked
+
+            echo "--- glibc gate ---"
+            max=$(objdump -T target/release/ccn \
               | grep -o "GLIBC_[0-9.]*" | sort -V | tail -n1)
-            echo "highest workbench glibc symbol: ${max:-none}"
+            echo "highest ccn glibc symbol: ${max:-none}"
             newest=$(printf "%s\nGLIBC_2.28\n" "$max" | sort -V | tail -n1)
             if [[ "$newest" != "GLIBC_2.28" ]]; then
-              echo "::error::ccn-workbench requires $max, newer than AlmaLinux 8 GLIBC_2.28"
+              echo "::error::ccn requires $max, newer than AlmaLinux 8 GLIBC_2.28"
               exit 1
             fi
 
@@ -59,43 +60,22 @@ jobs:
             export TERM=xterm-256color
 
             echo "--- workbench smoke (PTY) ---"
-            script -qec "./target/release/ccn-workbench --smoke" /dev/null
+            script -qec "./target/release/ccn workbench --smoke" /dev/null
 
             echo "--- workbench smoke (EPEL nvim) ---"
-            script -qec "./target/release/ccn-workbench --smoke-nvim --editor /usr/bin/nvim" /dev/null
+            script -qec "./target/release/ccn workbench --smoke-nvim --editor /usr/bin/nvim" /dev/null
 
             echo "--- workbench UTF-8 byte path (EPEL nvim) ---"
-            script -qec "./target/release/ccn-workbench --smoke-utf8 --editor /usr/bin/nvim" /dev/null
+            script -qec "./target/release/ccn workbench --smoke-utf8 --editor /usr/bin/nvim" /dev/null
 
             echo "--- workbench RPC live buffer (EPEL nvim 0.8) ---"
-            script -qec "./target/release/ccn-workbench --smoke-rpc --editor /usr/bin/nvim" /dev/null
+            script -qec "./target/release/ccn workbench --smoke-rpc --editor /usr/bin/nvim" /dev/null
 
             echo "--- workbench RPC unsaved edit (EPEL nvim 0.8) ---"
-            script -qec "./target/release/ccn-workbench --smoke-rpc-edit --editor /usr/bin/nvim" /dev/null
-
-            echo "--- RPC probe against EPEL nvim 0.8 ---"
-            tmp=$(mktemp -d)
-            printf "%s\n" \
-              "int simple(int x) { return x + 1; }" \
-              "int messy(int x) {" \
-              "    if (x > 0) x++;" \
-              "    if (x > 1) x++;" \
-              "    if (x > 2) x++;" \
-              "    if (x > 3) x++;" \
-              "    return x;" \
-              "}" > "$tmp/a.cpp"
-            nvim --headless --listen 127.0.0.1:7777 "$tmp/a.cpp" &
-            nvim_pid=$!
-            sleep 2
-            ./target/release/ccn-nvim-probe --server 127.0.0.1:7777 --json
-            ./target/release/ccn-nvim-probe --server 127.0.0.1:7777 --annotate
-            ./target/release/ccn-nvim-probe --server 127.0.0.1:7777 --dump-marks
-            kill "$nvim_pid" 2>/dev/null || true
-            wait "$nvim_pid" 2>/dev/null || true
-            rm -rf "$tmp"
+            script -qec "./target/release/ccn workbench --smoke-rpc-edit --editor /usr/bin/nvim" /dev/null
 
             echo "--- ccn.nvim plugin on EPEL nvim 0.8 (jobstart fallback) ---"
-            tmp2=$(mktemp -d)
+            tmp=$(mktemp -d)
             printf "%s\n" \
               "int simple(int x) { return x + 1; }" \
               "int messy(int x) {" \
@@ -112,31 +92,28 @@ jobs:
               "    if (x > 10) x++;" \
               "    if (x > 11) x++;" \
               "    return x;" \
-              "}" > "$tmp2/a.cpp"
+              "}" > "$tmp/a.cpp"
             PATH="/src/target/release:$PATH" nvim --headless -u NONE \
               --cmd "set rtp+=/src/spikes/ccn.nvim" \
               -c "lua require(\"ccn\").setup()" \
-              -c "edit $tmp2/a.cpp" \
+              -c "edit $tmp/a.cpp" \
               -c "CCNRefresh" -c "sleep 1500m" \
               -c "lua print(vim.inspect(vim.diagnostic.get(0)))" \
               -c "qa!" 2>&1 | tee /tmp/ccn-plugin.log
             grep -q "source = \"ccn\"" /tmp/ccn-plugin.log
             echo "ccn.nvim plugin ok"
-            rm -rf "$tmp2"
+            rm -rf "$tmp"
 
-            echo "--- stage artifacts ---"
-            cp target/release/ccn-workbench ccn-workbench-linux-x64
-            cp target/release/ccn-nvim-probe ccn-nvim-probe-linux-x64
-            chmod +x ccn-workbench-linux-x64 ccn-nvim-probe-linux-x64
+            echo "--- stage artifact ---"
+            cp target/release/ccn ccn-linux-x64
+            chmod +x ccn-linux-x64
           '
 
-      - name: Upload Linux workbench artifacts
+      - name: Upload Linux workbench artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ccn-workbench-almalinux8
-          path: |
-            ccn-workbench-linux-x64
-            ccn-nvim-probe-linux-x64
+          path: ccn-linux-x64
           if-no-files-found: error
           retention-days: 14
 
@@ -144,65 +121,46 @@ jobs:
     name: build + smoke workbench (macOS Intel)
     runs-on: macos-15-intel
     steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
         with:
           toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build and smoke
         run: |
           set -euo pipefail
           test "$(uname -m)" = "x86_64"
-          cargo build --release --locked --features workbench --bin ccn-workbench
-          ./target/release/ccn-workbench --smoke
+          cargo build --release --locked
+          ./target/release/ccn workbench --smoke
 
   macos-arm64:
     name: build + smoke workbench (macOS arm64)
     runs-on: macos-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
         with:
           toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build and smoke
         run: |
           set -euo pipefail
           test "$(uname -m)" = "arm64"
-          cargo build --release --locked --features workbench --bin ccn-workbench
-          ./target/release/ccn-workbench --smoke
+          cargo build --release --locked
+          ./target/release/ccn workbench --smoke
 
   windows:
     name: build + smoke workbench (Windows)
     runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head at pin time)
         with:
           toolchain: stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build and smoke
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --locked --features workbench --bin ccn-workbench
-          ./target/release/ccn-workbench.exe --smoke
-
+          cargo build --release --locked
+          ./target/release/ccn.exe workbench --smoke

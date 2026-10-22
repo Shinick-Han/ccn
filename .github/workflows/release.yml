@@ -44,12 +44,6 @@ jobs:
       - name: cargo test
         run: cargo test --release --locked
 
-      - name: cargo clippy (workbench)
-        run: cargo clippy --locked --features workbench --all-targets -- -D warnings
-
-      - name: cargo test (workbench)
-        run: cargo test --release --locked --features workbench --bin ccn-workbench
-
   linux:
     name: build ccn-linux-x64 (AlmaLinux 8 / glibc 2.28)
     needs: checks
@@ -73,42 +67,37 @@ jobs:
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
               | sh -s -- -y --profile minimal --default-toolchain stable
             . "$HOME/.cargo/env"
-            cargo build --release --locked --features workbench \
-              --bin ccn --bin ccn-workbench
+            cargo build --release --locked
           '
 
       - name: Assert glibc <= 2.28
         run: |
           set -euo pipefail
-          for binary in target/release/ccn target/release/ccn-workbench; do
-            test -f "$binary"
-            max=$(objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n1)
-            echo "highest glibc symbol in $binary: ${max:-none}"
-            if [[ -z "${max:-}" ]]; then
-              echo "::error::could not read GLIBC symbol versions"
-              exit 1
-            fi
-            newest=$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -n1)
-            if [[ "$newest" != "GLIBC_2.28" ]]; then
-              echo "::error::$binary requires $max, newer than AlmaLinux 8's GLIBC_2.28"
-              exit 1
-            fi
-          done
+          binary=target/release/ccn
+          test -f "$binary"
+          max=$(objdump -T "$binary" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n1)
+          echo "highest glibc symbol: ${max:-none}"
+          if [[ -z "${max:-}" ]]; then
+            echo "::error::could not read GLIBC symbol versions"
+            exit 1
+          fi
+          newest=$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -n1)
+          if [[ "$newest" != "GLIBC_2.28" ]]; then
+            echo "::error::$binary requires $max, newer than AlmaLinux 8's GLIBC_2.28"
+            exit 1
+          fi
 
-      - name: Stage assets
+      - name: Stage asset
         run: |
           set -euo pipefail
           cp target/release/ccn ccn-linux-x64
-          cp target/release/ccn-workbench ccn-workbench-linux-x64
-          chmod +x ccn-linux-x64 ccn-workbench-linux-x64
-          ls -l ccn-linux-x64 ccn-workbench-linux-x64
+          chmod +x ccn-linux-x64
+          ls -l ccn-linux-x64
 
       - name: Publish release asset
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: |
-            ccn-linux-x64
-            ccn-workbench-linux-x64
+          files: ccn-linux-x64
           generate_release_notes: true
 
   macos-x64:
@@ -134,23 +123,20 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = "x86_64"
 
-      - name: Build release binaries
-        run: cargo build --release --locked --features workbench --bin ccn --bin ccn-workbench
+      - name: Build release binary
+        run: cargo build --release --locked
 
       - name: Stage asset
         run: |
           set -euo pipefail
           cp target/release/ccn ccn-macos-x64
-          cp target/release/ccn-workbench ccn-workbench-macos-x64
-          chmod +x ccn-macos-x64 ccn-workbench-macos-x64
-          ls -l ccn-macos-x64 ccn-workbench-macos-x64
+          chmod +x ccn-macos-x64
+          ls -l ccn-macos-x64
 
       - name: Publish release asset
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: |
-            ccn-macos-x64
-            ccn-workbench-macos-x64
+          files: ccn-macos-x64
           generate_release_notes: true
 
   macos-arm64:
@@ -174,23 +160,20 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = "arm64"
 
-      - name: Build release binaries
-        run: cargo build --release --locked --features workbench --bin ccn --bin ccn-workbench
+      - name: Build release binary
+        run: cargo build --release --locked
 
       - name: Stage asset
         run: |
           set -euo pipefail
           cp target/release/ccn ccn-macos-arm64
-          cp target/release/ccn-workbench ccn-workbench-macos-arm64
-          chmod +x ccn-macos-arm64 ccn-workbench-macos-arm64
-          ls -l ccn-macos-arm64 ccn-workbench-macos-arm64
+          chmod +x ccn-macos-arm64
+          ls -l ccn-macos-arm64
 
       - name: Publish release asset
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: |
-            ccn-macos-arm64
-            ccn-workbench-macos-arm64
+          files: ccn-macos-arm64
           generate_release_notes: true
 
   windows:
@@ -209,23 +192,20 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: Build release binaries
-        run: cargo build --release --locked --features workbench --bin ccn --bin ccn-workbench
+      - name: Build release binary
+        run: cargo build --release --locked
 
       - name: Stage asset
         shell: bash
         run: |
           set -euo pipefail
           cp target/release/ccn.exe ccn-windows-x64.exe
-          cp target/release/ccn-workbench.exe ccn-workbench-windows-x64.exe
-          ls -l ccn-windows-x64.exe ccn-workbench-windows-x64.exe
+          ls -l ccn-windows-x64.exe
 
       - name: Publish release asset
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: |
-            ccn-windows-x64.exe
-            ccn-workbench-windows-x64.exe
+          files: ccn-windows-x64.exe
           generate_release_notes: true
 
   # Runs only after all four assets are published. Downloads the exact bytes
@@ -265,8 +245,8 @@ jobs:
           # Hash every published ccn-* asset rather than a hand-maintained
           # name list: a new platform must not silently be left out.
           mapfile -t assets < <(find . -maxdepth 1 -type f -name 'ccn-*' -printf '%f\n' | sort)
-          if [[ "${#assets[@]}" -ne 8 ]]; then
-            echo "::error::expected 8 ccn-* assets (4 scanner + 4 workbench), found ${#assets[@]}: ${assets[*]}"
+          if [[ "${#assets[@]}" -ne 4 ]]; then
+            echo "::error::expected 4 ccn-* assets, found ${#assets[@]}: ${assets[*]}"
             exit 1
           fi
           sha256sum "${assets[@]}" > SHA256SUMS

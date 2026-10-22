@@ -9,10 +9,10 @@ mod pty;
 mod rpc;
 mod ui;
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -26,9 +26,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
-use ccn::ccn::types::{CcnTier, FunctionCcn};
-use ccn::loc::{scan, ScanOptions};
-use ccn::model::{CcnSkip, FileLoc};
+use crate::ccn::types::{CcnTier, FunctionCcn};
+use crate::loc::{scan, ScanOptions};
+use crate::model::{CcnSkip, FileLoc};
 
 use pty::Pty;
 use rpc::{LiveSnapshot, RpcEvent, RpcHandle, RpcStatus};
@@ -50,9 +50,9 @@ int smoke_choice(int x) {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "ccn-workbench",
+    name = "ccn workbench",
     version,
-    about = "Neovim in a ratatui pane, with ccn complexity side panels"
+    about = "Neovim in a ratatui pane, with ccn complexity side panels (ccn workbench)"
 )]
 struct Cli {
     /// File to open. A directory is rejected in this spike.
@@ -610,8 +610,8 @@ fn native_path(path: &Path) -> String {
     text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
+pub fn run(args: Vec<OsString>) -> i32 {
+    let cli = Cli::parse_from(args);
     if cli.smoke {
         return report_smoke(run_smoke(&cli, false));
     }
@@ -628,27 +628,37 @@ fn main() -> ExitCode {
         return report_smoke(run_smoke_rpc(&cli, true));
     }
     match run_workbench(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => 0,
         Err(message) => {
-            eprintln!("ccn-workbench: {message}");
-            ExitCode::FAILURE
+            eprintln!("ccn workbench: {message}");
+            1
         }
     }
 }
 
-fn report_smoke(result: Result<(), String>) -> ExitCode {
+/// Launch the workbench for a single file, used by the dashboard `e` key.
+pub fn run_path(path: &Path, editor: &str) -> i32 {
+    run(vec![
+        OsString::from("ccn workbench"),
+        path.as_os_str().to_os_string(),
+        OsString::from("--editor"),
+        OsString::from(editor),
+    ])
+}
+
+fn report_smoke(result: Result<(), String>) -> i32 {
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => 0,
         Err(message) => {
             eprintln!("smoke failed: {message}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
 
 fn run_workbench(cli: &Cli) -> Result<(), String> {
     let requested = cli.target.as_deref().ok_or_else(|| {
-        "missing <path-or-file> (usage: ccn-workbench [--editor <cmd>] <file>)".to_string()
+        "missing <path-or-file> (usage: ccn workbench [--editor <cmd>] <file>)".to_string()
     })?;
     let target = fs::canonicalize(requested)
         .map_err(|e| format!("cannot open {}: {e}", requested.display()))?;
@@ -1181,7 +1191,7 @@ fn smoke_rpc_session(
     println!("namespace: {}", rpc::NAMESPACE);
     println!(
         "tier: {}",
-        snapshot.tier.map_or("n/a", ccn::ccn::CcnTier::as_str)
+        snapshot.tier.map_or("n/a", crate::ccn::CcnTier::as_str)
     );
     println!("functions: {}", snapshot.functions.len());
     println!("sum: {}  max: {}", snapshot.sum, snapshot.max);
