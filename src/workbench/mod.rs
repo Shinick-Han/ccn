@@ -5,6 +5,7 @@
 //! is rendered through `vt100` + `tui-term`, and keys are forwarded as bytes.
 //! See `docs/workbench-spike.md`.
 
+pub(crate) mod diagnostics_ui;
 mod pty;
 pub(crate) mod review_ui;
 mod rpc;
@@ -1151,6 +1152,14 @@ impl WorkbenchSession {
             self.app
                 .set_status(format!("review jump -> line {line}"), false);
         }
+    }
+
+    pub(crate) fn rescan(&mut self) {
+        self.app.rescan("command palette");
+    }
+
+    pub(crate) fn note(&mut self, message: impl Into<String>) {
+        self.app.set_status(message.into(), false);
     }
 
     pub(crate) fn resize(&mut self, width: u16, height: u16) {

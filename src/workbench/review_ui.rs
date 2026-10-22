@@ -45,6 +45,17 @@ fn summary_line(changes: &[Change], threshold: u32) -> String {
     )
 }
 
+/// Subtitle with an optional `added-only`/`worsened-only` marker.
+fn summary_line_filtered(changes: &[Change], threshold: u32, kind: Option<Kind>) -> String {
+    let mut line = summary_line(changes, threshold);
+    match kind {
+        Some(Kind::Added) => line.push_str(" \u{b7} added-only"),
+        Some(Kind::Worsened) => line.push_str(" \u{b7} worsened-only"),
+        None => {}
+    }
+    line
+}
+
 /// The CCN transition: `new->n` for an added function, `base->n` otherwise.
 fn ccn_text(change: &Change) -> String {
     match change.base_ccn {
@@ -193,6 +204,62 @@ fn row_line(change: &Change, width: u16, selected: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+/// One rendered list row, either a group header or a change.
+enum Row {
+    Header { path: String, count: usize },
+    Change(usize),
+}
+
+/// Normalize path separators the same way the review model does.
+fn normalized(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// Build the row list, injecting a file header when several paths are present.
+fn review_rows(changes: &[Change]) -> Vec<Row> {
+    let mut keys: Vec<String> = Vec::new();
+    for change in changes {
+        let key = normalized(&change.path);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+
+    if keys.len() <= 1 {
+        return (0..changes.len()).map(Row::Change).collect();
+    }
+
+    let mut rows = Vec::with_capacity(changes.len() + keys.len());
+    let mut previous: Option<String> = None;
+    for (index, change) in changes.iter().enumerate() {
+        let key = normalized(&change.path);
+        if previous.as_deref() != Some(key.as_str()) {
+            let count = changes
+                .iter()
+                .filter(|other| normalized(&other.path) == key)
+                .count();
+            rows.push(Row::Header {
+                path: change.path.clone(),
+                count,
+            });
+            previous = Some(key);
+        }
+        rows.push(Row::Change(index));
+    }
+    rows
+}
+
+/// One muted, bold file header row.
+fn header_line(path: &str, count: usize, width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        truncate_chars(&format!("{path} ({count})"), width),
+        Style::default()
+            .fg(AURA.muted)
+            .bg(AURA.card)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
 /// Render the review panel inside `area`.
 #[allow(dead_code)]
 pub(crate) fn render(
@@ -203,6 +270,27 @@ pub(crate) fn render(
     focused: bool,
     rev: &str,
     threshold: u32,
+) {
+    render_filtered(
+        frame, area, changes, selected, focused, rev, threshold, None,
+    );
+}
+
+/// Render the review panel with an optional active kind filter.
+///
+/// The marker only decorates the subtitle; `changes` is expected to already be
+/// filtered by the caller (see [`ReviewQueue::changes`]).
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_filtered(
+    frame: &mut Frame,
+    area: Rect,
+    changes: &[Change],
+    selected: usize,
+    focused: bool,
+    rev: &str,
+    threshold: u32,
+    kind: Option<Kind>,
 ) {
     let border = if focused {
         AURA.border_focus
@@ -227,7 +315,10 @@ pub(crate) fn render(
     }
 
     // Row 0 is always the subtitle; the list gets what remains.
-    let subtitle = truncate_chars(&summary_line(changes, threshold), inner.width);
+    let subtitle = truncate_chars(
+        &summary_line_filtered(changes, threshold, kind),
+        inner.width,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             subtitle,
@@ -268,19 +359,28 @@ pub(crate) fn render(
         return;
     }
 
-    let visible = usize::from(list_area.height).max(1);
+    // Headers shift every change row down, so scroll over the local row list.
+    let rows = review_rows(changes);
     let selected = selected.min(changes.len() - 1);
-    let start = if selected >= visible {
-        selected + 1 - visible
+    let selected_row = rows
+        .iter()
+        .position(|row| matches!(row, Row::Change(index) if *index == selected))
+        .unwrap_or(0);
+
+    let visible = usize::from(list_area.height).max(1);
+    let start = if selected_row >= visible {
+        selected_row + 1 - visible
     } else {
         0
     };
-    let end = (start + visible).min(changes.len());
+    let end = (start + visible).min(rows.len());
 
-    let lines: Vec<Line> = changes[start..end]
+    let lines: Vec<Line> = rows[start..end]
         .iter()
-        .enumerate()
-        .map(|(offset, change)| row_line(change, list_area.width, start + offset == selected))
+        .map(|row| match row {
+            Row::Header { path, count } => header_line(path, *count, list_area.width),
+            Row::Change(index) => row_line(&changes[*index], list_area.width, *index == selected),
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(AURA.card)),
@@ -321,6 +421,105 @@ mod tests {
         ]
     }
 
+    fn change_at(
+        path: &str,
+        kind: Kind,
+        name: &str,
+        line: usize,
+        ccn: u32,
+        base: Option<u32>,
+    ) -> Change {
+        let mut change = change(kind, name, line, ccn, base);
+        change.path = path.to_string();
+        change
+    }
+
+    fn multifile() -> Vec<Change> {
+        vec![
+            change_at("src/a.rs", Kind::Added, "a_new", 5, 14, None),
+            change_at("src/a.rs", Kind::Worsened, "a_worse", 9, 20, Some(15)),
+            change_at("src/b.rs", Kind::Worsened, "b_worse", 3, 30, Some(25)),
+        ]
+    }
+
+    fn row_symbols(width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), &multifile(), 2, true, "main", 10);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouping_headers_are_shown_for_multiple_files() {
+        let rows = row_symbols(40, 8);
+        let joined = rows.join("\n");
+        assert!(joined.contains("src/a.rs (2)"), "rows: {joined}");
+        assert!(joined.contains("src/b.rs (1)"), "rows: {joined}");
+        assert!(joined.contains("a_new"));
+        assert!(joined.contains("b_worse"));
+    }
+
+    #[test]
+    fn single_file_still_renders_flat_without_header() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), &sample(), 0, true, "main", 10);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..6 {
+            for x in 0..40 {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(!text.contains("src/example.rs ("), "flat list: {text}");
+    }
+
+    #[test]
+    fn selected_row_stays_visible_with_injected_headers() {
+        let changes = multifile();
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), &changes, 2, false, "r1", 10);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut found_selected = false;
+        let mut found_pill = false;
+        for y in 0..5 {
+            let mut row = String::new();
+            for x in 0..40 {
+                let cell = &buffer[(x, y)];
+                row.push_str(cell.symbol());
+                if cell.bg == AURA.pill {
+                    found_pill = true;
+                }
+            }
+            if row.contains("b_worse") {
+                found_selected = true;
+            }
+        }
+        assert!(
+            found_selected,
+            "selected change after a header should be scrolled into view"
+        );
+        assert!(found_pill, "selected row should use the pill background");
+    }
+
     #[test]
     fn summary_counts_both_kinds_and_positive_growth() {
         let line = summary_line(&sample(), 10);
@@ -331,6 +530,18 @@ mod tests {
         assert_eq!(
             summary_line(&[], 8),
             "0 changes \u{b7} added 0 \u{b7} worsened 0 \u{b7} +0 CCN \u{b7} threshold 8"
+        );
+        assert_eq!(
+            summary_line_filtered(&sample(), 10, Some(Kind::Worsened)),
+            "3 changes \u{b7} added 1 \u{b7} worsened 2 \u{b7} +18 CCN \u{b7} threshold 10 \u{b7} worsened-only"
+        );
+        assert_eq!(
+            summary_line_filtered(&sample(), 10, Some(Kind::Added)),
+            "3 changes \u{b7} added 1 \u{b7} worsened 2 \u{b7} +18 CCN \u{b7} threshold 10 \u{b7} added-only"
+        );
+        assert_eq!(
+            summary_line_filtered(&sample(), 10, None),
+            summary_line(&sample(), 10)
         );
     }
 

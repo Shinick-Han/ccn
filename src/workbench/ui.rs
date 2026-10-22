@@ -4,6 +4,7 @@
 //! editor pane is a real vt100 screen rendered by `tui-term`; everything else
 //! is plain ratatui.
 
+use crate::breadcrumb;
 use crate::theme::{grade_color, AURA};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -215,6 +216,23 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default()
                 .fg(if delta > 0 { AURA.warn } else { AURA.ok })
                 .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let breadcrumb = if app.live_mode() {
+        app.live
+            .as_ref()
+            .and_then(|live| live.functions.get(app.selected))
+            .map(|row| breadcrumb::line(&row.function))
+    } else {
+        app.view
+            .as_ref()
+            .and_then(|view| view.functions.get(app.selected))
+            .map(breadcrumb::line)
+    };
+    if let Some(crumb) = breadcrumb {
+        status_spans.push(Span::styled(
+            format!("  {crumb}"),
+            Style::default().fg(AURA.text),
         ));
     }
     if let Some(note) = &app.rpc_note {

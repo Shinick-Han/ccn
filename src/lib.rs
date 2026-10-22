@@ -4,9 +4,11 @@
 //! land in M1/M2; see `docs/PLAN.md`.
 
 pub mod baseline;
+pub mod breadcrumb;
 pub mod cache;
 pub mod ccn;
 pub mod cli;
+pub mod diagnostics;
 pub mod fuzzy;
 pub mod generated;
 pub mod git;
@@ -15,6 +17,7 @@ pub mod loc;
 pub mod metrics;
 pub mod model;
 pub mod p4;
+pub mod palette;
 pub mod report;
 pub mod review;
 pub mod sarif;

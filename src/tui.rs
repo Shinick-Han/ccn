@@ -26,7 +26,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(feature = "workbench")]
+use crate::diagnostics::{Area, Diagnostic, Diagnostics, Severity};
+#[cfg(feature = "workbench")]
 use crate::fuzzy::FuzzyState;
+#[cfg(feature = "workbench")]
+use crate::palette::{Palette, PaletteAction};
 #[cfg(feature = "workbench")]
 use crate::review::ReviewQueue;
 #[cfg(feature = "workbench")]
@@ -209,6 +213,47 @@ fn save_workspace(
     let _ = crate::session::save(root, &saved);
 }
 
+#[cfg(feature = "workbench")]
+fn build_diagnostics(
+    result: &ScanResult,
+    report: &Report,
+    session: &crate::workbench::WorkbenchSession,
+) -> Diagnostics {
+    let mut diagnostics = Diagnostics::from_scan(result, report.baseline.as_ref());
+    let app = &session.app;
+    if let Some(note) = &app.rpc_note {
+        diagnostics.push(Diagnostic {
+            area: Area::Editor,
+            severity: Severity::Warn,
+            path: relative_to_root(&result.root, &app.target),
+            line: None,
+            code: "rpc-note".to_string(),
+            message: note.clone(),
+        });
+    }
+    if let Some(error) = &app.scan_error {
+        diagnostics.push(Diagnostic {
+            area: Area::Editor,
+            severity: Severity::Error,
+            path: relative_to_root(&result.root, &app.target),
+            line: None,
+            code: "scan-error".to_string(),
+            message: error.clone(),
+        });
+    }
+    if let Some(note) = &app.exited {
+        diagnostics.push(Diagnostic {
+            area: Area::Editor,
+            severity: Severity::Warn,
+            path: relative_to_root(&result.root, &app.target),
+            line: None,
+            code: "editor-exited".to_string(),
+            message: note.clone(),
+        });
+    }
+    diagnostics
+}
+
 /// Run the dashboard and workbench in one terminal and one event loop.
 ///
 /// The dashboard is rebuilt after a workbench session so the scan/report and
@@ -239,6 +284,10 @@ pub fn run_unified(
     let mut split_ratio: u16 = saved.split_ratio;
     #[cfg(feature = "workbench")]
     let mut fuzzy = FuzzyState::new();
+    #[cfg(feature = "workbench")]
+    let mut palette = Palette::new();
+    #[cfg(feature = "workbench")]
+    let mut diagnostics: Option<(Diagnostics, usize)> = None;
     #[cfg(feature = "workbench")]
     let mut review: Option<ReviewQueue> = None;
     #[cfg(feature = "workbench")]
@@ -498,7 +547,7 @@ pub fn run_unified(
                                         || format!("{} - all files", base.rev),
                                         |path| format!("{} - {path}", base.rev),
                                     );
-                                    crate::workbench::review_ui::render(
+                                    crate::workbench::review_ui::render_filtered(
                                         frame,
                                         right,
                                         queue.changes(),
@@ -506,8 +555,16 @@ pub fn run_unified(
                                         true,
                                         &title,
                                         base.threshold,
+                                        queue.kind_filter(),
                                     );
                                 }
+                                if let Some((items, selected)) = &diagnostics {
+                                    frame.render_widget(Clear, right);
+                                    crate::workbench::diagnostics_ui::render(
+                                        frame, right, items, *selected, true,
+                                    );
+                                }
+                                crate::palette::render(frame, frame.area(), &palette);
                             })?;
                             if !event::poll(Duration::from_millis(16))? {
                                 continue;
@@ -525,6 +582,165 @@ pub fn run_unified(
                                     }
                                 }
                                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                    if palette.is_open() {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::F(5) => palette.close(),
+                                            KeyCode::Up => palette.move_selection(-1),
+                                            KeyCode::Down => palette.move_selection(1),
+                                            KeyCode::Backspace => palette.backspace(),
+                                            KeyCode::Enter => {
+                                                let action = palette.selected().map(|c| c.action);
+                                                palette.close();
+                                                if let Some(action) = action {
+                                                    match action {
+                                                        PaletteAction::OpenFilePicker => {
+                                                            fuzzy.open(&fuzzy_paths)
+                                                        }
+                                                        PaletteAction::ToggleReview => {
+                                                            if let Some(base) =
+                                                                report.baseline.as_ref()
+                                                            {
+                                                                let active = relative_to_root(
+                                                                    &result.root,
+                                                                    &session.app.target,
+                                                                );
+                                                                let filter = if review_current_only {
+                                                                    active.as_deref()
+                                                                } else {
+                                                                    None
+                                                                };
+                                                                review = Some(ReviewQueue::new(
+                                                                    &base.changes,
+                                                                    filter,
+                                                                ));
+                                                                diagnostics = None;
+                                                                fuzzy.close();
+                                                            } else {
+                                                                session.note(
+                                                                    "no baseline: run with --baseline <rev>",
+                                                                );
+                                                            }
+                                                        }
+                                                        PaletteAction::ToggleDiagnostics => {
+                                                            diagnostics = Some((
+                                                                build_diagnostics(
+                                                                    result, report, session,
+                                                                ),
+                                                                0,
+                                                            ));
+                                                            review = None;
+                                                            fuzzy.close();
+                                                        }
+                                                        PaletteAction::ShowHelp => session.note(
+                                                            "F6 review - F7 diagnostics - Ctrl+Shift+P commands - F8 panes",
+                                                        ),
+                                                        PaletteAction::NextTab => {
+                                                            if let Err(error) = session.next_tab() {
+                                                                session.note(error);
+                                                            }
+                                                        }
+                                                        PaletteAction::PrevTab => {
+                                                            if let Err(error) = session.prev_tab() {
+                                                                session.note(error);
+                                                            }
+                                                        }
+                                                        PaletteAction::CloseTab => {
+                                                            if let Err(error) = session.close_tab() {
+                                                                session.note(error);
+                                                            }
+                                                        }
+                                                        PaletteAction::FocusFiles => {
+                                                            focus = SplitFocus::Files
+                                                        }
+                                                        PaletteAction::FocusEditor => {
+                                                            focus = SplitFocus::Workbench
+                                                        }
+                                                        PaletteAction::FilterFiles => {
+                                                            focus = SplitFocus::Files;
+                                                            session.note(
+                                                                "split filter is Ctrl+P; / filters the dashboard table",
+                                                            );
+                                                        }
+                                                        PaletteAction::Rescan => session.rescan(),
+                                                        PaletteAction::Quit => break,
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Char(ch)
+                                                if !key
+                                                    .modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                palette.type_char(ch)
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if key.code == KeyCode::F(5)
+                                        || (key.modifiers.contains(KeyModifiers::CONTROL)
+                                            && key.modifiers.contains(KeyModifiers::SHIFT)
+                                            && matches!(key.code, KeyCode::Char('p' | 'P')))
+                                    {
+                                        palette.open();
+                                        continue;
+                                    }
+                                    if let Some((items, selected)) = diagnostics.as_mut() {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::F(7) => diagnostics = None,
+                                            KeyCode::Char('j')
+                                            | KeyCode::Down
+                                            | KeyCode::Char('n') => {
+                                                *selected = (*selected + 1)
+                                                    .min(items.len().saturating_sub(1))
+                                            }
+                                            KeyCode::Char('k')
+                                            | KeyCode::Up
+                                            | KeyCode::Char('p') => {
+                                                *selected = selected.saturating_sub(1)
+                                            }
+                                            KeyCode::Char('g') | KeyCode::Home => *selected = 0,
+                                            KeyCode::Char('G') | KeyCode::End => {
+                                                *selected = items.len().saturating_sub(1)
+                                            }
+                                            KeyCode::Enter => {
+                                                let item = items.items().get(*selected).cloned();
+                                                diagnostics = None;
+                                                if let Some(item) = item {
+                                                    if let Some(path) = item.path {
+                                                        let target =
+                                                            Path::new(&result.root).join(&path);
+                                                        let active = relative_to_root(
+                                                            &result.root,
+                                                            &session.app.target,
+                                                        );
+                                                        if active.as_deref() != Some(path.as_str())
+                                                        {
+                                                            if let Err(error) =
+                                                                session.open_file(&target)
+                                                            {
+                                                                session.note(error);
+                                                            }
+                                                        }
+                                                        if let Some(line) = item.line {
+                                                            session.jump_line(line);
+                                                        }
+                                                    } else {
+                                                        session.note(item.message);
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if key.code == KeyCode::F(7) {
+                                        diagnostics =
+                                            Some((build_diagnostics(result, report, session), 0));
+                                        review = None;
+                                        fuzzy.close();
+                                        continue;
+                                    }
                                     if let Some(queue) = review.as_mut() {
                                         match key.code {
                                             KeyCode::Esc | KeyCode::F(6) => review = None,
@@ -538,6 +754,15 @@ pub fn run_unified(
                                             KeyCode::Char('G') | KeyCode::End => {
                                                 queue.select(queue.len().saturating_sub(1))
                                             }
+                                            KeyCode::Char('}') => queue.next_file(),
+                                            KeyCode::Char('{') => queue.prev_file(),
+                                            KeyCode::Char('a') => queue.set_kind_filter(Some(
+                                                crate::baseline::Kind::Added,
+                                            )),
+                                            KeyCode::Char('w') => queue.set_kind_filter(Some(
+                                                crate::baseline::Kind::Worsened,
+                                            )),
+                                            KeyCode::Char('u') => queue.set_kind_filter(None),
                                             KeyCode::Char('f') => {
                                                 if let Some(base) = report.baseline.as_ref() {
                                                     review_current_only = !review_current_only;

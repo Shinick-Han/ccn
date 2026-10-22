@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.12.0 (2026-10-22)
+
+The P2 workbench slice: diagnostics, breadcrumbs, command palette, richer review.
+
+- **Diagnostics (`F7`)**: aggregated scan diagnostics (read errors, oversize,
+  no-grammar, best-effort/heuristic), baseline completeness/counts, and live
+  editor/RPC problems. Enter opens the owning file and jumps to the line.
+- **Breadcrumbs**: the workbench header shows the selected function as
+  `namespace > class > function(params)` from its stable identity.
+- **Command palette (`F5` / `Ctrl+Shift+P`)**: fuzzy search for open-file,
+  review, diagnostics, tab actions, focus, rescan and quit.
+- **Review upgrades**: `a`/`w`/`u` filter added/worsened/all, `{`/`}` jump
+  between files, file headers in all-files mode, kind-filter summary markers.
+- 537 lib + 17 CLI tests; clippy/fmt clean (default and lean); WSL+tmux checked
+  F6, F7, F5 and breadcrumb rendering.
+
 ## 0.11.1 (2026-10-22)
 
 - Compute the `--baseline` snapshot **before** the TUI starts so the `F6`

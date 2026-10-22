@@ -47,9 +47,16 @@ implementation; the public entry point is `ccn workbench` (single file) and
   `:edit` RPC (modified buffers are hidden, not discarded), and `F2`/`F3`
   switch, `F4` closes a clean buffer (`:bdelete`), dirty buffers must be saved.
 - With `--baseline <rev>`, `F6` opens the baseline review panel. `f` toggles
-  current-file/all-files, `n/p` or `j/k` move, Enter opens the owning tab and
-  jumps to the line. It consumes `crate::baseline::Change` rows already produced
-  by the scanner, so opening the panel performs no VCS I/O.
+  current-file/all-files, `a`/`w`/`u` filter added/worsened/all, `{`/`}` jump
+  between files, `n/p` or `j/k` move, Enter opens the owning tab and jumps to
+  the line. It consumes `crate::baseline::Change` rows already produced by the
+  scanner, so opening the panel performs no VCS I/O.
+- `F7` opens diagnostics: scan read errors/oversize/no-grammar and
+  best-effort/heuristic files, baseline completeness categories, and live
+  editor/RPC errors. `F5` opens the fuzzy command palette.
+- The header shows the selected function's breadcrumb
+  (`namespace > class > function(params)`), derived from the stable identity.
+  The embedded editor remains the only place that performs edits.
 - Session state (split ratio, dashboard sort/filter/selection/tab, open and
   active buffers) is stored in the OS cache sidecar, never in the scanned tree.
   Restored tabs are lazy: the first switch issues `:edit`.

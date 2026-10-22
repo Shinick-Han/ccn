@@ -27,6 +27,8 @@ pub struct ReviewQueue {
     selected: usize,
     /// Normalized path filter (separators are `/`).
     path_filter: Option<String>,
+    /// Optional kind filter composed with `path_filter`.
+    kind_filter: Option<Kind>,
 }
 
 impl ReviewQueue {
@@ -41,6 +43,7 @@ impl ReviewQueue {
             changes: Vec::new(),
             selected: 0,
             path_filter: path_filter.map(normalize_path),
+            kind_filter: None,
         };
         queue.refilter();
         queue
@@ -111,6 +114,62 @@ impl ReviewQueue {
         self.path_filter.as_deref()
     }
 
+    /// Replace the kind filter and reset the selection to the first match.
+    ///
+    /// `None` clears the kind filter. This composes with the path filter:
+    /// changing either one keeps the other.
+    pub fn set_kind_filter(&mut self, kind: Option<Kind>) {
+        self.kind_filter = kind;
+        self.selected = 0;
+        self.refilter();
+    }
+
+    /// The kind filter, if one is active.
+    pub fn kind_filter(&self) -> Option<Kind> {
+        self.kind_filter
+    }
+
+    /// Unique paths among the filtered changes, in first-appearance order.
+    ///
+    /// Paths are compared after normalizing separators; the first spelling seen
+    /// for a path is returned.
+    pub fn files(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        for change in &self.changes {
+            let key = normalize_path(&change.path);
+            if !seen.contains(&key) {
+                seen.push(key);
+                files.push(change.path.clone());
+            }
+        }
+        files
+    }
+
+    /// Select the first change of the next unique file.
+    ///
+    /// Clamps at the last file; it does **not** wrap. A no-op on an empty queue.
+    pub fn next_file(&mut self) {
+        let files = self.files();
+        let Some(current) = self.current_file_index(&files) else {
+            return;
+        };
+        let target = (current + 1).min(files.len() - 1);
+        self.select_first_of_file(&files[target]);
+    }
+
+    /// Select the first change of the previous unique file.
+    ///
+    /// Clamps at the first file; it does **not** wrap. A no-op on an empty queue.
+    pub fn prev_file(&mut self) {
+        let files = self.files();
+        let Some(current) = self.current_file_index(&files) else {
+            return;
+        };
+        let target = current.saturating_sub(1);
+        self.select_first_of_file(&files[target]);
+    }
+
     /// Number of [`Kind::Added`] changes matching the filter.
     pub fn added(&self) -> usize {
         self.count_kind(Kind::Added)
@@ -137,35 +196,67 @@ impl ReviewQueue {
     /// A stable, ASCII-only one-line summary of the filtered queue.
     ///
     /// For example `3 changes - +2 added - +14 CCN`. An empty queue is
-    /// `no changes`.
+    /// `no changes`. When a kind filter is active, ` - worsened-only` or
+    /// ` - added-only` is appended.
     pub fn summary(&self) -> String {
         if self.changes.is_empty() {
             return "no changes".to_string();
         }
-        format!(
+        let mut summary = format!(
             "{} changes - +{} added - {:+} CCN",
             self.changes.len(),
             self.added(),
             self.delta_sum()
-        )
+        );
+        match self.kind_filter {
+            Some(Kind::Added) => summary.push_str(" - added-only"),
+            Some(Kind::Worsened) => summary.push_str(" - worsened-only"),
+            None => {}
+        }
+        summary
     }
 
     /// Rebuild `changes` from `source` and keep the selection valid.
     fn refilter(&mut self) {
-        self.changes = match self.path_filter.as_deref() {
-            // `normalize_path` has already replaced separators in both sides.
-            Some(filter) => self
-                .source
-                .iter()
-                .filter(|change| normalize_path(&change.path) == filter)
-                .cloned()
-                .collect(),
-            None => self.source.clone(),
-        };
+        self.changes = self
+            .source
+            .iter()
+            .filter(|change| match self.path_filter.as_deref() {
+                // `normalize_path` has already replaced separators in both sides.
+                Some(filter) => normalize_path(&change.path) == filter,
+                None => true,
+            })
+            .filter(|change| match self.kind_filter {
+                Some(kind) => change.kind == kind,
+                None => true,
+            })
+            .cloned()
+            .collect();
         if self.changes.is_empty() {
             self.selected = 0;
         } else {
             self.selected = self.selected.min(self.changes.len() - 1);
+        }
+    }
+
+    /// Index into [`ReviewQueue::files`] for the selected change.
+    fn current_file_index(&self, files: &[String]) -> Option<usize> {
+        let change = self.changes.get(self.selected)?;
+        let current = normalize_path(&change.path);
+        files
+            .iter()
+            .position(|path| normalize_path(path) == current)
+    }
+
+    /// Select the first change whose path matches `path`.
+    fn select_first_of_file(&mut self, path: &str) {
+        let target = normalize_path(path);
+        if let Some(index) = self
+            .changes
+            .iter()
+            .position(|change| normalize_path(&change.path) == target)
+        {
+            self.selected = index;
         }
     }
 
@@ -387,5 +478,138 @@ mod tests {
         let filtered = ReviewQueue::new(&sample(), Some("src/b.rs"));
         assert_eq!(filtered.summary(), "2 changes - +0 added - +6 CCN");
         assert!(filtered.summary().is_ascii());
+    }
+
+    #[test]
+    fn kind_filter_composes_with_path_filter() {
+        let mut queue = ReviewQueue::new(&sample(), None);
+
+        assert_eq!(queue.kind_filter(), None);
+        queue.set_kind_filter(Some(Kind::Worsened));
+        assert_eq!(queue.kind_filter(), Some(Kind::Worsened));
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.added(), 0);
+        assert_eq!(queue.worsened(), 3);
+
+        queue.set_path_filter(Some("src/a.rs"));
+        assert_eq!(
+            queue.kind_filter(),
+            Some(Kind::Worsened),
+            "set_path_filter preserves the kind filter"
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.selected_change().map(|c| c.name.as_str()),
+            Some("big")
+        );
+
+        queue.set_kind_filter(Some(Kind::Added));
+        assert_eq!(queue.path_filter(), Some("src/a.rs"));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.selected_change().map(|c| c.name.as_str()),
+            Some("new")
+        );
+
+        queue.set_kind_filter(None);
+        assert_eq!(queue.len(), 2, "path filter alone is active again");
+        assert_eq!(queue.kind_filter(), None);
+    }
+
+    #[test]
+    fn files_are_unique_and_in_filtered_order() {
+        let changes = vec![
+            change("src/a.rs", "one", 1, 10, None),
+            change("src/b.rs", "two", 2, 10, None),
+            change("src\\a.rs", "three", 3, 12, None),
+            change("src/c.rs", "four", 4, 10, None),
+        ];
+        let queue = ReviewQueue::new(&changes, None);
+
+        assert_eq!(
+            queue.files(),
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "src/c.rs".to_string()
+            ],
+            "first spelling wins and separators compare equal"
+        );
+
+        let filtered = ReviewQueue::new(&changes, Some("src/a.rs"));
+        assert_eq!(filtered.files(), vec!["src/a.rs".to_string()]);
+
+        let empty = ReviewQueue::new(&[], None);
+        assert!(empty.files().is_empty());
+    }
+
+    #[test]
+    fn next_and_prev_file_clamp_without_wrapping() {
+        let changes = vec![
+            change("src/a.rs", "a1", 1, 10, None),
+            change("src/a.rs", "a2", 2, 11, None),
+            change("src/b.rs", "b1", 3, 12, None),
+            change("src/c.rs", "c1", 4, 13, None),
+            change("src/c.rs", "c2", 5, 14, None),
+        ];
+        let mut queue = ReviewQueue::new(&changes, None);
+
+        queue.next_file();
+        assert_eq!(
+            queue.selected_change().map(|c| c.name.as_str()),
+            Some("b1"),
+            "next_file selects the first change of the next file"
+        );
+        queue.next_file();
+        assert_eq!(queue.selected_change().map(|c| c.name.as_str()), Some("c1"));
+        queue.next_file();
+        assert_eq!(
+            queue.selected_change().map(|c| c.name.as_str()),
+            Some("c1"),
+            "next_file clamps at the last file"
+        );
+
+        queue.prev_file();
+        assert_eq!(queue.selected_change().map(|c| c.name.as_str()), Some("b1"));
+        queue.prev_file();
+        assert_eq!(
+            queue.selected_change().map(|c| c.name.as_str()),
+            Some("a1"),
+            "prev_file selects the first change of the previous file"
+        );
+        queue.prev_file();
+        assert_eq!(
+            queue.selected_change().map(|c| c.name.as_str()),
+            Some("a1"),
+            "prev_file clamps at the first file"
+        );
+
+        let mut empty = ReviewQueue::new(&[], None);
+        empty.next_file();
+        empty.prev_file();
+        assert_eq!(empty.selected(), 0);
+    }
+
+    #[test]
+    fn summary_marks_the_active_kind_filter() {
+        let mut queue = ReviewQueue::new(&sample(), None);
+        assert!(!queue.summary().contains("only"));
+
+        queue.set_kind_filter(Some(Kind::Worsened));
+        assert_eq!(
+            queue.summary(),
+            "3 changes - +0 added - +16 CCN - worsened-only"
+        );
+        assert!(queue.summary().is_ascii());
+
+        queue.set_kind_filter(Some(Kind::Added));
+        assert_eq!(
+            queue.summary(),
+            "1 changes - +1 added - +14 CCN - added-only"
+        );
+        assert!(queue.summary().is_ascii());
+
+        let empty = ReviewQueue::new(&[], None);
+        assert_eq!(empty.summary(), "no changes");
     }
 }
