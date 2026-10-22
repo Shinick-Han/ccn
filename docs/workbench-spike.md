@@ -35,13 +35,13 @@ verified.** No RPC, no extmarks, no file picker.
 ## Run
 
 ```text
-cargo run --release --bin ccn-workbench -- path/to/file.c
-cargo run --release --bin ccn-workbench -- --editor "<path-to-nvim>" file.cpp
-cargo run --release --bin ccn-workbench -- --smoke
-cargo run --release --bin ccn-workbench -- --smoke-nvim
-cargo run --release --bin ccn-workbench -- --editor "<path>" --smoke-nvim
-cargo run --release --bin ccn-workbench -- --smoke-utf8
-cargo run --release --bin ccn-workbench -- --editor "<path>" --smoke-utf8
+cargo run --release --features workbench --bin ccn-workbench -- path/to/file.c
+cargo run --release --features workbench --bin ccn-workbench -- --editor "<path-to-nvim>" file.cpp
+cargo run --release --features workbench --bin ccn-workbench -- --smoke
+cargo run --release --features workbench --bin ccn-workbench -- --smoke-nvim
+cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-nvim
+cargo run --release --features workbench --bin ccn-workbench -- --smoke-utf8
+cargo run --release --features workbench --bin ccn-workbench -- --editor "<path>" --smoke-utf8
 ```
 
 `--editor` defaults to `nvim`. A command with arguments must be quoted at the
@@ -54,7 +54,7 @@ The UTF-8 smoke is the byte-path test, suitable for CI:
 
 ```text
 # Windows
-cargo run --release --bin ccn-workbench -- --smoke-utf8 --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
+cargo run --release --features workbench --bin ccn-workbench -- --smoke-utf8 --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
 
 # WSL Ubuntu: build, then run under a PTY
 wsl -d Ubuntu -- bash -c 'export PATH=/home/jcpuk/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/user/source/CCN; CARGO_TARGET_DIR=/home/jcpuk/ccn-target cargo build --release --locked --bin ccn-workbench'
@@ -68,7 +68,7 @@ cargo build --release --bin ccn-workbench
 cargo clippy --release --locked --bin ccn-workbench -- -D warnings
 cargo fmt --check
 cargo test --release --bin ccn-workbench
-cargo run --release --bin ccn-workbench -- --smoke
+cargo run --release --features workbench --bin ccn-workbench -- --smoke
 ```
 
 ## Layout (condensed ASCII capture, 130x40 host)

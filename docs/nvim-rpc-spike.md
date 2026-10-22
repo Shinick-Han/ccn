@@ -27,7 +27,7 @@ disk is never opened, written, or stat'ed by the probe.
 Build:
 
 ```
-cargo build --release --bin ccn-nvim-probe
+cargo build --release --features workbench --bin ccn-nvim-probe
 ```
 
 Run against any Neovim started with a listen address:

@@ -4,18 +4,43 @@ version = "0.7.8"
 edition = "2021"
 license = "MIT"
 rust-version = "1.90"
+autobins = false
 description = "Repository code-health scanner: per-file LOC, per-function CCN, distribution histograms"
+
+[features]
+default = []
+workbench = [
+    "dep:tui-term",
+    "dep:portable-pty",
+    "dep:vt100",
+    "dep:nvim-rs",
+    "dep:tokio",
+]
+
+[[bin]]
+name = "ccn"
+path = "src/main.rs"
+
+[[bin]]
+name = "ccn-workbench"
+path = "src/bin/ccn-workbench/main.rs"
+required-features = ["workbench"]
+
+[[bin]]
+name = "ccn-nvim-probe"
+path = "src/bin/ccn-nvim-probe/main.rs"
+required-features = ["workbench"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 ignore = "0.4.30"
 ratatui = "0.29.0"
-tui-term = "0.2"
-portable-pty = "0.9"
-vt100 = "0.15"
-nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+tui-term = { version = "0.2", optional = true }
+portable-pty = { version = "0.9", optional = true }
+vt100 = { version = "0.15", optional = true }
+nvim-rs = { version = "0.9.2", features = ["use_tokio"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"], optional = true }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

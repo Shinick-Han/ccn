@@ -43,9 +43,8 @@ jobs:
               | sh -s -- -y --profile minimal --default-toolchain stable
             . "$HOME/.cargo/env"
 
-            cargo build --release --locked \
+            cargo build --release --locked --features workbench \
               --bin ccn-workbench --bin ccn-nvim-probe
-
             echo "--- glibc gate (workbench) ---"
             max=$(objdump -T target/release/ccn-workbench \
               | grep -o "GLIBC_[0-9.]*" | sort -V | tail -n1)
