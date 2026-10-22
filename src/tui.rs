@@ -28,6 +28,8 @@ use std::time::Duration;
 #[cfg(feature = "workbench")]
 use crate::diagnostics::{Area, Diagnostic, Diagnostics, Severity};
 #[cfg(feature = "workbench")]
+use crate::diff::{diff_lines, DiffLine};
+#[cfg(feature = "workbench")]
 use crate::fuzzy::FuzzyState;
 #[cfg(feature = "workbench")]
 use crate::palette::{Palette, PaletteAction};
@@ -124,6 +126,13 @@ struct DashboardState {
 enum SplitFocus {
     Files,
     Workbench,
+}
+
+#[cfg(feature = "workbench")]
+struct DiffPane {
+    rows: Vec<DiffLine>,
+    selected: usize,
+    title: String,
 }
 
 /// Left dashboard table + right workbench pane. The left pane shrinks first
@@ -254,6 +263,49 @@ fn build_diagnostics(
     diagnostics
 }
 
+#[cfg(feature = "workbench")]
+fn baseline_text(root: &str, rev: &str, path: &str) -> Result<String, String> {
+    let root_path = Path::new(root);
+    let backend =
+        crate::vcs::detect(root_path).ok_or_else(|| "no git or Perforce workspace".to_string())?;
+    match crate::vcs::file_at(root_path, backend, rev, path) {
+        crate::vcs::FileAt::Found(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        crate::vcs::FileAt::Absent => Ok(String::new()),
+        crate::vcs::FileAt::Unmapped => Err("path is outside the depot/client view".to_string()),
+        crate::vcs::FileAt::Unknown => Err("client view is incomplete".to_string()),
+        crate::vcs::FileAt::Unavailable => Err("baseline content is unavailable".to_string()),
+    }
+}
+
+#[cfg(feature = "workbench")]
+fn split_lines(text: &str) -> Vec<String> {
+    text.lines().map(str::to_string).collect()
+}
+
+#[cfg(feature = "workbench")]
+fn build_diff_pane(
+    root: &str,
+    rev: &str,
+    change: &crate::baseline::Change,
+    session: &crate::workbench::WorkbenchSession,
+) -> Result<DiffPane, String> {
+    let old_text = baseline_text(root, rev, &change.path)?;
+    let active = relative_to_root(root, &session.app.target);
+    let current_text = if active.as_deref() == Some(change.path.as_str()) {
+        session.app.live.as_ref().map(|live| live.lines.join("\n"))
+    } else {
+        None
+    }
+    .or_else(|| std::fs::read_to_string(Path::new(root).join(&change.path)).ok())
+    .unwrap_or_default();
+    let rows = diff_lines(&split_lines(&old_text), &split_lines(&current_text));
+    Ok(DiffPane {
+        rows,
+        selected: 0,
+        title: format!("{} - {} @ {}", change.name, change.path, rev),
+    })
+}
+
 /// Run the dashboard and workbench in one terminal and one event loop.
 ///
 /// The dashboard is rebuilt after a workbench session so the scan/report and
@@ -288,6 +340,8 @@ pub fn run_unified(
     let mut palette = Palette::new();
     #[cfg(feature = "workbench")]
     let mut diagnostics: Option<(Diagnostics, usize)> = None;
+    #[cfg(feature = "workbench")]
+    let mut diff: Option<DiffPane> = None;
     #[cfg(feature = "workbench")]
     let mut review: Option<ReviewQueue> = None;
     #[cfg(feature = "workbench")]
@@ -564,6 +618,17 @@ pub fn run_unified(
                                         frame, right, items, *selected, true,
                                     );
                                 }
+                                if let Some(pane) = &diff {
+                                    frame.render_widget(Clear, right);
+                                    crate::workbench::diff_ui::render(
+                                        frame,
+                                        right,
+                                        &pane.rows,
+                                        pane.selected,
+                                        true,
+                                        &pane.title,
+                                    );
+                                }
                                 crate::palette::render(frame, frame.area(), &palette);
                             })?;
                             if !event::poll(Duration::from_millis(16))? {
@@ -685,6 +750,31 @@ pub fn run_unified(
                                         palette.open();
                                         continue;
                                     }
+                                    if let Some(pane) = diff.as_mut() {
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::Char('d') => diff = None,
+                                            KeyCode::Char('j') | KeyCode::Down => {
+                                                pane.selected = (pane.selected + 1)
+                                                    .min(pane.rows.len().saturating_sub(1))
+                                            }
+                                            KeyCode::Char('k') | KeyCode::Up => {
+                                                pane.selected = pane.selected.saturating_sub(1)
+                                            }
+                                            KeyCode::PageDown => {
+                                                pane.selected = (pane.selected + 10)
+                                                    .min(pane.rows.len().saturating_sub(1))
+                                            }
+                                            KeyCode::PageUp => {
+                                                pane.selected = pane.selected.saturating_sub(10)
+                                            }
+                                            KeyCode::Char('g') | KeyCode::Home => pane.selected = 0,
+                                            KeyCode::Char('G') | KeyCode::End => {
+                                                pane.selected = pane.rows.len().saturating_sub(1)
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
                                     if let Some((items, selected)) = diagnostics.as_mut() {
                                         match key.code {
                                             KeyCode::Esc | KeyCode::F(7) => diagnostics = None,
@@ -777,6 +867,23 @@ pub fn run_unified(
                                                     };
                                                     *queue =
                                                         ReviewQueue::new(&base.changes, filter);
+                                                }
+                                            }
+                                            KeyCode::Char('d') => {
+                                                if let Some(base) = report.baseline.as_ref() {
+                                                    if let Some(change) =
+                                                        queue.selected_change().cloned()
+                                                    {
+                                                        match build_diff_pane(
+                                                            &result.root,
+                                                            &base.rev,
+                                                            &change,
+                                                            session,
+                                                        ) {
+                                                            Ok(pane) => diff = Some(pane),
+                                                            Err(error) => session.note(error),
+                                                        }
+                                                    }
                                                 }
                                             }
                                             KeyCode::Enter => {

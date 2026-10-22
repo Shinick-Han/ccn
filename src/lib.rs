@@ -9,6 +9,7 @@ pub mod cache;
 pub mod ccn;
 pub mod cli;
 pub mod diagnostics;
+pub mod diff;
 pub mod fuzzy;
 pub mod generated;
 pub mod git;

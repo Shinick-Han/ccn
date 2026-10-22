@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.0 (2026-10-22)
+
+- **Baseline diff view**: in the `F6` review panel, `d` opens a unified line
+  diff of the baseline file (`--baseline <rev>`) against the live Neovim
+  buffer, including unsaved edits. Added/removed/context rows, old/new line
+  numbers, a selected-row scroll window and `PgUp`/`PgDn`/`g/G` navigation.
+  `Esc`/`d` returns to the review list.
+- The RPC snapshot now carries the live buffer lines, and baseline lines are
+  read through `vcs::file_at`; opening the diff performs no writes.
+- 558 lib + 17 CLI tests; clippy/fmt clean; WSL+tmux verified the review → diff
+  flow on a real baseline.
+
 ## 0.12.0 (2026-10-22)
 
 The P2 workbench slice: diagnostics, breadcrumbs, command palette, richer review.

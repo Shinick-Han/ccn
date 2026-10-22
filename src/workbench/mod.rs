@@ -6,6 +6,7 @@
 //! See `docs/workbench-spike.md`.
 
 pub(crate) mod diagnostics_ui;
+pub(crate) mod diff_ui;
 mod pty;
 pub(crate) mod review_ui;
 mod rpc;
@@ -189,6 +190,8 @@ pub(crate) struct LiveView {
     pub name: String,
     pub tier: CcnTier,
     pub functions: Vec<LiveRow>,
+    /// Current buffer lines for the diff view (including unsaved edits).
+    pub lines: Vec<String>,
     pub sum: u32,
     pub max: u32,
     pub changedtick: i64,
@@ -453,6 +456,7 @@ impl App {
             name: display_name,
             tier,
             functions: rows,
+            lines: snapshot.lines,
             sum: snapshot.sum,
             max: snapshot.max,
             changedtick: snapshot.changedtick,

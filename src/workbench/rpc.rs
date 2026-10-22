@@ -51,6 +51,9 @@ pub struct LiveSnapshot {
     /// `None` when the snapshot carries an error instead of a measurement.
     pub tier: Option<CcnTier>,
     pub functions: Vec<FunctionCcn>,
+    /// The live buffer lines, already UTF-8 decoded. Used by the diff view so
+    /// unsaved edits are shown without touching disk.
+    pub lines: Vec<String>,
     pub sum: u32,
     pub max: u32,
     pub changedtick: i64,
@@ -483,6 +486,7 @@ pub async fn read_snapshot(nvim: &Rpc, fallback_path: &Path, base_tick: i64) -> 
         name,
         tier: Some(summary.tier),
         functions: summary.detail,
+        lines,
         sum: summary.sum,
         max: summary.max,
         changedtick,
@@ -497,6 +501,7 @@ fn error_snapshot(base_tick: i64, started: Instant, message: String) -> LiveSnap
         name: String::new(),
         tier: None,
         functions: Vec::new(),
+        lines: Vec::new(),
         sum: 0,
         max: 0,
         changedtick: base_tick,
