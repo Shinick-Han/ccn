@@ -185,3 +185,21 @@ run, so they include process startup in the shell measurement only, not in
    `CCN <n> (+<d>)` only when a baseline file is loaded.
 6. **Clear on detach.** Always clear the `ccn_rpc` namespace before leaving a
    buffer or shutting down so stale labels never outlive the analysis.
+
+## AlmaLinux 8 / EPEL Neovim 0.8 evidence (2026-10-22)
+
+The same probe was run in `.github/workflows/workbench-linux-check.yml` inside
+`almalinux:8` with EPEL's `neovim` 0.8.0:
+
+```text
+elapsed_ms=0.682
+"tier": "exact",
+"max": 5
+extmarks in namespace ccn_rpc: 2
+  id=1 row=0 col=0 text="CCN 1" hl=DiagnosticInfo
+  id=2 row=1 col=0 text="CCN 5" hl=DiagnosticInfo
+```
+
+So the RPC path is not tied to Neovim 0.10+; `nvim_buf_get_lines` and
+`nvim_exec_lua` + `nvim_buf_set_extmark` work on the EL8 package. The official
+Neovim 0.12 tarball requires GLIBC 2.34 and cannot be used on EL8.

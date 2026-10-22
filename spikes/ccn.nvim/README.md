@@ -268,3 +268,9 @@ spikes/ccn.nvim/
   lua/ccn/init.lua   -- config, async runner, JSON parsing, extmarks, diagnostics
   README.md
 ```
+
+## Tested versions
+
+- Neovim 0.12.6 (Windows, Ubuntu 26.04): `vim.system` async path.
+- Neovim 0.8.0 (AlmaLinux 8, EPEL): `jobstart` fallback, verified headless with
+  a `source = "ccn"` diagnostic and a virtual-text mark.

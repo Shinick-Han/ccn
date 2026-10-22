@@ -237,3 +237,42 @@ Windows/ConPTY details worth keeping:
   `script`/alternate-screen paths are verified under WSL Ubuntu 26.04. Resize
   (SIGWINCH) and interactive keyboard handling were not exercised there; the
   full key loop was only driven on Windows.
+
+## Compatibility matrix (2026-10-22)
+
+| Host / toolchain | Editor | PTY render | UTF-8 byte path | RPC + extmarks |
+|---|---|---|---|---|
+| Windows 11 (ConPTY) | portable Neovim 0.12.6 | pass | pass | pass (probe) |
+| Ubuntu 26.04 (WSL, glibc 2.43) | portable Neovim 0.12.6 | pass | pass | pass (probe) |
+| AlmaLinux 8 (glibc 2.28) | EPEL `neovim` 0.8.0 | pass | pass | pass (probe) |
+| AlmaLinux 8 | official Neovim 0.12 tarball | **not runnable** | - | - |
+
+The official Neovim Linux tarball requires **GLIBC_2.34**; AlmaLinux 8 ships
+2.28. Use the EPEL 8 `neovim` package (0.8.0) or a locally built Neovim on EL8.
+The workbench's PTY path works with 0.8; the RPC probe's
+`nvim_buf_set_extmark` path was verified against 0.8, and `ccn.nvim`'s
+`jobstart` fallback produced a `source = "ccn"` diagnostic on 0.8.
+
+Verification is in `.github/workflows/workbench-linux-check.yml`:
+AlmaLinux 8 build (glibc 2.28 symbol gate), PTY smoke, EPEL-nvim render,
+UTF-8 smoke, RPC probe, and the plugin. Artifacts are retained for 14 days.
+Linux interactive resize/keyboard was exercised only on Windows and via
+`script` smokes; a full interactive Linux session and a human IME test remain
+open.
+
+## Packaging status
+
+The workbench is behind the `workbench` feature and is **not** part of the
+`ccn` release assets:
+
+```text
+cargo build --release --locked                       # scanner only
+cargo run --release --features workbench --bin ccn-workbench -- file.c
+cargo build --release --features workbench --bin ccn-nvim-probe
+```
+
+The default `cargo test`/`cargo build` does not compile `tui-term`,
+`portable-pty`, `vt100`, `nvim-rs` or `tokio`. The AlmaLinux workflow builds
+`ccn-workbench-linux-x64` and `ccn-nvim-probe-linux-x64` as CI artifacts;
+promoting them to GitHub release assets needs a separate packaging decision
+(and a story for the Neovim dependency: system/EPEL vs bundled).
