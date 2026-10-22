@@ -169,7 +169,7 @@ pub fn run_unified(
                 {
                     let target = Path::new(&result.root).join(&path);
                     let target = std::fs::canonicalize(&target).unwrap_or(target);
-                    let restart = session.as_ref().map_or(true, |session| {
+                    let restart = session.as_ref().is_none_or(|session| {
                         session.app.target != target || session.app.exited.is_some()
                     });
                     if restart {
