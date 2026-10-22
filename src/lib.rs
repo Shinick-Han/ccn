@@ -23,6 +23,7 @@ pub mod report;
 pub mod review;
 pub mod sarif;
 pub mod session;
+pub mod symbols;
 pub mod terminal;
 pub mod theme;
 pub mod tree;

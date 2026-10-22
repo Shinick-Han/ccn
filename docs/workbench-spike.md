@@ -56,6 +56,10 @@ implementation; the public entry point is `ccn workbench` (single file) and
 - `F7` opens diagnostics: scan read errors/oversize/no-grammar and
   best-effort/heuristic files, baseline completeness categories, and live
   editor/RPC errors. `F5` opens the fuzzy command palette.
+- `Alt+O` opens the current-file symbol palette; fuzzy-match a function and
+  Enter jumps to it. The function sidebar is display-only for navigation:
+  click a function row to jump, or use Alt+O. `F9` remains an advanced focus
+  alias for compatibility.
 - The header shows the selected function's breadcrumb
   (`namespace > class > function(params)`), derived from the stable identity.
   The embedded editor remains the only place that performs edits.

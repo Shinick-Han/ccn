@@ -36,6 +36,8 @@ use crate::palette::{Palette, PaletteAction};
 #[cfg(feature = "workbench")]
 use crate::review::ReviewQueue;
 #[cfg(feature = "workbench")]
+use crate::symbols::SymbolPalette;
+#[cfg(feature = "workbench")]
 use crate::tree::{Tree, TreeAction};
 use crossterm::cursor::{Hide, Show};
 #[cfg(feature = "workbench")]
@@ -357,6 +359,8 @@ pub fn run_unified(
     #[cfg(feature = "workbench")]
     let mut review: Option<ReviewQueue> = None;
     #[cfg(feature = "workbench")]
+    let mut symbols = SymbolPalette::new();
+    #[cfg(feature = "workbench")]
     let mut review_current_only = false;
     #[cfg(feature = "workbench")]
     let mut tree_state: Option<Tree> = None;
@@ -641,6 +645,9 @@ pub fn run_unified(
                                         &pane.title,
                                     );
                                 }
+                                if symbols.is_open() {
+                                    crate::symbols::render(frame, frame.area(), &symbols);
+                                }
                                 crate::palette::render(frame, frame.area(), &palette);
                             })?;
                             if !event::poll(Duration::from_millis(16))? {
@@ -752,6 +759,42 @@ pub fn run_unified(
                                             }
                                             _ => {}
                                         }
+                                        continue;
+                                    }
+                                    if symbols.is_open() {
+                                        match key.code {
+                                            KeyCode::Esc => symbols.close(),
+                                            KeyCode::Up => symbols.move_selection(-1),
+                                            KeyCode::Down => symbols.move_selection(1),
+                                            KeyCode::PageUp => symbols.move_selection(-10),
+                                            KeyCode::PageDown => symbols.move_selection(10),
+                                            KeyCode::Backspace => symbols.backspace(),
+                                            KeyCode::Enter => {
+                                                if let Some(function) = symbols.selected() {
+                                                    let line = function.line;
+                                                    symbols.close();
+                                                    session.jump_line(line);
+                                                }
+                                            }
+                                            KeyCode::Char(ch)
+                                                if !key
+                                                    .modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                symbols.type_char(ch)
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if key.modifiers.contains(KeyModifiers::ALT)
+                                        && matches!(key.code, KeyCode::Char('o' | 'O'))
+                                    {
+                                        symbols.open(&session.functions());
+                                        review = None;
+                                        diff = None;
+                                        diagnostics = None;
+                                        fuzzy.close();
                                         continue;
                                     }
                                     if key.code == KeyCode::F(5)
@@ -1059,6 +1102,7 @@ pub fn run_unified(
                                             && !palette.is_open()
                                             && mouse.column >= right.x =>
                                     {
+                                        session.click_workbench(mouse.column, mouse.row, right);
                                         focus = SplitFocus::Workbench;
                                     }
                                     MouseEventKind::Drag(MouseButton::Left) if dragging => {
@@ -2285,6 +2329,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("F6", "baseline review (then d for diff)"),
                 ("F7", "diagnostics"),
                 ("Alt+W", "files / editor panes"),
+                ("Alt+O", "search functions in this file"),
                 ("F10", "back to the dashboard"),
             ],
         ),

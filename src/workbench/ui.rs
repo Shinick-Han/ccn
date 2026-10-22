@@ -52,6 +52,41 @@ pub fn editor_inner(editor: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(editor)
 }
 
+/// Split the sidebar into its summary block and its function-list block.
+pub(crate) fn sidebar_regions(sidebar: Rect) -> (Rect, Rect) {
+    let inner = Block::default().borders(Borders::ALL).inner(sidebar);
+    let [summary, list] =
+        Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(inner);
+    (summary, list)
+}
+
+/// Height in terminal rows of one function entry (name row + identity row).
+pub(crate) const FUNCTION_ROWS: u16 = 2;
+
+/// Number of function entries that fit in the sidebar list area.
+pub(crate) fn visible_functions(list: Rect) -> usize {
+    (list.height / FUNCTION_ROWS).max(1) as usize
+}
+
+/// First function index shown for `selected` (page-aligned scrolling).
+pub(crate) fn list_offset(selected: usize, visible: usize) -> usize {
+    let visible = visible.max(1);
+    (selected / visible) * visible
+}
+
+/// Map a terminal row inside the sidebar list to a function index.
+///
+/// Rows are grouped in pairs (name + identity), and `offset` is the first
+/// function index rendered at the top of `list`. Rows outside the list, empty
+/// lists, and rows past the last function all return `None`.
+pub(crate) fn function_row_at(list: Rect, offset: usize, count: usize, row: u16) -> Option<usize> {
+    if count == 0 || row < list.y || row >= list.y.saturating_add(list.height) {
+        return None;
+    }
+    let index = offset + usize::from((row - list.y) / FUNCTION_ROWS);
+    (index < count).then_some(index)
+}
+
 pub fn render(frame: &mut Frame, app: &App, screen: &Screen) {
     render_area(frame, app, screen, frame.area());
 }
@@ -338,8 +373,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let [summary_area, list_area] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(1)]).areas(inner);
+    let (summary_area, list_area) = sidebar_regions(area);
 
     let initial = app.initial.len();
     let summary = match (&app.live, &app.view) {
@@ -460,9 +494,8 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let rows_per_function = 2u16;
-    let visible = (list_area.height / rows_per_function).max(1) as usize;
-    let start = (app.selected / visible) * visible;
+    let visible = visible_functions(list_area);
+    let start = list_offset(app.selected, visible);
     let end = (start + visible).min(count);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -562,7 +595,7 @@ fn delta_color(delta: &str) -> Color {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let keys = match app.focus {
-        Focus::Editor => " F10 dashboard - Alt+W panes - F5 commands - F6 review - F7 diagnostics ",
+        Focus::Editor => " F10 dashboard - Alt+W panes - Alt+O symbols - F5 commands - F6 review - F7 diagnostics ",
         Focus::Sidebar => " j/k move - Enter jump - F9 editor - F5 commands - F10 dashboard ",
     };
     let keys = if app.split {
@@ -650,5 +683,58 @@ mod tests {
         assert!(rendered.contains("one(int)"), "{rendered}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn list() -> Rect {
+        Rect::new(80, 10, 20, 8)
+    }
+
+    #[test]
+    fn function_row_at_maps_both_rows_of_the_first_function() {
+        assert_eq!(function_row_at(list(), 0, 5, 10), Some(0));
+        assert_eq!(function_row_at(list(), 0, 5, 11), Some(0));
+        assert_eq!(function_row_at(list(), 0, 5, 12), Some(1));
+    }
+
+    #[test]
+    fn function_row_at_honors_the_scroll_offset() {
+        assert_eq!(function_row_at(list(), 4, 10, 10), Some(4));
+        assert_eq!(function_row_at(list(), 4, 10, 13), Some(5));
+    }
+
+    #[test]
+    fn function_row_at_rejects_rows_past_the_last_function() {
+        // Offset 8 with only 9 functions: local rows map to 8 and then 9+
+        // (off the end).
+        assert_eq!(function_row_at(list(), 8, 9, 12), None);
+        assert_eq!(function_row_at(list(), 8, 9, 16), None);
+    }
+
+    #[test]
+    fn function_row_at_rejects_empty_lists() {
+        assert_eq!(function_row_at(list(), 0, 0, 10), None);
+    }
+
+    #[test]
+    fn function_row_at_ignores_summary_border_and_below_list_clicks() {
+        assert_eq!(function_row_at(list(), 0, 5, 9), None);
+        assert_eq!(function_row_at(list(), 0, 5, 18), None);
+        assert_eq!(function_row_at(Rect::new(80, 10, 20, 0), 0, 5, 10), None);
+    }
+
+    #[test]
+    fn list_offset_pages_with_the_selection() {
+        assert_eq!(list_offset(0, 4), 0);
+        assert_eq!(list_offset(3, 4), 0);
+        assert_eq!(list_offset(4, 4), 4);
+        assert_eq!(list_offset(9, 4), 8);
+        assert_eq!(list_offset(9, 0), 9);
+    }
+
+    #[test]
+    fn visible_functions_uses_paired_rows() {
+        assert_eq!(visible_functions(Rect::new(0, 0, 20, 8)), 4);
+        assert_eq!(visible_functions(Rect::new(0, 0, 20, 1)), 1);
+        assert_eq!(visible_functions(Rect::new(0, 0, 20, 0)), 1);
     }
 }

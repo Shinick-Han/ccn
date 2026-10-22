@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.15.0 (2026-10-22)
+
+Navigation slice.
+
+- `Alt+O` opens a fuzzy symbol palette for the current file; Enter jumps to the
+  function line. This replaces keyboard navigation through the function sidebar.
+- The function sidebar is display-only for navigation: click a function row to
+  jump. `F9` remains an advanced compatibility focus key.
+- `Alt+W` is the primary pane switch; mouse clicks focus either pane and click a
+  tree file to open it.
+- 578 lib + 17 CLI tests; clippy/fmt clean; WSL+tmux verified Alt+O and jump.
+
 ## 0.14.1 (2026-10-22)
 
 Patch-level UX polish on top of 0.14.0.

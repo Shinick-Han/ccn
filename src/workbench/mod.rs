@@ -30,7 +30,7 @@ use crossterm::event::{
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::Frame;
 use ratatui::Terminal;
 
@@ -1139,6 +1139,54 @@ impl WorkbenchSession {
         if let Err(error) = self.child.send(&bytes) {
             self.app
                 .set_status(format!("paste to editor failed: {error}"), true);
+        }
+    }
+
+    /// Handle a left click at `(column, row)` inside the workbench `area`.
+    ///
+    /// Editor clicks only take focus (the PTY never sees mouse events). A click
+    /// on a sidebar function row maps through the same page-aligned scroll
+    /// offset used by the renderer, selects that function, and runs the normal
+    /// Enter jump. Clicks on the summary, borders, or elsewhere do nothing.
+    #[allow(dead_code)] // Wired by the split UI mouse handler.
+    /// Functions of the current file for the symbol palette. Live rows include
+    /// unsaved edits; otherwise the latest on-disk scan is used.
+    pub(crate) fn functions(&self) -> Vec<FunctionCcn> {
+        if self.app.live_mode() {
+            self.app
+                .live
+                .as_ref()
+                .map(|live| {
+                    live.functions
+                        .iter()
+                        .map(|row| row.function.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.app
+                .view
+                .as_ref()
+                .map(|view| view.functions.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    pub(crate) fn click_workbench(&mut self, column: u16, row: u16, area: Rect) {
+        let rects = ui::layout(area);
+        let point = Position::new(column, row);
+        if rects.sidebar.contains(point) {
+            let (_, list_area) = ui::sidebar_regions(rects.sidebar);
+            let count = self.app.function_count();
+            let visible = ui::visible_functions(list_area);
+            let offset = ui::list_offset(self.app.selected, visible);
+            if let Some(index) = ui::function_row_at(list_area, offset, count, row) {
+                self.app.selected = index;
+                self.app.jump_selected();
+                self.app.focus = Focus::Editor;
+            }
+        } else if rects.editor.contains(point) {
+            self.app.focus = Focus::Editor;
         }
     }
 
