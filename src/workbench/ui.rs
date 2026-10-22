@@ -562,7 +562,7 @@ fn delta_color(delta: &str) -> Color {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let keys = match app.focus {
-        Focus::Editor => " F10 dashboard - F8 panes - F9 sidebar - F5 commands - F6 review ",
+        Focus::Editor => " F10 dashboard - F8 panes - F5 commands - F6 review - F7 diagnostics ",
         Focus::Sidebar => " j/k move - Enter jump - F9 editor - F5 commands - F10 dashboard ",
     };
     let keys = if app.split {

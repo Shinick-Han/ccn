@@ -334,6 +334,39 @@ impl Tree {
         }
     }
 
+    /// Hit-test a mouse click inside the rendered tree. Single-clicking a
+    /// directory toggles it; clicking a file returns `Open`. `area` is the
+    /// same rectangle passed to `render`, and the current offset is used.
+    pub fn click(&mut self, column: u16, row: u16, area: Rect) -> TreeAction {
+        let inner_x = area.x.saturating_add(1);
+        let inner_y = area.y.saturating_add(1);
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if column < inner_x
+            || column >= inner_x.saturating_add(inner_w)
+            || row < inner_y
+            || row >= inner_y.saturating_add(inner_h)
+        {
+            return TreeAction::None;
+        }
+        let header = u16::from(inner_h >= 2);
+        let row_y = row.saturating_sub(inner_y);
+        if row_y < header {
+            return TreeAction::None;
+        }
+        let index = self.offset + usize::from(row_y - header);
+        let Some(tree_row) = self.rows.get(index) else {
+            return TreeAction::None;
+        };
+        self.selected = index;
+        if tree_row.is_dir {
+            self.toggle();
+            TreeAction::None
+        } else {
+            TreeAction::Open(PathBuf::from(&tree_row.path))
+        }
+    }
+
     /// Draw the tree into `area`. `focused` swaps the border and adds the same
     /// accent marker the dashboard's file table uses.
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -588,6 +621,18 @@ mod tests {
         assert!(tree.collapsed().contains("src/sub"));
         assert!(!paths(&tree).contains(&"src/sub/b.c"));
         assert!(paths(&tree).contains(&"new/file.rs"));
+    }
+
+    #[test]
+    fn mouse_click_selects_a_file_and_opens_it() {
+        let mut tree = tree();
+        tree.offset = 0;
+        let area = Rect::new(0, 0, 30, 10);
+        assert_eq!(
+            tree.click(5, 4, area),
+            TreeAction::Open(PathBuf::from("src/sub/b.c"))
+        );
+        assert_eq!(tree.selected_path(), Some("src/sub/b.c"));
     }
 
     #[test]

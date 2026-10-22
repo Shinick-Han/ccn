@@ -1012,6 +1012,36 @@ pub fn run_unified(
                                     {
                                         dragging = true;
                                     }
+                                    MouseEventKind::Down(MouseButton::Left)
+                                        if review.is_none()
+                                            && diff.is_none()
+                                            && diagnostics.is_none()
+                                            && !fuzzy.is_open()
+                                            && !palette.is_open()
+                                            && mouse.column < left.width =>
+                                    {
+                                        focus = SplitFocus::Files;
+                                        if let TreeAction::Open(path) =
+                                            tree.click(mouse.column, mouse.row, left)
+                                        {
+                                            let target = Path::new(&result.root).join(path);
+                                            if let Err(error) = session.open_file(&target) {
+                                                eprintln!("ccn: {error}");
+                                            } else {
+                                                focus = SplitFocus::Workbench;
+                                            }
+                                        }
+                                    }
+                                    MouseEventKind::Down(MouseButton::Left)
+                                        if review.is_none()
+                                            && diff.is_none()
+                                            && diagnostics.is_none()
+                                            && !fuzzy.is_open()
+                                            && !palette.is_open()
+                                            && mouse.column >= right.x =>
+                                    {
+                                        focus = SplitFocus::Workbench;
+                                    }
                                     MouseEventKind::Drag(MouseButton::Left) if dragging => {
                                         split_ratio = split_ratio_from_x(mouse.column, area.width);
                                     }
@@ -2236,13 +2266,13 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("F6", "baseline review (then d for diff)"),
                 ("F7", "diagnostics"),
                 ("F8", "files / editor panes"),
-                ("F9", "editor / function sidebar"),
                 ("F10", "back to the dashboard"),
             ],
         ),
         (
             "ADVANCED (still works)",
             &[
+                ("F9", "editor / function sidebar"),
                 ("g / G", "first / last"),
                 ("Tab", "chart: CCN per function / LOC per file"),
                 ("s / S", "sort key / reverse direction"),
