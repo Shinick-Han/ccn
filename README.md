@@ -44,8 +44,10 @@ The report is one self-contained HTML file: verdict, CCN-per-function histogram,
 LOC-per-file histogram (files vs lines), riskiest files, and git hotspots when
 the repo has history. No CDN, no chart library, no telemetry — ~27 KB.
 
-`--tui` keys: `j/k` move, `Tab` chart, `s` sort, `/` filter, `Enter` detail,
-`?` help, `q` quit. On a non-TTY it falls back to the summary.
+`--tui` keys: `j/k` move, `/` filter, `e` edit, `Ctrl+P` open, `?` help,
+`q` quit. The left column shows the CCN/LOC histogram, a live preview of the
+selected file, and a repo pulse (parse confidence, threshold counts, baseline).
+On a non-TTY it falls back to the summary.
 
 ### Experimental: embedded workbench (ccn workbench)
 

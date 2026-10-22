@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.16.0 (2026-10-22)
+
+Dashboard context panels.
+
+- The left dashboard column now uses its empty space for:
+  - **Selected file**: path, LOC, function count, CCN max/sum/p90, tier, risk,
+    top three functions, and baseline change count.
+  - **Repo pulse**: exact/best-effort/heuristic files, >10/>20/>50 functions,
+    generated/vendored exclusions, read/oversize/no-grammar counts, baseline
+    completeness and health score.
+- Short terminals keep the original single histogram panel.
+- 578 lib + 17 CLI tests; clippy/fmt clean; WSL+tmux verified the three-panel
+  layout.
+
 ## 0.15.0 (2026-10-22)
 
 Navigation slice.

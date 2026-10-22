@@ -1908,6 +1908,231 @@ fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
 }
 
 fn render_left(frame: &mut Frame, app: &App<'_>, area: Rect) {
+    // Keep the original single chart on short terminals. On a normal dashboard
+    // the left column becomes contextual: histogram, selected file, repo pulse.
+    if area.height < 22 {
+        render_histogram(frame, app, area);
+        return;
+    }
+    let hist_height = if app.left_tab == LeftTab::Ccn { 10 } else { 9 };
+    let chunks = Layout::vertical([
+        Constraint::Length(hist_height),
+        Constraint::Min(5),
+        Constraint::Length(7),
+    ])
+    .split(area);
+    render_histogram(frame, app, chunks[0]);
+    render_selected_file(frame, app, chunks[1]);
+    render_repo_pulse(frame, app, chunks[2]);
+}
+
+fn render_selected_file(frame: &mut Frame, app: &App<'_>, area: Rect) {
+    let title = Line::from(Span::styled(
+        " selected file ",
+        Style::default().fg(AURA.muted),
+    ));
+    let block = panel_block(false, title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let Some(row) = app.selected_row() else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "no file selected",
+                Style::default().fg(AURA.muted),
+            ))
+            .style(Style::default().bg(AURA.card)),
+            inner,
+        );
+        return;
+    };
+
+    let tier = match row.tier {
+        CcnTier::Exact => "exact",
+        CcnTier::BestEffort => "best-effort",
+        CcnTier::Heuristic => "heuristic",
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            row.path.as_str(),
+            Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "{} · {} LOC · {} fn · CCN max {} · sum {} · p90 {}",
+                row.lang, row.loc, row.functions, row.ccn_max, row.ccn_sum, row.p90
+            ),
+            Style::default().fg(AURA.muted),
+        )),
+        Line::from(Span::styled(
+            format!("tier {tier} · risk {:.1} · >10 {}", row.risk, row.over_10),
+            Style::default().fg(AURA.muted),
+        )),
+    ];
+
+    let functions = app
+        .result
+        .files
+        .get(row.index)
+        .and_then(|file| file.ccn.as_ref())
+        .map(|summary| summary.detail.as_slice())
+        .unwrap_or(&[]);
+    let mut top: Vec<&crate::ccn::types::FunctionCcn> = functions.iter().collect();
+    top.sort_by(|a, b| b.ccn.cmp(&a.ccn).then(a.line.cmp(&b.line)));
+    if top.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " no function detail",
+            Style::default().fg(AURA.muted),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " top functions",
+            Style::default().fg(AURA.accent_alt),
+        )));
+        for function in top.into_iter().take(3) {
+            if lines.len() >= inner.height as usize {
+                break;
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:>3} ", function.ccn),
+                    Style::default().fg(risk_color(f64::from(function.ccn))),
+                ),
+                Span::styled(
+                    truncate_right(&function.name, inner.width as usize - 12),
+                    Style::default().fg(AURA.text),
+                ),
+                Span::styled(
+                    format!(" L{}", function.line),
+                    Style::default().fg(AURA.muted),
+                ),
+            ]));
+        }
+    }
+    if let Some(baseline) = app.report.baseline.as_ref() {
+        let changes = baseline
+            .changes
+            .iter()
+            .filter(|change| change.path == row.path)
+            .count();
+        if lines.len() < inner.height as usize {
+            lines.push(Line::from(Span::styled(
+                format!("baseline {}: {} changes", baseline.rev, changes),
+                Style::default().fg(if changes > 0 { AURA.warn } else { AURA.muted }),
+            )));
+        }
+    }
+    lines.truncate(inner.height as usize);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        inner,
+    );
+}
+
+fn render_repo_pulse(frame: &mut Frame, app: &App<'_>, area: Rect) {
+    let title = Line::from(Span::styled(
+        " repo pulse ",
+        Style::default().fg(AURA.muted),
+    ));
+    let block = panel_block(false, title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let stats = &app.report.stats;
+    let ccn = app.result.ccn.as_ref();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "{} exact · {} best · {} heuristic",
+                stats.files_exact, stats.files_best_effort, stats.files_heuristic
+            ),
+            Style::default().fg(AURA.muted),
+        )),
+        Line::from(Span::styled(
+            match ccn {
+                Some(ccn) => format!(
+                    ">10 {} · >20 {} · >50 {}",
+                    ccn.over_10, ccn.over_20, ccn.over_50
+                ),
+                None => "no CCN pass".to_string(),
+            },
+            Style::default().fg(AURA.muted),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "excluded: {} generated · {} vendored",
+                stats.files_excluded_generated, stats.files_excluded_vendored
+            ),
+            Style::default().fg(AURA.muted),
+        )),
+    ];
+
+    let mut read_errors = 0;
+    let mut oversize = 0;
+    let mut no_grammar = 0;
+    for file in &app.result.files {
+        match file.ccn_skip {
+            Some(crate::model::CcnSkip::ReadError) => read_errors += 1,
+            Some(crate::model::CcnSkip::Oversize) => oversize += 1,
+            Some(crate::model::CcnSkip::NoGrammar) => no_grammar += 1,
+            None => {}
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        format!("read errors {read_errors} · oversize {oversize} · no grammar {no_grammar}"),
+        Style::default().fg(if read_errors > 0 {
+            AURA.danger
+        } else {
+            AURA.muted
+        }),
+    )));
+    if let Some(baseline) = app.report.baseline.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "baseline {}: {} changes{}",
+                baseline.rev,
+                baseline.changes.len(),
+                if baseline.complete {
+                    ""
+                } else {
+                    " · incomplete"
+                }
+            ),
+            Style::default().fg(if baseline.complete {
+                AURA.muted
+            } else {
+                AURA.warn
+            }),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "baseline: none (--baseline <rev>)",
+            Style::default().fg(AURA.muted),
+        )));
+    }
+    if let Some(health) = app.report.health.as_ref() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "health {:.1} · grade {} · debt {:.2} of lines",
+                health.score, health.grade, health.debt
+            ),
+            Style::default().fg(grade_color(health.grade)),
+        )));
+    }
+    lines.truncate(inner.height as usize);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        inner,
+    );
+}
+
+fn render_histogram(frame: &mut Frame, app: &App<'_>, area: Rect) {
     let title = Line::from(vec![Span::styled(
         format!(" {} [{}/2] ", app.left_tab.title(), app.left_tab.number()),
         Style::default().fg(AURA.muted),
