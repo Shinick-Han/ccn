@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.1 (2026-10-22)
+
+- Compute the `--baseline` snapshot **before** the TUI starts so the `F6`
+  review panel is populated; the post-TUI pass still recomputes it against the
+  edited tree for the gate.
+- Verified in WSL+tmux: `F6` showed `review_complex new->13 (+13)`, Enter
+  opened the owning tab and jumped to the function.
+- 492 lib + 17 CLI tests.
+
 ## 0.11.0 (2026-10-22)
 
 Baseline review panel plus terminal-input fixes.

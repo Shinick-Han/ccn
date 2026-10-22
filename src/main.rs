@@ -66,6 +66,26 @@ fn main() {
     let sarif_owns_stdout = cli.sarif.as_deref() == Some("-");
     let mut tui_handled = false;
     if cli.tui && !cli.report_json && !cli.json && !sarif_owns_stdout {
+        // The review panel needs the baseline before the dashboard starts.
+        // The post-TUI pass below recomputes it against the edited tree for the
+        // gate, so this snapshot is UI-only and never weakens the final verdict.
+        if let Some(rev) = &cli.baseline {
+            match ccn::vcs::detect(Path::new(&result.root)) {
+                Some(backend) => {
+                    if !ccn::vcs::rev_exists(Path::new(&result.root), backend, rev) {
+                        eprintln!("ccn: cannot resolve baseline revision {rev}");
+                        std::process::exit(2);
+                    }
+                    let (baseline, _) =
+                        ccn::baseline::collect_with_manifest(&result, backend, rev, 10);
+                    report.baseline = Some(baseline);
+                }
+                None => {
+                    eprintln!("ccn: --baseline needs a git or Perforce workspace");
+                    std::process::exit(2);
+                }
+            }
+        }
         match ccn::tui::run_unified(
             &mut result,
             &mut report,
