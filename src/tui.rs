@@ -102,6 +102,29 @@ struct DashboardState {
     left_tab: LeftTab,
 }
 
+#[cfg(feature = "workbench")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitFocus {
+    Files,
+    Workbench,
+}
+
+/// Left dashboard table + right workbench pane. The left pane shrinks first
+/// on narrow terminals, leaving at least ~40 columns for the editor.
+#[cfg(feature = "workbench")]
+fn split_areas(size: Rect) -> (Rect, Rect) {
+    let max_left = size.width.saturating_sub(40).max(20);
+    let left_width = ((u32::from(size.width) * 38) / 100).clamp(24, u32::from(max_left)) as u16;
+    let left = Rect::new(size.x, size.y, left_width, size.height);
+    let right = Rect::new(
+        size.x + left_width,
+        size.y,
+        size.width.saturating_sub(left_width),
+        size.height,
+    );
+    (left, right)
+}
+
 /// Run the dashboard and workbench in one terminal and one event loop.
 ///
 /// The dashboard is rebuilt after a workbench session so the scan/report and
@@ -177,12 +200,14 @@ pub fn run_unified(
                             old.close();
                         }
                         let size = guard.terminal.size()?;
+                        let area = Rect::new(0, 0, size.width, size.height);
+                        let (_, right) = split_areas(area);
                         match crate::workbench::WorkbenchSession::open(
                             &target,
                             editor,
                             false,
-                            size.width,
-                            size.height,
+                            right.width,
+                            right.height,
                         ) {
                             Ok(open) => session = Some(open),
                             Err(e) => {
@@ -193,21 +218,72 @@ pub fn run_unified(
                     }
 
                     if let Some(session) = session.as_mut() {
+                        let mut split_dashboard = App::new(result, report);
+                        if let Some(state) = &dashboard_state {
+                            split_dashboard.restore_state(state);
+                        }
+                        let mut focus = SplitFocus::Workbench;
+                        let mut last_right = (0u16, 0u16);
                         loop {
                             session.tick();
-                            guard.terminal.draw(|frame| session.draw(frame))?;
-                            if event::poll(Duration::from_millis(16))? {
-                                match event::read()? {
-                                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                            session.app.split = true;
+                            let size = guard.terminal.size()?;
+                            let area = Rect::new(0, 0, size.width, size.height);
+                            let (left, right) = split_areas(area);
+                            if last_right != (right.width, right.height) {
+                                session.resize(right.width, right.height);
+                                last_right = (right.width, right.height);
+                            }
+                            guard.terminal.draw(|frame| {
+                                render_right(
+                                    frame,
+                                    &mut split_dashboard,
+                                    left,
+                                    focus == SplitFocus::Files,
+                                );
+                                session.draw_in(frame, right);
+                            })?;
+                            if !event::poll(Duration::from_millis(16))? {
+                                continue;
+                            }
+                            match event::read()? {
+                                Event::Key(key) if key.kind != KeyEventKind::Release => match focus
+                                {
+                                    SplitFocus::Files => match key.code {
+                                        KeyCode::Char('q') => break,
+                                        KeyCode::Char('j') | KeyCode::Down => {
+                                            split_dashboard.move_selection(1)
+                                        }
+                                        KeyCode::Char('k') | KeyCode::Up => {
+                                            split_dashboard.move_selection(-1)
+                                        }
+                                        KeyCode::Char('g') | KeyCode::Home => {
+                                            split_dashboard.select_first()
+                                        }
+                                        KeyCode::Char('G') | KeyCode::End => {
+                                            split_dashboard.select_last()
+                                        }
+                                        KeyCode::Char('e') | KeyCode::Enter | KeyCode::F(8) => {
+                                            focus = SplitFocus::Workbench
+                                        }
+                                        KeyCode::F(10) => break,
+                                        _ => {}
+                                    },
+                                    SplitFocus::Workbench => {
+                                        if key.code == KeyCode::F(8) {
+                                            focus = SplitFocus::Files;
+                                            continue;
+                                        }
                                         if session.handle_key(key) {
                                             break;
                                         }
                                     }
-                                    Event::Resize(width, height) => session.resize(width, height),
-                                    _ => {}
-                                }
+                                },
+                                Event::Resize(_, _) => {}
+                                _ => {}
                             }
                         }
+                        dashboard_state = Some(split_dashboard.capture_state());
                     }
 
                     match crate::loc::scan(options) {
@@ -769,7 +845,7 @@ pub fn render(frame: &mut Frame, app: &mut App<'_>) {
     let body =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(rows[1]);
     render_left(frame, app, body[0]);
-    render_right(frame, app, body[1]);
+    render_right(frame, app, body[1], true);
     render_footer(frame, app, rows[2]);
 
     match app.overlay {
@@ -1016,7 +1092,7 @@ fn bar_cells(share: f64, max: f64, width: usize) -> usize {
     cells.min(width)
 }
 
-fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect) {
+fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect, focused: bool) {
     let arrow = if app.sort_desc { '↓' } else { '↑' };
     let title = Line::from(vec![
         Span::styled("▌", Style::default().fg(AURA.accent)),
@@ -1030,7 +1106,7 @@ fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect) {
             Style::default().fg(AURA.muted),
         ),
     ]);
-    let block = panel_block(true, title);
+    let block = panel_block(focused, title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {

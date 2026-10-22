@@ -218,6 +218,8 @@ pub(crate) struct App {
     rpc_rx: Option<Receiver<RpcEvent>>,
     pub child_alive: Arc<AtomicBool>,
     pub rpc_disabled: bool,
+    /// True when rendered as the right pane of the dashboard split.
+    pub split: bool,
 }
 
 impl App {
@@ -244,6 +246,7 @@ impl App {
             rpc_rx: None,
             child_alive: Arc::new(AtomicBool::new(true)),
             rpc_disabled: false,
+            split: false,
         };
         app.rescan("scan");
         app.initial = app
@@ -760,13 +763,13 @@ impl WorkbenchSession {
         }
     }
 
-    pub(crate) fn draw(&self, frame: &mut Frame) {
+    pub(crate) fn draw_in(&self, frame: &mut Frame, area: Rect) {
         let parser = self.child.parser();
         let screen = match parser.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        ui::render(frame, &self.app, screen.screen());
+        ui::render_area(frame, &self.app, screen.screen(), area);
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {

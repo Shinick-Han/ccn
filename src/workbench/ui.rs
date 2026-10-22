@@ -52,7 +52,12 @@ pub fn editor_inner(editor: Rect) -> Rect {
 }
 
 pub fn render(frame: &mut Frame, app: &App, screen: &Screen) {
-    let area = frame.area();
+    render_area(frame, app, screen, frame.area());
+}
+
+/// Render the complete workbench UI inside `area` (a split pane, a test
+/// backend, or the full terminal).
+pub fn render_area(frame: &mut Frame, app: &App, screen: &Screen, area: Rect) {
     frame.render_widget(
         Block::default().style(Style::default().bg(AURA.canvas)),
         area,
@@ -518,6 +523,11 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             " F10 back/quit · F9 focus sidebar · typing goes to the editor · r rescans in the sidebar "
         }
         Focus::Sidebar => " F10 back/quit · F9 back · Enter/o jump · j/k move · g/G · r rescan ",
+    };
+    let keys = if app.split {
+        format!(" F8 panes |{keys}")
+    } else {
+        keys.to_string()
     };
     let status_style = if app.status_is_error() {
         Style::default().fg(AURA.danger)

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.9.0 (2026-10-22)
+
+Split-screen dashboard + editor.
+
+- `e` now opens a **split view**: the dashboard file table on the left and the
+  workbench (Neovim + live function sidebar) on the right, in the same
+  terminal and event loop. No handoff, no alternate-screen churn.
+- `F8` switches focus between the file table and the workbench; `F9` switches
+  editor/sidebar inside the workbench; `F10` hides the split and returns to the
+  full dashboard; `q` in the file table also hides the split (so unsaved
+  buffers are not discarded by accident). `q` on the full dashboard exits.
+- The left table keeps the selected path, sort, filter and chart tab; the
+  workbench session and nvim/RPC live across split/full-dashboard switches.
+- The PTY is sized to the right pane; resizing recomputes the split and
+  resizes the editor.
+- Opening a different file from the split's left table is not supported yet:
+  `F10`, select the file, then `e` (the session is replaced). The full
+  dashboard remains the multi-file navigator.
+- WSL+tmux capture shows the left table (`Files (2)`, sort/risk) and the right
+  workbench (`engine.cpp`, RPC live, function sidebar) simultaneously.
+- 439 lib + 17 CLI tests, clippy/fmt clean (default and lean builds).
+
 ## 0.8.2 (2026-10-22)
 
 Keep the workbench session and dashboard position across tab switches.

@@ -59,7 +59,11 @@ $ ccn workbench file.c --editor nvim
 $ ccn . --tui   # press e on a file to open it here
 ```
 
-Requirements: `nvim` on `PATH` or `--editor <path>`. In the dashboard, `e` opens the selected file in the workbench; `F10` returns to a refreshed dashboard, reusing the nvim session and the dashboard selection/sort/filter when the same file is reopened. On AlmaLinux/RHEL 8 use
+Requirements: `nvim` on `PATH` or `--editor <path>`. In the dashboard, `e` opens the selected file in a **split view**: the file
+table on the left, Neovim and the live function sidebar on the right. `F8`
+switches panes, `F9` switches editor/sidebar, `F10` hides the split, and `q`
+on the full dashboard exits. The nvim session and dashboard selection are
+reused when you reopen the same file. On AlmaLinux/RHEL 8 use
 the EPEL `neovim` (0.8 works; the official Neovim Linux tarball requires glibc
 2.34 and cannot run on EL8). Use `--no-rpc` for PTY-only editing with the
 mtime-based sidebar. See [`docs/workbench-spike.md`](docs/workbench-spike.md)
