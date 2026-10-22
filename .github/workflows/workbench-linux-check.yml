@@ -70,15 +70,15 @@ jobs:
 
             echo "--- RPC probe against EPEL nvim 0.8 ---"
             tmp=$(mktemp -d)
-            printf '%s\n' \
-              'int simple(int x) { return x + 1; }' \
-              'int messy(int x) {' \
-              '    if (x > 0) x++;' \
-              '    if (x > 1) x++;' \
-              '    if (x > 2) x++;' \
-              '    if (x > 3) x++;' \
-              '    return x;' \
-              '}' > "$tmp/a.cpp"
+            printf "%s\n" \
+              "int simple(int x) { return x + 1; }" \
+              "int messy(int x) {" \
+              "    if (x > 0) x++;" \
+              "    if (x > 1) x++;" \
+              "    if (x > 2) x++;" \
+              "    if (x > 3) x++;" \
+              "    return x;" \
+              "}" > "$tmp/a.cpp"
             nvim --headless --listen 127.0.0.1:7777 "$tmp/a.cpp" &
             nvim_pid=$!
             sleep 2
