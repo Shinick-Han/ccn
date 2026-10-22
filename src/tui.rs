@@ -1702,21 +1702,17 @@ fn render_footer(frame: &mut Frame, app: &App<'_>, area: Rect) {
     let chrome = Style::default().fg(AURA.muted);
     let mut spans = vec![
         Span::styled("j/k", key),
-        Span::styled(" move · ", chrome),
-        Span::styled("Tab", key),
-        Span::styled(" panel · ", chrome),
-        Span::styled("s", key),
-        Span::styled(" sort · ", chrome),
+        Span::styled(" move - ", chrome),
         Span::styled("/", key),
-        Span::styled(" filter · ", chrome),
-        Span::styled("Enter", key),
-        Span::styled(" detail · ", chrome),
+        Span::styled(" filter - ", chrome),
+        Span::styled("e", key),
+        Span::styled(" edit - ", chrome),
+        Span::styled("Ctrl+P", key),
+        Span::styled(" open - ", chrome),
         Span::styled("?", key),
-        Span::styled(" help · ", chrome),
+        Span::styled(" help - ", chrome),
         Span::styled("q", key),
         Span::styled(" quit", chrome),
-        Span::styled("  e", key),
-        Span::styled(" workbench", chrome),
     ];
     if let Some(filter) = app.active_filter() {
         spans.push(Span::styled("  ", chrome));
@@ -2193,6 +2189,13 @@ fn render_detail(frame: &mut Frame, app: &App<'_>, area: Rect) {
     );
 }
 
+/// Advanced keys remain available but stay out of the compact help unless the
+/// user explicitly asks for them. This keeps the default key map teachable.
+fn advanced_keys() -> bool {
+    std::env::var("CCN_KEYMAP")
+        .map(|value| value.eq_ignore_ascii_case("advanced"))
+        .unwrap_or(false)
+}
 fn render_help(frame: &mut Frame, area: Rect) {
     let area = centered(area, 76, 76);
     if area.width < 4 || area.height < 4 {
@@ -2204,7 +2207,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         .style(Style::default().bg(AURA.card))
         .border_style(Style::default().fg(AURA.border_focus))
         .title(Line::from(Span::styled(
-            " KEYS · Esc closes ",
+            " keys · Esc closes ",
             Style::default().fg(AURA.accent),
         )));
     let inner = block.inner(area);
@@ -2213,25 +2216,65 @@ fn render_help(frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let entries = [
-        ("j / k", "move selection"),
-        ("g / G", "first / last file"),
-        ("Tab", "switch chart: CCN per function, LOC per file"),
-        ("s", "cycle sort: risk, loc, max ccn, over 10, path"),
-        ("S", "reverse the sort direction"),
-        ("/", "filter paths (Enter applies, Esc cancels)"),
-        ("Enter / d", "file detail"),
-        ("e", "open the workbench on this file"),
-        ("?", "this help (keys)"),
-        ("q / Esc", "quit"),
+    let sections: [(&str, &[(&str, &str)]); 3] = [
+        (
+            "NAVIGATE",
+            &[
+                ("j / k", "move selection"),
+                ("/", "filter paths (Enter applies, Esc cancels)"),
+                ("Enter / d", "file detail"),
+                ("e", "open the workbench"),
+                ("Ctrl+P", "open a file by name"),
+                ("?", "this help"),
+                ("q / Esc", "quit"),
+            ],
+        ),
+        (
+            "WORKBENCH",
+            &[
+                ("F5", "command palette"),
+                ("F6", "baseline review (then d for diff)"),
+                ("F7", "diagnostics"),
+                ("F8", "files / editor panes"),
+                ("F9", "editor / function sidebar"),
+                ("F10", "back to the dashboard"),
+            ],
+        ),
+        (
+            "ADVANCED (still works)",
+            &[
+                ("g / G", "first / last"),
+                ("Tab", "chart: CCN per function / LOC per file"),
+                ("s / S", "sort key / reverse direction"),
+                ("1 / 2", "chart tab"),
+                ("[ / ]", "resize the split from the file pane"),
+                ("F2 / F3 / F4", "previous / next / close tab"),
+                ("Ctrl+C", "quit confirmation / interrupt in the editor"),
+            ],
+        ),
     ];
-
-    let mut lines: Vec<Line> = Vec::with_capacity(entries.len());
-    for (keys, description) in entries {
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {:<12}", keys), Style::default().fg(AURA.accent)),
-            Span::styled(description, Style::default().fg(AURA.text)),
-        ]));
+    let mut lines: Vec<Line> = Vec::new();
+    let visible = if advanced_keys() {
+        sections.len()
+    } else {
+        sections.len() - 1
+    };
+    for (index, (title, entries)) in sections.iter().take(visible).enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" {title}"),
+            Style::default()
+                .fg(AURA.accent_alt)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (keys, description) in entries.iter() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {:<14}", keys), Style::default().fg(AURA.accent)),
+                Span::styled(*description, Style::default().fg(AURA.text)),
+            ]));
+        }
     }
     lines.truncate(inner.height as usize);
     frame.render_widget(

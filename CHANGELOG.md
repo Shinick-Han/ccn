@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.0 (2026-10-22)
+
+UX simplification: fewer visible keys, same power.
+
+- Dashboard footer reduced to `j/k`, `/`, `e`, `Ctrl+P`, `?`, `q`.
+- Workbench footer reduced to `F10`, `F8`, `F9`, `F5`, `F6` (and the
+  sidebar's `j/k`, Enter, `F9`, `F5`, `F10`). `F2`/`F3`/`F4` and resize keys
+  still work but are no longer advertised.
+- `?` is grouped into NAVIGATE / WORKBENCH / ADVANCED; the ADVANCED section is
+  hidden unless `CCN_KEYMAP=advanced` is set.
+- No command was removed. The command palette remains the single place for tab
+  actions, review, diagnostics, rescan, focus and quit.
+- 558 lib + 17 CLI tests; clippy/fmt clean.
+
 ## 0.13.0 (2026-10-22)
 
 - **Baseline diff view**: in the `F6` review panel, `d` opens a unified line

@@ -562,10 +562,8 @@ fn delta_color(delta: &str) -> Color {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let keys = match app.focus {
-        Focus::Editor => {
-            " F10 back/quit · F9 focus sidebar · F2/F3 tabs · F4 close tab · typing goes to the editor · r rescans in the sidebar "
-        }
-        Focus::Sidebar => " F10 back/quit · F9 back · Enter/o jump · j/k move · g/G · r rescan ",
+        Focus::Editor => " F10 dashboard - F8 panes - F9 sidebar - F5 commands - F6 review ",
+        Focus::Sidebar => " j/k move - Enter jump - F9 editor - F5 commands - F10 dashboard ",
     };
     let keys = if app.split {
         format!(" F8 panes |{keys}")
@@ -648,7 +646,7 @@ mod tests {
         assert!(rendered.contains("[1 sample.c]"), "{rendered}");
         assert!(rendered.contains("NVIM-EDITOR-CONTENT"), "{rendered}");
         assert!(rendered.contains("functions"), "{rendered}");
-        assert!(rendered.contains("F10 back/quit"), "{rendered}");
+        assert!(rendered.contains("F10 dashboard"), "{rendered}");
         assert!(rendered.contains("one(int)"), "{rendered}");
 
         let _ = std::fs::remove_dir_all(&dir);
