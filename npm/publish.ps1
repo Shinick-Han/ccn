@@ -76,7 +76,7 @@ foreach ($dir in $targets) {
 # npm returns 202 "being processed" for large packages; metadata can lag by
 # 1-3 minutes. Poll the exact version rather than the `latest` tag, which may
 # still point at the previous release while the upload is queued.
-$deadline = (Get-Date).AddMinutes(3)
+$deadline = (Get-Date).AddMinutes(6)
 $pending = @($toVerify)
 while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
     $still = @()
