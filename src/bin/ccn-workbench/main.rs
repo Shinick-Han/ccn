@@ -64,6 +64,10 @@ struct Cli {
     /// Non-interactive Neovim render test on a temp file (skips if missing).
     #[arg(long)]
     smoke_nvim: bool,
+
+    /// Type Korean through the PTY into Neovim, save, and assert the bytes.
+    #[arg(long)]
+    smoke_utf8: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +339,9 @@ fn main() -> ExitCode {
     }
     if cli.smoke_nvim {
         return report_smoke(run_smoke(&cli, true));
+    }
+    if cli.smoke_utf8 {
+        return report_smoke(run_smoke_utf8(&cli));
     }
     match run_workbench(&cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -723,6 +730,97 @@ fn run_smoke(cli: &Cli, nvim: bool) -> Result<(), String> {
         Err("the vt100 screen never contained CCN_SMOKE".to_string())
     };
     result
+}
+
+/// `--smoke-utf8`: prove the UTF-8 byte path through the real PTY.
+///
+/// This types `한글` with the same `encode_key` the UI uses, saves with `:wq`,
+/// and asserts the file contains the bytes. It does not test OS IME
+/// composition: the characters enter as already-composed UTF-8.
+fn run_smoke_utf8(cli: &Cli) -> Result<(), String> {
+    let temp = TempDir::new()?;
+    let file = temp.path.join("ccn_workbench_utf8.c");
+    fs::write(&file, "int utf8_probe(void) { return 0; }\n")
+        .map_err(|e| format!("cannot write the UTF-8 smoke file: {e}"))?;
+
+    let parts = pty::parse_command(&cli.editor)?;
+    let program = parts[0].clone();
+    if !pty::program_available(&program) {
+        println!("skip: editor not found: {program} (install Neovim or pass --editor \"<cmd>\")");
+        return Ok(());
+    }
+    let mut args = parts[1..].to_vec();
+    args.push(native_path(&file));
+    let mut child = Pty::spawn(&program, &args, &temp.path, 24, 80)?;
+
+    let name = file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Give Neovim its normal startup window, then wait (briefly) for the file
+    // to be visible before typing so a cold start cannot eat the keystrokes.
+    std::thread::sleep(Duration::from_millis(1200));
+    let ready = Instant::now() + Duration::from_millis(2000);
+    while Instant::now() < ready && !child.screen_text().contains(&name) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut keys = vec![KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)];
+    keys.extend(
+        "한글"
+            .chars()
+            .map(|ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+    );
+    keys.push(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    keys.extend(
+        ":wq"
+            .chars()
+            .map(|ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+    );
+    keys.push(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    for key in keys {
+        let bytes = encode_key(&key)
+            .ok_or_else(|| format!("cannot encode key {:?} for the editor", key.code))?;
+        child
+            .send(&bytes)
+            .map_err(|e| format!("cannot send key {:?}: {e}", key.code))?;
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(5000);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.exit_status().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let screen = child.screen_text();
+    child.kill();
+
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|e| format!("<cannot read {}: {e}>", file.display()));
+    if exited && content.contains("한글") {
+        println!("smoke-utf8 ok");
+        return Ok(());
+    }
+
+    println!("--- screen tail ---");
+    for line in screen_tail(&screen, 12) {
+        println!("{line}");
+    }
+    println!("--- file content ---");
+    print!("{content}");
+    if !content.ends_with('\n') {
+        println!();
+    }
+    if !exited {
+        Err("the editor did not exit after :wq".to_string())
+    } else {
+        Err("the saved file does not contain the Korean text".to_string())
+    }
 }
 
 fn screen_tail(text: &str, count: usize) -> Vec<String> {

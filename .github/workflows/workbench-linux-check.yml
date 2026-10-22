@@ -1,0 +1,106 @@
+name: workbench-linux-check
+
+# Verifies the experimental workbench on the oldest supported userland
+# (AlmaLinux 8 / glibc 2.28), including the distro Neovim from EPEL 8.
+# The official Neovim Linux tarball requires GLIBC 2.34 and cannot be used
+# there, so this job is the compatibility gate for the embedded-editor path.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/bin/ccn-workbench/**"
+      - "src/bin/ccn-nvim-probe/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/workbench-linux-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  almalinux8:
+    name: build + smoke on AlmaLinux 8 (glibc 2.28, EPEL nvim)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Build and smoke inside AlmaLinux 8
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/src" -w /src almalinux:8 bash -c '
+            set -euo pipefail
+            dnf install -y --setopt=install_weak_deps=False \
+              gcc gcc-c++ make git tar gzip curl ca-certificates binutils \
+              util-linux procps-ng
+            dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+            dnf install -y neovim
+            echo "--- nvim ---"
+            nvim --version | head -3
+
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+
+            cargo build --release --locked \
+              --bin ccn-workbench --bin ccn-nvim-probe
+
+            echo "--- glibc gate (workbench) ---"
+            max=$(objdump -T target/release/ccn-workbench \
+              | grep -o "GLIBC_[0-9.]*" | sort -V | tail -n1)
+            echo "highest workbench glibc symbol: ${max:-none}"
+            newest=$(printf "%s\nGLIBC_2.28\n" "$max" | sort -V | tail -n1)
+            if [[ "$newest" != "GLIBC_2.28" ]]; then
+              echo "::error::ccn-workbench requires $max, newer than AlmaLinux 8 GLIBC_2.28"
+              exit 1
+            fi
+
+            export LANG=C.UTF-8
+            export TERM=xterm-256color
+
+            echo "--- workbench smoke (PTY) ---"
+            script -qec "./target/release/ccn-workbench --smoke" /dev/null
+
+            echo "--- workbench smoke (EPEL nvim) ---"
+            script -qec "./target/release/ccn-workbench --smoke-nvim --editor /usr/bin/nvim" /dev/null
+
+            echo "--- workbench UTF-8 byte path (EPEL nvim) ---"
+            script -qec "./target/release/ccn-workbench --smoke-utf8 --editor /usr/bin/nvim" /dev/null
+
+            echo "--- RPC probe against EPEL nvim 0.8 ---"
+            tmp=$(mktemp -d)
+            printf '%s\n' \
+              'int simple(int x) { return x + 1; }' \
+              'int messy(int x) {' \
+              '    if (x > 0) x++;' \
+              '    if (x > 1) x++;' \
+              '    if (x > 2) x++;' \
+              '    if (x > 3) x++;' \
+              '    return x;' \
+              '}' > "$tmp/a.cpp"
+            nvim --headless --listen 127.0.0.1:7777 "$tmp/a.cpp" &
+            nvim_pid=$!
+            sleep 2
+            ./target/release/ccn-nvim-probe --server 127.0.0.1:7777 --json
+            ./target/release/ccn-nvim-probe --server 127.0.0.1:7777 --annotate
+            ./target/release/ccn-nvim-probe --server 127.0.0.1:7777 --dump-marks
+            kill "$nvim_pid" 2>/dev/null || true
+            wait "$nvim_pid" 2>/dev/null || true
+            rm -rf "$tmp"
+
+            echo "--- stage artifacts ---"
+            cp target/release/ccn-workbench ccn-workbench-linux-x64
+            cp target/release/ccn-nvim-probe ccn-nvim-probe-linux-x64
+            chmod +x ccn-workbench-linux-x64 ccn-nvim-probe-linux-x64
+          '
+
+      - name: Upload Linux workbench artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ccn-workbench-almalinux8
+          path: |
+            ccn-workbench-linux-x64
+            ccn-nvim-probe-linux-x64
+          if-no-files-found: error
+          retention-days: 14

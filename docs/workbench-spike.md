@@ -3,8 +3,9 @@
 First spike for a Neovim-centric workbench: a real Neovim TUI runs inside a
 ratatui pane next to ccn's per-file complexity sidebar.
 
-Status: **builds and runs on Windows (verified); Linux runtime unverified.**
-No RPC, no extmarks, no file picker. `src/bin/ccn-workbench/` is the only code.
+Status: **Windows full TUI verified; Linux (WSL/Ubuntu 26.04) PTY and smoke paths
+verified.** No RPC, no extmarks, no file picker.
+`src/bin/ccn-workbench/` is the only code.
 
 ## What works
 
@@ -27,7 +28,9 @@ No RPC, no extmarks, no file picker. `src/bin/ccn-workbench/` is the only code.
 - Window resize calls `MasterPty::resize` and `vt100::Parser::set_size`.
 - Child exit leaves the workbench open, marks `[editor exited]`, and `F10`
   quits.
-- `--smoke` and `--smoke-nvim` run PTY + vt100 without an interactive terminal.
+- `--smoke`, `--smoke-nvim`, and `--smoke-utf8` run PTY + vt100 without an
+  interactive terminal. The UTF-8 smoke types Korean through `encode_key`,
+  saves with `:wq`, and asserts the file bytes.
 
 ## Run
 
@@ -37,13 +40,26 @@ cargo run --release --bin ccn-workbench -- --editor "<path-to-nvim>" file.cpp
 cargo run --release --bin ccn-workbench -- --smoke
 cargo run --release --bin ccn-workbench -- --smoke-nvim
 cargo run --release --bin ccn-workbench -- --editor "<path>" --smoke-nvim
+cargo run --release --bin ccn-workbench -- --smoke-utf8
+cargo run --release --bin ccn-workbench -- --editor "<path>" --smoke-utf8
 ```
 
 `--editor` defaults to `nvim`. A command with arguments must be quoted at the
 shell level; the spike understands double quotes inside it but performs no
 shell expansion. A directory argument is rejected with an explicit message
-(this spike opens one file). `--smoke-nvim` exits 0 with a `skip:` line when
-the editor is not found.
+(this spike opens one file). `--smoke-nvim` and `--smoke-utf8` exit 0 with a
+`skip:` line when the editor is not found.
+
+The UTF-8 smoke is the byte-path test, suitable for CI:
+
+```text
+# Windows
+cargo run --release --bin ccn-workbench -- --smoke-utf8 --editor "$env:TEMP\nvim-portable\nvim-win64\bin\nvim.exe"
+
+# WSL Ubuntu: build, then run under a PTY
+wsl -d Ubuntu -- bash -c 'export PATH=/home/jcpuk/.cargo/bin:/usr/local/bin:/usr/bin:/bin; cd /mnt/c/Users/user/source/CCN; CARGO_TARGET_DIR=/home/jcpuk/ccn-target cargo build --release --locked --bin ccn-workbench'
+wsl -d Ubuntu -- bash -c 'export PATH=/usr/local/bin:/usr/bin:/bin; script -qec "/home/jcpuk/ccn-target/release/ccn-workbench --smoke-utf8 --editor /home/jcpuk/tools/nvim-linux-x86_64/bin/nvim" /dev/null'
+```
 
 Gates:
 
@@ -102,6 +118,62 @@ Verified with Neovim 0.12.6 (portable) under a ConPTY-driven harness at
 - `--smoke` output: `smoke ok` (exit 0).
 - `--smoke-nvim` (portable Neovim path) printed the screen tail ending in
   `ccn_workbench_smoke.c   1,1   All` and then `smoke-nvim ok` (exit 0).
+- `--smoke-utf8` printed `smoke-utf8 ok` (exit 0): the Korean text typed via
+  `encode_key` survived ConPTY and was saved to the file.
+
+### Linux (WSL Ubuntu 26.04, Neovim 0.12.6)
+
+Run under `script` (a real PTY, no host terminal answering probes):
+
+```text
+$ script -qec ".../ccn-workbench --smoke-nvim --editor .../nvim" /dev/null
+--- nvim screen tail ---
+~
+...
+ccn_workbench_smoke.c                                         1,1            All
+smoke-nvim ok
+
+$ script -qec ".../ccn-workbench --smoke-utf8 --editor .../nvim" /dev/null
+smoke-utf8 ok
+```
+
+Before the query bridge, Neovim logged
+`E1568: Terminal did not respond to DSR request for 'background' color`.
+It is now gone. Neovim sends `OSC 11;?` + `CSI 5n` in two phases (the first
+after its DA1 probe); the bridge answers each occurrence, including the repeat,
+so the 100 ms synchronous DSR wait is satisfied.
+
+## Terminal query bridge
+
+The PTY reader also acts as the missing terminal emulator for capability
+probes. It scans the raw output stream for complete queries, keeps a bounded
+partial suffix so a query split across `read()` calls is still recognized, and
+writes the reply back to the PTY. Ordinary output is never modified.
+
+| Query | Reply |
+| --- | --- |
+| `OSC 11;?` (BEL or ST) | `OSC 11;rgb:1e1e/1e1e/1e1e` ST |
+| `OSC 10;?` (BEL or ST) | `OSC 10;rgb:ffff/ffff/ffff` ST |
+| `CSI 6n` | `CSI 1;1R` |
+| `CSI 5n` | `CSI 0n` |
+| `CSI c` | `CSI ?1;2c` (DA1) |
+| `CSI >c` | `CSI >0;276;0c` (DA2) |
+| `CSI ?<mode>$p` | `CSI ?<mode>;4$y` (DECRQM, generic) |
+| `CSI ?u` | `CSI ?0u` (kitty keyboard: unsupported) |
+
+The generic DECRQM reply covers the modes Neovim probes (`69`, `2004`, `2026`,
+`2027`, `2031`, `2048`); "permanently reset" is accurate because the bridge
+does not implement any of them. `CSI 14t` / `CSI 16t` (pixel size) are
+deliberately **not** answered: pixel dimensions are unknown, Neovim does not
+block on them, and a guessed `CSI 4;...t` would be worse than silence. DCS
+`XTGETTCAP` (`ESC P $ q ... ST`) and title-stack/window operations are also
+left alone.
+
+Duplicate replies are avoided by construction: the scanner consumes each query
+occurrence, so one probe produces exactly one reply even when it spans chunks.
+Later *repeated* probes are new occurrences and are answered again. Suppressing
+them as "already answered" is what reproduced `E1568` on Linux, because Neovim
+re-issues `OSC 11;?` + `CSI 5n` and waits for that second DSR response.
 
 Windows/ConPTY details worth keeping:
 
@@ -127,10 +199,13 @@ Windows/ConPTY details worth keeping:
 - **Wide/combining glyphs**: vt100 tracks double-width cells; box drawing and
   Hangul generally render, but glyphs whose width differs between the PTY and
   the host font can leave a stray cell.
-- **IME**: not verified. Windows commits composition as `Char` events and the
-  spike forwards UTF-8, so Hangul input should arrive, but the OS composition
-  preview window is outside the pane and may overlap it. Needs a manual test in
-  Windows Terminal.
+- **IME**: the *UTF-8 byte path* is verified on Windows ConPTY and Linux:
+  `--smoke-utf8` sends the Hangul string `U+D55C U+AE00` through `encode_key`, Neovim saves it, and the
+  file contains the bytes. This does **not** test OS IME composition: the
+  characters enter already composed, so the pinyin/Hangul candidate window,
+  composition preview, and key-event ordering on a real terminal are still
+  unverified. A human IME test in the target terminal (Windows Terminal and the
+  WSL terminal) is still required.
 - **Clipboard**: no bracketed-paste mode is enabled. `Ctrl+V` is forwarded as
   `0x16` (Neovim paste-from-register). Console-host paste (e.g. right-click)
   arrives as a stream of chars and works but is slow and has no single paste
@@ -158,5 +233,7 @@ Windows/ConPTY details worth keeping:
   arguments, and persist panel focus/width.
 - Re-evaluate cursor rendering with RPC (`nvim_ui_attach` gives mode info), and
   add bracketed paste / mouse if the editor stays PTY-based.
-- Linux: build and run the PTY, resize (SIGWINCH), and clean shutdown paths;
-  only Windows ConPTY was exercised here.
+- Linux: the PTY, terminal-query bridge, Neovim startup, UTF-8 byte path, and
+  `script`/alternate-screen paths are verified under WSL Ubuntu 26.04. Resize
+  (SIGWINCH) and interactive keyboard handling were not exercised there; the
+  full key loop was only driven on Windows.
