@@ -16,6 +16,7 @@
 
 const fs = require("fs");
 const https = require("https");
+const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
@@ -25,6 +26,28 @@ const DRY_RUN = process.argv.includes("--dry-run");
 const OTP_INDEX = process.argv.indexOf("--otp");
 const OTP =
   OTP_INDEX >= 0 && process.argv[OTP_INDEX + 1] ? process.argv[OTP_INDEX + 1] : process.env.NPM_OTP || "";
+
+// A hard-coded _authToken in the user's ~/.npmrc wins over NODE_AUTH_TOKEN, so
+// a stale OTP token quietly defeats vault/CI automation. When an automation
+// token is supplied, point npm at a dedicated temporary userconfig instead.
+function configureToken() {
+  const token = process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN || "";
+  if (!token) return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ccn-npm-"));
+  const file = path.join(dir, "npmrc");
+  fs.writeFileSync(file, "//registry.npmjs.org/:_authToken=" + token + "\n", { mode: 0o600 });
+  process.env.NPM_CONFIG_USERCONFIG = file;
+  const cleanup = () => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (_) {}
+  };
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(130);
+  });
+}
 
 const PLATFORMS = [
   { dir: "platforms/linux-x64", asset: "ccn-linux-x64", file: "ccn" },
@@ -111,6 +134,7 @@ async function verify() {
 
 async function main() {
   console.log("ccn npm publish " + VERSION + (DRY_RUN ? " (dry run)" : ""));
+  configureToken();
 
   if (!DRY_RUN) {
     const who = spawnSync("npm", ["whoami"], { stdio: "pipe", encoding: "utf8", shell: process.platform === "win32" });
