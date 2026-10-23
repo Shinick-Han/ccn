@@ -165,6 +165,11 @@ impl ReviewQueue {
         &self.reviewed
     }
 
+    /// Restore session-reviewed marks (path + identity keys).
+    pub fn apply_reviewed(&mut self, keys: impl IntoIterator<Item = String>) {
+        self.reviewed = keys.into_iter().collect();
+    }
+
     pub fn reviewed_count(&self) -> usize {
         self.changes
             .iter()

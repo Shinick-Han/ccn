@@ -68,9 +68,14 @@ implementation; the public entry point is `ccn workbench` (single file) and
 - The header shows the selected function's breadcrumb
   (`namespace > class > function(params)`), derived from the stable identity.
   The embedded editor remains the only place that performs edits.
+- The editor pane is a real Neovim process in a PTY, not a reimplementation:
+  modes, motions/operators, undo, `:` commands, registers and the user's vimrc
+  apply. ccn adds `-c "set number"` after the vimrc so line numbers are on by
+  default; `:set nonumber` still works. Mouse clicks are not forwarded into the
+  editor, and some modifier+arrow sequences use the plain xterm form.
 - Session state (split ratio, dashboard sort/filter/selection/tab, open and
-  active buffers) is stored in the OS cache sidecar, never in the scanned tree.
-  Restored tabs are lazy: the first switch issues `:edit`.
+  active buffers, reviewed findings) is stored in the OS cache sidecar, never in
+  the scanned tree. Restored tabs are lazy: the first switch issues `:edit`.
 - Window resize calls `MasterPty::resize` and `vt100::Parser::set_size`.
 - Child exit leaves the workbench open, marks `[editor exited]`, stops the RPC
   worker, and `F10` quits.

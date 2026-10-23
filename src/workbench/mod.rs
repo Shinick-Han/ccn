@@ -916,6 +916,14 @@ fn display_path(path: &Path) -> String {
 }
 
 /// Path string without the Windows verbatim prefix, for the child and UI.
+/// ccn defaults applied after the user's vimrc. Line numbers are requested by
+/// default; the user can still turn them off with `:set nonumber`.
+fn apply_editor_defaults(program: &str, args: &mut Vec<String>) {
+    if rpc::is_nvim_program(program) {
+        args.push("-c".to_string());
+        args.push("set number".to_string());
+    }
+}
 fn native_path(path: &Path) -> String {
     let text = path.display().to_string();
     text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
@@ -1022,6 +1030,7 @@ impl WorkbenchSession {
             editor_args.push("--listen".to_string());
             editor_args.push(address.clone());
         }
+        apply_editor_defaults(&program, &mut editor_args);
         editor_args.push(native_path(&target));
         let child = Pty::spawn(
             &program,
@@ -1292,6 +1301,7 @@ fn run_workbench(cli: &Cli) -> Result<(), String> {
         editor_args.push("--listen".to_string());
         editor_args.push(address.clone());
     }
+    apply_editor_defaults(&program, &mut editor_args);
     editor_args.push(native_path(&target));
     let mut child = match Pty::spawn(
         &program,

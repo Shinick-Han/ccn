@@ -59,6 +59,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
+#[cfg(feature = "workbench")]
+use std::collections::BTreeSet;
 
 use crate::ccn::types::{CcnSummary, CcnTier, FunctionCcn};
 use crate::metrics::{penalty, Report};
@@ -213,6 +215,7 @@ fn save_workspace(
     split_ratio: u16,
     state: &Option<DashboardState>,
     session: Option<&crate::workbench::WorkbenchSession>,
+    reviewed: &BTreeSet<String>,
 ) {
     let mut saved = crate::session::Session {
         split_ratio,
@@ -225,6 +228,7 @@ fn save_workspace(
         saved.filter = state.filter.clone();
         saved.left_tab = state.left_tab.persisted().to_string();
     }
+    saved.reviewed = reviewed.iter().cloned().collect();
     if let Some(session) = session {
         for path in session.tabs().paths() {
             if let Some(relative) = relative_to_root(root, &path) {
@@ -352,6 +356,8 @@ pub fn run_unified(
     let saved = crate::session::load(&result.root);
     #[cfg(feature = "workbench")]
     let mut split_ratio: u16 = saved.split_ratio;
+    #[cfg(feature = "workbench")]
+    let mut reviewed_keys: BTreeSet<String> = saved.reviewed.iter().cloned().collect();
     #[cfg(feature = "workbench")]
     let mut fuzzy = FuzzyState::new();
     #[cfg(feature = "workbench")]
@@ -517,6 +523,7 @@ pub fn run_unified(
                         split_ratio,
                         &dashboard_state,
                         session.as_ref(),
+                        &reviewed_keys,
                     );
                     if let Some(session) = session.take() {
                         session.close();
@@ -743,10 +750,15 @@ pub fn run_unified(
                                                                 } else {
                                                                     None
                                                                 };
-                                                                review = Some(ReviewQueue::new(
-                                                                    &base.changes,
-                                                                    filter,
-                                                                ));
+                                                                let mut queue =
+                                                                    ReviewQueue::new(
+                                                                        &base.changes,
+                                                                        filter,
+                                                                    );
+                                                                queue.apply_reviewed(
+                                                                    reviewed_keys.iter().cloned(),
+                                                                );
+                                                                review = Some(queue);
                                                                 diagnostics = None;
                                                                 fuzzy.close();
                                                             } else {
@@ -1011,6 +1023,7 @@ pub fn run_unified(
                                             KeyCode::Char('u') => queue.set_kind_filter(None),
                                             KeyCode::Char('x') | KeyCode::Char(' ') => {
                                                 queue.toggle_selected_reviewed();
+                                                reviewed_keys = queue.reviewed_keys().clone();
                                             }
                                             KeyCode::Char('f') => {
                                                 if let Some(base) = report.baseline.as_ref() {
@@ -1026,6 +1039,9 @@ pub fn run_unified(
                                                     };
                                                     *queue =
                                                         ReviewQueue::new(&base.changes, filter);
+                                                    queue.apply_reviewed(
+                                                        reviewed_keys.iter().cloned(),
+                                                    );
                                                 }
                                             }
                                             KeyCode::Char('d') => {
@@ -1081,7 +1097,9 @@ pub fn run_unified(
                                             } else {
                                                 None
                                             };
-                                            review = Some(ReviewQueue::new(&base.changes, filter));
+                                            let mut queue = ReviewQueue::new(&base.changes, filter);
+                                            queue.apply_reviewed(reviewed_keys.iter().cloned());
+                                            review = Some(queue);
                                         }
                                         continue;
                                     }
@@ -1228,6 +1246,7 @@ pub fn run_unified(
                         split_ratio,
                         &dashboard_state,
                         session.as_ref(),
+                        &reviewed_keys,
                     );
                     if session.as_ref().is_some_and(|s| s.tabs().is_empty()) {
                         if let Some(empty) = session.take() {

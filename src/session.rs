@@ -49,6 +49,9 @@ pub struct Session {
     pub open_files: Vec<String>,
     pub active_file: Option<String>,
     pub tree_expanded: Vec<String>,
+    /// Session-only reviewed review keys (`path\0identity`).
+    #[serde(default)]
+    pub reviewed: Vec<String>,
 }
 
 impl Default for Session {
@@ -64,6 +67,7 @@ impl Default for Session {
             open_files: Vec::new(),
             active_file: None,
             tree_expanded: Vec::new(),
+            reviewed: Vec::new(),
         }
     }
 }

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.19.0 (2026-10-22)
+
+Editor and review polish.
+
+- The embedded Neovim starts with **line numbers on** (`-c "set number"` after
+  the user's vimrc; `:set nonumber` still works).
+- Reviewed marks now persist in the session and are restored with the review
+  panel, not just for the current process.
+- The editor is a real Neovim PTY, not a reimplementation: modes, `i/a/o`,
+  motions, operators, undo, `:` commands, registers and the user's vimrc all
+  behave as in Neovim. Mouse clicks in the editor and some modified keys remain
+  forwarded limitations.
+- 643 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; WSL+tmux
+  verified line numbers.
+
 ## 0.18.0 (2026-10-22)
 
 Review polish.
