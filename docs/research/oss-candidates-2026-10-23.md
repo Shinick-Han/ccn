@@ -92,6 +92,27 @@ Build a **thin CCN plugin for TTT** before forking anything:
 This avoids a multi-month Go/Zig rewrite before validating that TTT's shell is
 the right product surface.
 
+## Spike result: TTT plugin works
+
+A first-party spike now lives at [`integrations/ttt-ccn`](../../integrations/ttt-ccn/README.md).
+It adds a right drawer showing the active file's CCN maximum, function count,
+`>10` count and a clickable function list, with a status item and refresh on
+open/save.
+
+Native Windows smoke test (TTT v1.9.0, C fixture) rendered:
+
+```text
+CCN · main.c
+max CCN 4 · 3 functions · 0 over 10
+process  L3  4
+simple   L12 1
+main     L14 1
+```
+
+This validates the composition path: TTT provides the IDE shell and drawer,
+while ccn remains the Rust analysis engine. It does not yet cover full-repo
+review or P4.
+
 ## Not selected
 
 - **Helix**: excellent editor, but no IDE shell/right inspector; fork cost too
