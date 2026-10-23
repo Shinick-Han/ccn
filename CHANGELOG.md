@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.28.1 (2026-10-23)
+
+Fix npm packaging: download the release binaries for the published version before packing. 0.28.0 npm packages contained 0.27 binaries; use 0.28.1.
+
 ## 0.28.0 (2026-10-23)
 
 Agent-oriented complexity brief.
