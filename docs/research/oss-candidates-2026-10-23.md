@@ -94,7 +94,7 @@ the right product surface.
 
 ## Spike result: TTT plugin works
 
-A first-party spike now lives at [`integrations/ttt-ccn`](../../integrations/ttt-ccn/README.md).
+A first-party spike now lives at [`ttt-ccn`](https://github.com/Shinick-Han/ttt-ccn).
 It adds a right drawer showing the active file's CCN maximum, function count,
 `>10` count and a clickable function list, with a status item and refresh on
 open/save.

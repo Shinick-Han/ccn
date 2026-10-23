@@ -90,6 +90,14 @@ mtime-based sidebar. See [`docs/workbench-spike.md`](docs/workbench-spike.md)
 for the compatibility matrix, keys, and limitations. The workbench is
 experimental; the scanner behavior is unchanged.
 
+### TTT integration (`ttt-ccn`)
+
+For TTT users there is a separate MIT plugin that adds a right-side CCN
+inspector: [Shinick-Han/ttt-ccn](https://github.com/Shinick-Han/ttt-ccn).
+TTT remains the editor, LSP, Git and terminal shell; ccn supplies the
+complexity data. Install it from the TTT Plugins panel or with
+**Plugins: Install from URL**.
+
 ### Editor integration (`ccn lsp`)
 
 `ccn lsp` runs the same binary as a **stdio Language Server Protocol server** —
