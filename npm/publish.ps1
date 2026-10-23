@@ -15,7 +15,8 @@
 
 param(
     [string]$Otp = "",
-    [switch]$Check
+    [switch]$Check,
+    [switch]$SkipPrepare
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +25,13 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($Check) {
     node (Join-Path $root 'verify-release.js')
     exit $LASTEXITCODE
+}
+
+# Always replace the vendor binaries with the assets for this version. A stale
+# vendor/ccn.exe is otherwise packed under the new version number.
+if (-not $SkipPrepare) {
+    node (Join-Path $root 'prepare.js')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 $args = @((Join-Path $root 'publish.js'))

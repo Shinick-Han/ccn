@@ -47,8 +47,7 @@ $ npm config set //registry.npmjs.org/:_authToken <token>
 Then release locally:
 
 ```powershell
-node npm\prepare.js          # download v<version> assets
-pwsh -File npm\publish.ps1  # publish missing packages (idempotent)
+pwsh -File npm\publish.ps1  # downloads v<version> assets, then publishes (idempotent)
 pwsh -File npm\publish.ps1 -Check
 ```
 
