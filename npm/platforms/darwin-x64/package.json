@@ -1,6 +1,6 @@
 {
   "name": "@shinick/ccn-darwin-x64",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "description": "ccn binary for macOS Intel",
   "license": "MIT",
   "homepage": "https://github.com/Shinick-Han/ccn",

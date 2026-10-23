@@ -5,7 +5,7 @@ ratatui pane next to ccn's per-file complexity sidebar.
 
 Status: **Workbench v1.1: PTY editor + live RPC verified on Windows, WSL
 Ubuntu 26.04 (Neovim 0.12.6) and AlmaLinux 8 (EPEL Neovim 0.8, CI).**
-The unified dashboard now has a directory tree, `Ctrl+P` fuzzy open,
+The unified shell now has one Files/Functions rail, `F5` command/search,
 multi-buffer tabs in one Neovim, and session restore. `src/workbench/` is the
 implementation; the public entry point is `ccn workbench` (single file) and
 `ccn . --tui` (dashboard + split).
@@ -34,25 +34,29 @@ implementation; the public entry point is `ccn workbench` (single file) and
   `DiagnosticWarn` above 10 and `DiagnosticError` above 20.
 - Sidebar `Enter`/`o` jumps Neovim's cursor to the selected function and runs
   `normal! zz`, then focuses the editor.
-- Focus model: editor by default. `F9` toggles sidebar; `j/k`, `g/G` move,
-  `r` rescans, `F9`/`Esc` returns. While the editor is focused, every key
-  except `F9`/`F10` and the tab keys goes to Neovim.
+- Focus model: editor by default. `F9` focuses the Functions tab; `j/k`, `g/G`
+  move, `Enter` jumps, `r` rescans, `Esc` returns. While the editor is focused,
+  only ccn's function keys and Alt shortcuts are intercepted; every other key
+  goes to Neovim (`Ctrl+P` included).
 - `ccn . --tui` enters the editor-first split view: it restores the last active
   tab or opens the first measured file. F10 shows the dashboard;
   `--tui --dashboard` preserves the old dashboard-first entry point.
-- Split navigation: the left pane is a collapsible directory tree (`j/k`,
-  `g/G`, `Enter`/Space toggles a directory, `e`/`Enter` opens a file). `F8`
-  switches tree/editor focus; `[`/`]` or dragging the divider changes the
-  split ratio (20-70%, minimum pane widths). Tree rows show Git/P4 change
-  markers; `c` toggles changed-files-only. `Alt+Z` hides the tree and function
-  sidebar, giving the editor the full terminal; press it again (or F8/F9/Alt+W)
-  to restore the split. Alt+Z does not restart the editor session.
+- The unified shell is one editor, one `Files | Functions` rail and one status
+  line. At 100+ columns the rail is pinned to 28 columns; below that it floats
+  over the editor on demand so the code keeps the full width. `F8` toggles the
+  rail, `Tab` switches Files/Functions while focused, `F9` focuses Functions,
+  `Alt+W` switches focus, and `Alt+Z` is fullscreen. `j/k`, `g/G`, `Enter` and
+  mouse clicks work in both tabs. Tree rows show Git/P4 markers; `c` filters
+  changed files. Expanded directories are persisted.
+- `F5` is the single command/search palette (open file, workspace text,
+  functions, Explain CCN, review, diagnostics, fullscreen). `Ctrl+P` is left to
+  Neovim. `F6` and `F7` stay direct shortcuts.
 - `Alt+E` opens the Explain CCN view for the selected function: a heuristic
   decision breakdown (if/for/while/case/catch/&&/||/?) with the top decision
   lines. The tree-sitter CCN remains authoritative.
-- Expanded tree directories are persisted in the session.
-- `Ctrl+P` fuzzy file picker ranks measured source paths with a dependency-free
-  subsequence scorer and opens the selected file as a tab.
+- `F5` -> Open file ranks measured source paths with a dependency-free
+  subsequence scorer and opens the selected file as a tab. `Ctrl+P` is not
+  intercepted and goes to Neovim.
 - Multi-buffer tabs use one Neovim process: a new file is opened with a Lua
   `:edit` RPC (modified buffers are hidden, not discarded), and `F2`/`F3`
   switch, `F4` closes a clean buffer (`:bdelete`), dirty buffers must be saved.
@@ -71,11 +75,10 @@ implementation; the public entry point is `ccn workbench` (single file) and
   hunk position.
 - The dashboard header shows the git branch when available (Perforce shows the
   backend label without blocking startup on network commands).
-- `Alt+O` opens the current-file symbol palette; fuzzy-match a function and
-  Enter jumps to it. `Alt+F` searches workspace text and opens the selected
-  `path:line` in a tab. The function sidebar is display-only for navigation:
-  click a function row to jump, or use Alt+O. `F9` remains an advanced focus
-  alias for compatibility.
+- `F5` is the primary entry for Functions, workspace text and Explain CCN;
+  `Alt+O`/`Alt+F`/`Alt+E` remain as compatibility shortcuts. The Functions tab
+  in the rail is display-only for navigation: click a row or press Enter to
+  jump. `F9` focuses that tab.
 - `.ccn.toml` can set `editor`, `baseline`, and `keymap`; CLI flags win. See
   [`docs/config.md`](config.md).
 - The header shows the selected function's breadcrumb
@@ -86,7 +89,7 @@ implementation; the public entry point is `ccn workbench` (single file) and
   apply. ccn adds `-c "set number"` after the vimrc so line numbers are on by
   default; `:set nonumber` still works. Mouse clicks are not forwarded into the
   editor, and some modifier+arrow sequences use the plain xterm form.
-- Session state (split ratio, dashboard sort/filter/selection/tab, open and
+- Session state (dashboard sort/filter/selection/tab, tree expansion, open and
   active buffers, reviewed findings) is stored in the OS cache sidecar, never in
   the scanned tree. Restored tabs are lazy: the first switch issues `:edit`.
 - Window resize calls `MasterPty::resize` and `vt100::Parser::set_size`.

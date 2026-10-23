@@ -21,13 +21,44 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-/// Panel title: `Diff · <title>`, or just `Diff` when there is no title.
-fn title_text(title: &str) -> String {
-    if title.trim().is_empty() {
-        " Diff ".to_string()
-    } else {
-        format!(" Diff \u{b7} {} ", title.trim())
+/// Suffix that keeps the exit key visible in every overlay title.
+const ESC_HINT: &str = " \u{b7} Esc close ";
+
+/// Leading marker for the selected row; readable without colour.
+const SELECT_GUTTER: &str = "\u{258c} ";
+
+/// Same width as [`SELECT_GUTTER`], so rows do not shift when selection moves.
+const BLANK_GUTTER: &str = "  ";
+
+/// Append the `Esc close` hint, truncating the head instead of the hint.
+fn with_esc_hint(head: String, width: u16) -> String {
+    let budget = usize::from(width.saturating_sub(2));
+    if budget == 0 {
+        return String::new();
     }
+    let hint_len = ESC_HINT.chars().count();
+    if head.chars().count() + hint_len <= budget {
+        return format!("{head}{ESC_HINT}");
+    }
+    if budget > hint_len + 3 {
+        let keep = budget - hint_len;
+        let head = truncate_chars(&head, u16::try_from(keep).unwrap_or(u16::MAX));
+        return format!("{head}{ESC_HINT}");
+    }
+    truncate_chars(
+        &format!("{head}{ESC_HINT}"),
+        u16::try_from(budget).unwrap_or(u16::MAX),
+    )
+}
+
+/// Panel title: `Diff · <title> · <context> · Esc close`.
+fn title_text(title: &str, context: &str, width: u16) -> String {
+    let head = if title.trim().is_empty() {
+        format!(" Diff \u{b7} {context}")
+    } else {
+        format!(" Diff \u{b7} {} \u{b7} {context}", title.trim())
+    };
+    with_esc_hint(head, width)
 }
 
 /// Counts of each kind in `rows`.
@@ -195,12 +226,29 @@ fn row_line_with(
     };
     let muted = Style::default().fg(palette().muted).bg(bg);
     let width_chars = usize::from(width);
+    let select_gutter = if selected {
+        SELECT_GUTTER
+    } else {
+        BLANK_GUTTER
+    };
+    let select_style = if selected {
+        Style::default()
+            .fg(palette().accent)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        muted
+    };
 
-    // Two number columns, two separators, the marker and its trailing space.
-    let gutter = num_width.saturating_mul(2).saturating_add(4);
+    // Selection gutter, two number columns, two separators, the marker and a
+    // trailing space.
+    let gutter = 2 + num_width.saturating_mul(2).saturating_add(4);
     if width_chars <= gutter {
         return Line::from(Span::styled(
-            truncate_chars(&format_row(row, num_width), width),
+            truncate_chars(
+                &format!("{select_gutter}{}", format_row(row, num_width)),
+                width,
+            ),
             kind_style,
         ));
     }
@@ -214,6 +262,7 @@ fn row_line_with(
     );
 
     let mut spans = vec![
+        Span::styled(select_gutter, select_style),
         Span::styled(
             format!("{old:>num_width$}"),
             Style::default().fg(palette().muted).bg(bg),
@@ -241,9 +290,9 @@ fn row_line_with(
     Line::from(spans)
 }
 
-/// Two-line empty state.
-fn empty_lines() -> [&'static str; 2] {
-    ["No diff rows", "baseline and current are identical"]
+/// One-line empty state that names the next action and the exit key.
+fn empty_line() -> &'static str {
+    "No diff rows \u{b7} baseline and current match \u{b7} Esc close"
 }
 
 /// Render the diff panel inside `area`.
@@ -275,6 +324,7 @@ pub(crate) fn render_with_hunks(
     hunk: Option<Hunk>,
 ) {
     let active_hunk = resolve_hunk(rows, hunk);
+    let context = summary_line_with_hunk(rows, selected, active_hunk);
     let border = if focused {
         palette().border_focus
     } else {
@@ -285,7 +335,7 @@ pub(crate) fn render_with_hunks(
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(palette().card))
         .title(Span::styled(
-            title_text(title),
+            title_text(title, &context, area.width),
             Style::default()
                 .fg(if focused {
                     palette().accent
@@ -301,52 +351,12 @@ pub(crate) fn render_with_hunks(
         return;
     }
 
-    // Row 0 is always the subtitle; the list gets what remains.
-    let subtitle = truncate_chars(
-        &summary_line_with_hunk(rows, selected, active_hunk),
-        inner.width,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            subtitle,
-            Style::default().fg(palette().muted).bg(palette().card),
-        ))),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
-
-    let list_area = Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(1),
-        width: inner.width,
-        height: inner.height.saturating_sub(1),
-    };
-    if list_area.height == 0 {
-        return;
-    }
-
     if rows.is_empty() {
-        let lines: Vec<Line> = empty_lines()
-            .iter()
-            .map(|text| {
-                Line::from(Span::styled(
-                    truncate_chars(text, list_area.width),
-                    Style::default().fg(palette().muted).bg(palette().card),
-                ))
-            })
-            .collect();
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(palette().card)),
-            list_area,
-        );
+        render_empty_state(frame, inner);
         return;
     }
 
-    let visible = usize::from(list_area.height).max(1);
+    let visible = usize::from(inner.height).max(1);
     let selected = selected.min(rows.len() - 1);
     let start = if selected >= visible {
         selected + 1 - visible
@@ -363,18 +373,12 @@ pub(crate) fn render_with_hunks(
             let index = start + offset;
             let selected = index == selected;
             let in_hunk = active_hunk.is_some_and(|hunk| hunk.contains(index));
-            row_line_with(
-                row,
-                num_width,
-                list_area.width,
-                selected,
-                in_hunk && !selected,
-            )
+            row_line_with(row, num_width, inner.width, selected, in_hunk && !selected)
         })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(palette().card)),
-        list_area,
+        inner,
     );
 }
 
@@ -494,7 +498,7 @@ impl Side {
 
 /// Narrowest list area that still renders two usable columns. Below this the
 /// renderer falls back to a truncated unified row.
-const MIN_SIDE_BY_SIDE_WIDTH: u16 = 5;
+const MIN_SIDE_BY_SIDE_WIDTH: u16 = 9;
 
 /// Width of one side's line-number column, at least one digit.
 fn side_number_width(rows: &[DiffLine], side: Side) -> usize {
@@ -618,7 +622,28 @@ fn pair_line(
     bg: Color,
     selected: bool,
 ) -> Line<'static> {
-    let mut spans = side_cell(left, Side::Old, left_num_width, left_width, bg, selected);
+    let select_gutter = if selected {
+        SELECT_GUTTER
+    } else {
+        BLANK_GUTTER
+    };
+    let select_style = if selected {
+        Style::default()
+            .fg(palette().accent)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette().muted).bg(bg)
+    };
+    let mut spans = vec![Span::styled(select_gutter, select_style)];
+    spans.extend(side_cell(
+        left,
+        Side::Old,
+        left_num_width,
+        left_width,
+        bg,
+        selected,
+    ));
     let divider_style = if selected {
         Style::default().fg(palette().muted).bg(bg)
     } else {
@@ -677,18 +702,18 @@ fn render_unified_fallback(
 
 /// Render the empty-diff state inside the list area.
 fn render_empty_state(frame: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = empty_lines()
-        .iter()
-        .map(|text| {
-            Line::from(Span::styled(
-                truncate_chars(text, area.width),
-                Style::default().fg(palette().muted).bg(palette().card),
-            ))
-        })
-        .collect();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(palette().card)),
-        area,
+        Paragraph::new(Line::from(Span::styled(
+            truncate_chars(empty_line(), area.width),
+            Style::default().fg(palette().muted).bg(palette().card),
+        )))
+        .style(Style::default().bg(palette().card)),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height.min(1),
+        },
     );
 }
 
@@ -715,6 +740,7 @@ pub(crate) fn render_side_by_side(
     hunk: Option<Hunk>,
 ) {
     let active_hunk = resolve_hunk(rows, hunk);
+    let context = side_summary_line(rows, active_hunk);
     let border = if focused {
         palette().border_focus
     } else {
@@ -725,7 +751,7 @@ pub(crate) fn render_side_by_side(
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(palette().card))
         .title(Span::styled(
-            title_text(title),
+            title_text(title, &context, area.width),
             Style::default()
                 .fg(if focused {
                     palette().accent
@@ -741,30 +767,7 @@ pub(crate) fn render_side_by_side(
         return;
     }
 
-    // Row 0 is always the subtitle; the columns get what remains.
-    let subtitle = truncate_chars(&side_summary_line(rows, active_hunk), inner.width);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            subtitle,
-            Style::default().fg(palette().muted).bg(palette().card),
-        ))),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
-
-    let list_area = Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(1),
-        width: inner.width,
-        height: inner.height.saturating_sub(1),
-    };
-    if list_area.height == 0 {
-        return;
-    }
+    let list_area = inner;
 
     if rows.is_empty() {
         render_empty_state(frame, list_area);
@@ -795,6 +798,9 @@ pub(crate) fn render_side_by_side(
     let divider_width = 1u16;
     let left_width = (list_area.width - divider_width) / 2;
     let right_width = list_area.width - divider_width - left_width;
+    // The selection gutter is rendered before the left cell, so the left cell
+    // gets the remaining columns.
+    let left_cell_width = left_width.saturating_sub(2);
 
     let lines: Vec<Line> = pairs[start..end]
         .iter()
@@ -808,7 +814,7 @@ pub(crate) fn render_side_by_side(
                 pair.right.map(|index| &rows[index]),
                 left_num_width,
                 right_num_width,
-                left_width,
+                left_cell_width,
                 right_width,
                 divider_width,
                 bg,
@@ -875,13 +881,25 @@ mod tests {
 
     #[test]
     fn title_and_summary_carry_counts_and_position() {
-        assert_eq!(title_text("main.rs"), " Diff \u{b7} main.rs ");
-        assert_eq!(title_text(""), " Diff ");
-        assert_eq!(title_text("   "), " Diff ");
+        assert_eq!(
+            title_text("main.rs", "ctx", 50),
+            " Diff \u{b7} main.rs \u{b7} ctx \u{b7} Esc close "
+        );
+        assert_eq!(
+            title_text("", "ctx", 50),
+            " Diff \u{b7} ctx \u{b7} Esc close "
+        );
+        assert_eq!(
+            title_text("   ", "ctx", 50),
+            " Diff \u{b7} ctx \u{b7} Esc close "
+        );
         assert_eq!(summary_line(&sample(), 2), "+1 -1 2 context \u{b7} 3/4");
         assert_eq!(summary_line(&[], 0), "+0 -0 0 context \u{b7} 0/0");
         // Out-of-range selections clamp instead of showing a bogus position.
         assert_eq!(summary_line(&sample(), 99), "+1 -1 2 context \u{b7} 4/4");
+        // A narrow title keeps the exit hint and drops the context instead.
+        let narrow = title_text("main.rs", "a very long context that cannot fit", 30);
+        assert!(narrow.contains("Esc close"), "{narrow}");
     }
 
     #[test]
@@ -943,9 +961,10 @@ mod tests {
         assert!(text.contains("Diff"), "{text}");
         assert!(text.contains("+0 -0 0 context"), "{text}");
         assert!(text.contains("No diff rows"), "{text}");
-        assert!(
-            text.contains("baseline and current are identical"),
-            "{text}"
+        assert!(text.contains("Esc close"), "{text}");
+        assert_eq!(
+            empty_line(),
+            "No diff rows \u{b7} baseline and current match \u{b7} Esc close"
         );
     }
 
@@ -972,6 +991,34 @@ mod tests {
             }
         }
         assert!(found_pill, "selected row should use the pill background");
+    }
+
+    #[test]
+    fn selected_row_has_a_leading_marker_not_just_colour() {
+        let rows = sample();
+        let mut terminal = Terminal::new(TestBackend::new(50, 7)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), &rows, 1, false, "main.rs");
+            })
+            .unwrap();
+        let text = screen(&terminal);
+        let selected = text
+            .lines()
+            .find(|line| line.contains("old_call();"))
+            .unwrap_or_else(|| panic!("selected row missing: {text}"));
+        assert!(
+            selected.contains('\u{258c}'),
+            "selected row needs a visible marker: {selected:?}"
+        );
+        let other = text
+            .lines()
+            .find(|line| line.contains("new_call();"))
+            .unwrap_or_else(|| panic!("unselected row missing: {text}"));
+        assert!(
+            !other.contains('\u{258c}'),
+            "unselected rows must not carry the marker: {other:?}"
+        );
     }
 
     #[test]
@@ -1044,7 +1091,7 @@ mod tests {
     #[test]
     fn hunk_subtitle_and_highlight_render() {
         let rows = sample();
-        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 8)).unwrap();
         terminal
             .draw(|frame| {
                 render_with_hunks(
@@ -1065,7 +1112,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let mut found = false;
         for y in 0..8 {
-            for x in 0..60 {
+            for x in 0..90 {
                 if buffer[(x, y)].bg == palette().canvas {
                     found = true;
                 }
@@ -1319,6 +1366,20 @@ mod tests {
         assert!(
             found_pill,
             "selected visual row should use the pill background"
+        );
+    }
+
+    #[test]
+    fn side_by_side_selected_row_has_a_leading_marker() {
+        let terminal = draw_side(60, 6, &sample(), 1, None);
+        let text = screen(&terminal);
+        let selected = text
+            .lines()
+            .find(|line| line.contains("old_call();"))
+            .unwrap_or_else(|| panic!("selected row missing: {text}"));
+        assert!(
+            selected.contains('\u{258c}'),
+            "selected visual row needs a visible marker: {selected:?}"
         );
     }
 

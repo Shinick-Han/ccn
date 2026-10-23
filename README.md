@@ -47,10 +47,10 @@ the repo has history. No CDN, no chart library, no telemetry — ~27 KB.
 
 `--tui` opens the editor first (restoring the last active tab when available).
 `F10` opens the dashboard at any time; `--tui --dashboard` starts there
-instead. Dashboard keys: `j/k` move, `/` filter, `e` edit, `Ctrl+P` open,
-`?` help, `q` quit. The left column shows the CCN/LOC histogram, a live
-preview of the selected file, and a repo pulse (parse confidence, threshold
-counts, baseline). On a non-TTY it falls back to the summary.
+instead. Dashboard keys: `j/k` move, `/` filter, `e` edit, `?` help, `q` quit.
+The file table is the primary surface; histogram, selected-file preview and
+repo pulse sit to its right and fold first on narrow terminals. On a non-TTY
+it falls back to the summary.
 
 ### Experimental: embedded workbench (ccn workbench)
 
@@ -64,10 +64,26 @@ $ ccn workbench file.c --editor nvim
 $ ccn . --tui   # editor first; F10 shows the dashboard
 ```
 
-Requirements: `nvim` on `PATH` or `--editor <path>`. `--tui` opens the **split view** immediately on the last active tab (or the first measured file), so editing is the default entry point; F10 switches to the dashboard. In the dashboard, `e` opens the selected file in the same split view: a collapsible file tree on the left, Neovim and the live function sidebar on the right. Drag the divider with the mouse to resize the panes. The primary keys are deliberately few: `j/k` move, `/` filter, `e` edit, `Ctrl+P` open by name, `F5` command palette, `F6` baseline review (`d` opens the line diff, `s` side-by-side, `x` reviewed), `F7` diagnostics, `Alt+W` panes, `Alt+Z` editor fullscreen (hides the tree and function sidebar; press again to restore), `Alt+O` function search, `Alt+F` workspace search, `Alt+E` explain CCN, `F10` dashboard, `?` help, and `q` quit. The first `q`/`Esc`/`Ctrl+C` on a live editor asks for confirmation; press `q` or `Ctrl+C` again to discard. The nvim session, open buffers, split ratio, and dashboard selection are restored on the next run. Clipboard paste uses bracketed paste; mouse reporting is enabled only in the split (use Shift+drag for normal terminal selection/copy). In the split, click a file in the tree to open it and click either pane to focus it; the divider is draggable. Tree rows show Git/P4 change markers and `c` toggles changed-files-only. Use `Alt+O` (or click a function row) to jump to a function in the current file. The embedded editor is real Neovim; line numbers are enabled by default (`:set nonumber` to turn them off). The review panel needs a baseline run: `ccn . --tui --baseline <rev>`.
+Requirements: `nvim` on `PATH` or `--editor <path>`. `--tui` opens the editor
+immediately, restoring the last active tab or the first measured file. The shell
+is deliberately small: one editor, one `Files | Functions` rail, and one status
+line. At 80 columns the rail floats on demand and the editor keeps the full
+width; at 100+ columns it pins to 28 columns. `F8` toggles the rail, `F9`
+focuses Functions, `Alt+W` switches focus, `Alt+Z` is editor fullscreen and
+`F10` opens Overview. `F5` is the single command/search entry (open file,
+workspace text, functions, Explain CCN, review, diagnostics, fullscreen).
+`Ctrl+P` is deliberately left to Neovim. `F6` review and `F7` diagnostics
+stay direct. In Overview, `e` opens the selected file in the editor. The first
+`q`/`Esc`/`Ctrl+C` on a live editor asks for confirmation; press it again to
+discard. Sessions restore tab order, tree expansion and dashboard selection.
+Tree rows show Git/P4 markers; `c` toggles changed-files-only.
+The embedded editor is real Neovim with line numbers on by default. Review
+needs a baseline run: `ccn . --tui --baseline <rev>`.
 
-Advanced keys still work but are not shown in the footer: `F8`/`Ctrl+Shift+E` pane switch (compatibility), `F9` function sidebar, `F2`/`F3` previous/next tab, `F4` close tab, `[`/`]` resize from the file pane, `Tab` chart tab, `s`/`S` sort key/direction, `g`/`G` first/last. Set `CCN_KEYMAP=advanced` to show the advanced section in `?`. On AlmaLinux/RHEL 8 use
-the EPEL `neovim` (0.8 works; the official Neovim Linux tarball requires glibc
+Advanced keys remain available: `Alt+O`/`Alt+F`/`Alt+E` compatibility,
+`F2`/`F3` tabs, `F4` close tab, `s`/`S` dashboard sort, `1`/`2` dashboard
+chart, `g`/`G` first/last. Set `CCN_KEYMAP=advanced` to show them in `?`.
+On AlmaLinux/RHEL 8 use the EPEL `neovim` (0.8 works; the official Neovim Linux tarball requires glibc
 2.34 and cannot run on EL8). Use `--no-rpc` for PTY-only editing with the
 mtime-based sidebar. See [`docs/workbench-spike.md`](docs/workbench-spike.md)
 for the compatibility matrix, keys, and limitations. The workbench is

@@ -12,18 +12,57 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-/// Title shown in the panel border, including the E/W/I counts.
-fn title_text(diagnostics: &Diagnostics) -> String {
-    let (errors, warnings, infos) = diagnostics.counts();
-    format!(" Diagnostics \u{b7} {errors}E/{warnings}W/{infos}I ")
+/// Suffix that keeps the exit key visible in every overlay title.
+const ESC_HINT: &str = " \u{b7} Esc close ";
+
+/// Leading marker for the selected row; readable without colour.
+const SELECT_GUTTER: &str = "\u{258c} ";
+
+/// Same width as [`SELECT_GUTTER`], so rows do not shift when selection moves.
+const BLANK_GUTTER: &str = "  ";
+
+/// Append the `Esc close` hint, truncating the head instead of the hint.
+fn with_esc_hint(head: String, width: u16) -> String {
+    let budget = usize::from(width.saturating_sub(2));
+    if budget == 0 {
+        return String::new();
+    }
+    let hint_len = ESC_HINT.chars().count();
+    if head.chars().count() + hint_len <= budget {
+        return format!("{head}{ESC_HINT}");
+    }
+    if budget > hint_len + 3 {
+        let keep = budget - hint_len;
+        let head = truncate_chars(&head, u16::try_from(keep).unwrap_or(u16::MAX));
+        return format!("{head}{ESC_HINT}");
+    }
+    truncate_chars(
+        &format!("{head}{ESC_HINT}"),
+        u16::try_from(budget).unwrap_or(u16::MAX),
+    )
 }
 
-/// Severity marker, colour and letter.
-fn severity_marker(severity: Severity) -> (char, ratatui::style::Color) {
+/// Title line: `Diagnostics · <counts> · <shown/total> · Esc close`.
+fn title_text(diagnostics: &Diagnostics, filter: Filter, width: u16) -> String {
+    let (errors, warnings, infos) = diagnostics.counts();
+    let shown = diagnostics.filtered(filter).len();
+    let mut head = format!(
+        " Diagnostics \u{b7} {errors}E/{warnings}W/{infos}I \u{b7} {shown}/{}",
+        diagnostics.len()
+    );
+    if let Some(label) = filter_label(filter) {
+        head.push_str(&format!(" \u{b7} {label}"));
+    }
+    with_esc_hint(head, width)
+}
+
+/// Severity glyph, word and colour. The glyph and word carry the meaning even
+/// when colour is unavailable.
+fn severity_marker(severity: Severity) -> (&'static str, ratatui::style::Color) {
     match severity {
-        Severity::Error => ('E', palette().danger),
-        Severity::Warn => ('W', palette().warn),
-        Severity::Info => ('I', palette().accent),
+        Severity::Error => ("\u{2716} error   ", palette().danger),
+        Severity::Warn => ("\u{25b2} warning ", palette().warn),
+        Severity::Info => ("\u{2139} info    ", palette().accent),
     }
 }
 
@@ -55,20 +94,6 @@ fn filter_label(filter: Filter) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" + "))
 }
 
-/// Counts, visible/total, and the active filter when one is set.
-fn subtitle_text(diagnostics: &Diagnostics, filter: Filter) -> String {
-    let (errors, warnings, infos) = diagnostics.counts();
-    let shown = diagnostics.filtered(filter).len();
-    let mut text = format!(
-        "{errors}E/{warnings}W/{infos}I \u{b7} {shown}/{} shown",
-        diagnostics.len()
-    );
-    if let Some(label) = filter_label(filter) {
-        text.push_str(&format!(" \u{b7} filter: {label}"));
-    }
-    text
-}
-
 /// `path:line`, `path`, or empty when the finding is not about a file.
 fn location(item: &Diagnostic) -> String {
     match (&item.path, item.line) {
@@ -96,10 +121,11 @@ fn truncate_chars(text: &str, width: u16) -> String {
     out
 }
 
-/// Build one styled row: `[E] scan path:line message`.
+/// Build one styled row: `▌ ✖ error scan path:line message`.
 ///
-/// The marker keeps its severity colour at every width; the rest is truncated
-/// into whatever columns remain. The caller guarantees `width > 0`.
+/// The `▌` selection marker and the severity glyph/word stay readable at every
+/// width; the rest is truncated into whatever columns remain. The caller
+/// guarantees `width > 0`.
 fn row_line(item: &Diagnostic, width: u16, selected: bool) -> Line<'static> {
     let bg = if selected {
         palette().pill
@@ -115,36 +141,59 @@ fn row_line(item: &Diagnostic, width: u16, selected: bool) -> Line<'static> {
         Style::default().fg(palette().text).bg(bg)
     };
     let muted = Style::default().fg(palette().muted).bg(bg);
+    let select_gutter = if selected {
+        SELECT_GUTTER
+    } else {
+        BLANK_GUTTER
+    };
+    let select_style = if selected {
+        Style::default()
+            .fg(palette().accent)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        muted
+    };
 
-    let (letter, colour) = severity_marker(item.severity);
-    let mark = format!("[{letter}] ");
+    let (mark, colour) = severity_marker(item.severity);
     let mark_style = Style::default()
         .fg(colour)
         .bg(bg)
         .add_modifier(Modifier::BOLD);
 
+    let width_chars = usize::from(width);
+    let gutter_len = 2;
+    let mark_len = mark.chars().count();
+
     // A single truncated span is the only sane output below the marker width.
-    if width <= 4 {
+    if width_chars <= gutter_len + mark_len + 3 {
         return Line::from(Span::styled(
-            truncate_chars(&format!("{mark}{}", body_text(item)), width),
+            truncate_chars(&format!("{select_gutter}{mark}{}", body_text(item)), width),
             mark_style,
         ));
     }
 
-    let mut spans = vec![Span::styled(mark, mark_style)];
-    let remaining = width - 4;
+    let mut spans = vec![
+        Span::styled(select_gutter, select_style),
+        Span::styled(mark, mark_style),
+    ];
+    let remaining = width_chars - gutter_len - mark_len;
 
     // Below ~10 usable columns, drop the area column rather than the message.
     if remaining < 10 {
         spans.push(Span::styled(
-            truncate_chars(&body_text(item), remaining),
+            truncate_chars(
+                &body_text(item),
+                u16::try_from(remaining).unwrap_or(u16::MAX),
+            ),
             text_style,
         ));
         return finish_row(spans, width, selected);
     }
 
     let area = format!("{:<8} ", area_label(item.area));
-    spans.push(Span::styled(area.clone(), muted));
+    let area_len = area.chars().count();
+    spans.push(Span::styled(area, muted));
 
     let location = location(item);
     let message = if location.is_empty() {
@@ -152,9 +201,11 @@ fn row_line(item: &Diagnostic, width: u16, selected: bool) -> Line<'static> {
     } else {
         format!("{location} {}", item.message)
     };
-    let used = area.chars().count();
     spans.push(Span::styled(
-        truncate_chars(&message, remaining - used as u16),
+        truncate_chars(
+            &message,
+            u16::try_from(remaining.saturating_sub(area_len)).unwrap_or(u16::MAX),
+        ),
         text_style,
     ));
     finish_row(spans, width, selected)
@@ -185,14 +236,14 @@ fn finish_row(mut spans: Vec<Span<'static>>, width: u16, selected: bool) -> Line
     Line::from(spans)
 }
 
-/// Two-line empty state when there is nothing to show at all.
-fn empty_lines() -> [&'static str; 2] {
-    ["No diagnostics", "scan and baseline look clean"]
+/// One-line empty state when there is nothing to show at all.
+fn empty_line() -> &'static str {
+    "No diagnostics \u{b7} scan and baseline look clean \u{b7} Esc close"
 }
 
-/// Two-line empty state when diagnostics exist but the filter hides them.
-fn no_matches_lines() -> [&'static str; 2] {
-    ["No matches for filter", "adjust or clear the filter"]
+/// One-line empty state when diagnostics exist but the filter hides them.
+fn no_matches_line() -> &'static str {
+    "No matches \u{b7} clear the filter \u{b7} Esc close"
 }
 
 /// Render the diagnostics panel inside `area`.
@@ -237,7 +288,7 @@ pub(crate) fn render_filtered(
         .border_style(Style::default().fg(border))
         .style(Style::default().bg(palette().card))
         .title(Span::styled(
-            title_text(diagnostics),
+            title_text(diagnostics, filter, area.width),
             Style::default()
                 .fg(if focused {
                     palette().accent
@@ -253,70 +304,46 @@ pub(crate) fn render_filtered(
         return;
     }
 
-    // Row 0 is always the subtitle; the list gets what remains.
-    let subtitle = truncate_chars(&subtitle_text(diagnostics, filter), inner.width);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            subtitle,
-            Style::default().fg(palette().muted).bg(palette().card),
-        ))),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
-
-    let list_area = Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(1),
-        width: inner.width,
-        height: inner.height.saturating_sub(1),
-    };
-    if list_area.height == 0 {
+    let items = diagnostics.filtered(filter);
+    if diagnostics.is_empty() || items.is_empty() {
+        let text = if diagnostics.is_empty() {
+            empty_line()
+        } else {
+            no_matches_line()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_chars(text, inner.width),
+                Style::default().fg(palette().muted).bg(palette().card),
+            )))
+            .style(Style::default().bg(palette().card)),
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            },
+        );
         return;
     }
 
-    let items = diagnostics.filtered(filter);
-    let empty = if diagnostics.is_empty() {
-        empty_lines()
-    } else if items.is_empty() {
-        no_matches_lines()
+    let visible = usize::from(inner.height).max(1);
+    let selected = selected.min(items.len() - 1);
+    let start = if selected >= visible {
+        selected + 1 - visible
     } else {
-        let visible = usize::from(list_area.height).max(1);
-        let selected = selected.min(items.len() - 1);
-        let start = if selected >= visible {
-            selected + 1 - visible
-        } else {
-            0
-        };
-        let end = (start + visible).min(items.len());
-
-        let lines: Vec<Line> = items[start..end]
-            .iter()
-            .enumerate()
-            .map(|(offset, item)| row_line(item, list_area.width, start + offset == selected))
-            .collect();
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(palette().card)),
-            list_area,
-        );
-        return;
+        0
     };
+    let end = (start + visible).min(items.len());
 
-    let lines: Vec<Line> = empty
+    let lines: Vec<Line> = items[start..end]
         .iter()
-        .map(|text| {
-            Line::from(Span::styled(
-                truncate_chars(text, list_area.width),
-                Style::default().fg(palette().muted).bg(palette().card),
-            ))
-        })
+        .enumerate()
+        .map(|(offset, item)| row_line(item, inner.width, start + offset == selected))
         .collect();
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(palette().card)),
-        list_area,
+        inner,
     );
 }
 
@@ -409,7 +436,7 @@ mod tests {
     #[test]
     fn empty_state_is_rendered() {
         let diagnostics = Diagnostics::new();
-        let mut terminal = Terminal::new(TestBackend::new(36, 6)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(64, 6)).unwrap();
         terminal
             .draw(|frame| {
                 render(frame, frame.area(), &diagnostics, 0, false);
@@ -418,19 +445,28 @@ mod tests {
         let text = screen(&terminal);
 
         assert!(text.contains("No diagnostics"), "{text}");
-        assert!(text.contains("scan and baseline look clean"), "{text}");
         assert!(text.contains("0E/0W/0I"), "{text}");
+        assert_eq!(
+            empty_line(),
+            "No diagnostics \u{b7} scan and baseline look clean \u{b7} Esc close"
+        );
     }
 
     #[test]
     fn title_and_summary_carry_counts() {
         let diagnostics = sample();
-        assert_eq!(title_text(&diagnostics), " Diagnostics \u{b7} 1E/1W/1I ");
+        assert_eq!(
+            title_text(&diagnostics, Filter::default(), 80),
+            " Diagnostics \u{b7} 1E/1W/1I \u{b7} 3/3 \u{b7} Esc close "
+        );
         assert_eq!(diagnostics.summary(), "1 error(s), 1 warning(s), 1 info");
+        // A narrow title keeps the exit hint and drops the context instead.
+        let narrow = title_text(&diagnostics, Filter::default(), 26);
+        assert!(narrow.contains("Esc close"), "{narrow}");
     }
 
     #[test]
-    fn row_format_is_marker_area_location_message() {
+    fn row_format_is_gutter_glyph_word_area_location_message() {
         let diagnostics = sample();
         let item = &diagnostics.items()[0];
         let line = row_line(item, 60, false);
@@ -439,7 +475,12 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(text, "[E] scan     src/broken.rs:42 could not read Rust");
+        assert_eq!(
+            text,
+            "  \u{2716} error   scan     src/broken.rs:42 could not read Rust"
+        );
+        // Severity is carried by a glyph and a word, not colour alone.
+        assert!(text.contains("error"), "{text}");
     }
 
     #[test]
@@ -464,7 +505,7 @@ mod tests {
         let text = screen(&terminal);
 
         assert!(
-            text.contains("outside the vers"),
+            text.contains("outside"),
             "selected row should be scrolled into view: {text}"
         );
         let mut found_pill = false;
@@ -494,7 +535,7 @@ mod tests {
         })
         .unwrap();
         let all_text = screen(&all);
-        assert!(all_text.contains("3/3 shown"), "{all_text}");
+        assert!(all_text.contains("3/3"), "{all_text}");
         assert!(all_text.contains("src/big.rs"), "{all_text}");
         assert!(all_text.contains("outside the vers"), "{all_text}");
 
@@ -509,8 +550,11 @@ mod tests {
             })
             .unwrap();
         let filtered_text = screen(&filtered);
-        assert!(filtered_text.contains("1/3 shown"), "{filtered_text}");
-        assert!(filtered_text.contains("filter: error"), "{filtered_text}");
+        assert!(filtered_text.contains("1/3"), "{filtered_text}");
+        assert!(
+            filtered_text.contains("\u{b7} error \u{b7}"),
+            "{filtered_text}"
+        );
         assert!(filtered_text.contains("src/broken.rs"), "{filtered_text}");
         assert!(!filtered_text.contains("src/big.rs"), "{filtered_text}");
         assert!(
@@ -526,7 +570,7 @@ mod tests {
             severity: None,
             area: Some(Area::Scan),
         };
-        let mut terminal = Terminal::new(TestBackend::new(44, 4)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(70, 3)).unwrap();
         terminal
             .draw(|frame| {
                 // One list row: selecting the second filtered row scrolls to it.
@@ -536,13 +580,13 @@ mod tests {
         let text = screen(&terminal);
         let buffer = terminal.backend().buffer();
 
-        assert!(text.contains("2/3 shown"), "{text}");
-        assert!(text.contains("filter: scan"), "{text}");
+        assert!(text.contains("2/3"), "{text}");
+        assert!(text.contains("\u{b7} scan \u{b7}"), "{text}");
         assert!(text.contains("src/big.rs"), "{text}");
         assert!(!text.contains("src/broken.rs"), "{text}");
         let mut found_pill = false;
-        for y in 0..4 {
-            for x in 0..44 {
+        for y in 0..3 {
+            for x in 0..70 {
                 if buffer[(x, y)].bg == palette().pill {
                     found_pill = true;
                 }
@@ -558,7 +602,7 @@ mod tests {
             severity: Some(Severity::Info),
             area: Some(Area::Editor),
         };
-        let mut terminal = Terminal::new(TestBackend::new(48, 6)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
         terminal
             .draw(|frame| {
                 render_filtered(frame, frame.area(), &diagnostics, 0, false, filter);
@@ -566,11 +610,11 @@ mod tests {
             .unwrap();
         let text = screen(&terminal);
 
-        assert!(text.contains("No matches for filter"), "{text}");
-        assert!(text.contains("adjust or clear the filter"), "{text}");
+        assert!(text.contains("No matches"), "{text}");
+        assert!(text.contains("clear the filter"), "{text}");
         assert!(!text.contains("No diagnostics"), "{text}");
-        assert!(text.contains("0/3 shown"), "{text}");
-        assert!(text.contains("filter: info + editor"), "{text}");
+        assert!(text.contains("0/3"), "{text}");
+        assert!(text.contains("\u{b7} info + editor \u{b7}"), "{text}");
 
         // With no diagnostics at all the original empty copy still wins.
         let empty = Diagnostics::new();
@@ -582,9 +626,34 @@ mod tests {
             .unwrap();
         let clean_text = screen(&clean);
         assert!(clean_text.contains("No diagnostics"), "{clean_text}");
+        assert!(!clean_text.contains("No matches"), "{clean_text}");
+    }
+
+    #[test]
+    fn selected_row_has_a_leading_marker_not_just_colour() {
+        let diagnostics = sample();
+        let mut terminal = Terminal::new(TestBackend::new(64, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), &diagnostics, 1, false);
+            })
+            .unwrap();
+        let text = screen(&terminal);
+        let selected = text
+            .lines()
+            .find(|line| line.contains("src/big.rs"))
+            .unwrap_or_else(|| panic!("selected row missing: {text}"));
         assert!(
-            !clean_text.contains("No matches for filter"),
-            "{clean_text}"
+            selected.contains('\u{258c}'),
+            "selected row needs a visible marker: {selected:?}"
+        );
+        let other = text
+            .lines()
+            .find(|line| line.contains("src/broken.rs"))
+            .unwrap_or_else(|| panic!("unselected row missing: {text}"));
+        assert!(
+            !other.contains('\u{258c}'),
+            "unselected rows must not carry the marker: {other:?}"
         );
     }
 

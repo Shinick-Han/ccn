@@ -125,13 +125,18 @@ impl Focus {
 /// The part of a scan the sidebar needs, owned so the event loop never holds a
 /// `ScanResult` alive.
 pub(crate) struct FileView {
+    #[allow(dead_code)] // Overview/inspector owns the file summary now.
     pub name: String,
+    #[allow(dead_code)] // Overview/inspector owns the file summary now.
     pub lang: String,
     pub loc: usize,
+    #[allow(dead_code)] // Overview/inspector owns the file summary now.
     pub loc_total: usize,
     pub count: usize,
     pub max: u32,
+    #[allow(dead_code)] // Overview/inspector owns the distribution summary.
     pub p90: u32,
+    #[allow(dead_code)] // Overview/inspector owns the distribution summary.
     pub sum: u32,
     pub tier: Option<CcnTier>,
     pub file_ccn: Option<u32>,
@@ -188,15 +193,19 @@ pub(crate) struct LiveRow {
 
 /// Live RPC snapshot prepared for rendering.
 pub(crate) struct LiveView {
+    #[allow(dead_code)] // Overview/inspector owns the file summary now.
     pub name: String,
+    #[allow(dead_code)] // Overview/inspector owns the tier summary now.
     pub tier: CcnTier,
     pub functions: Vec<LiveRow>,
     /// Current buffer lines for the diff view (including unsaved edits).
     pub lines: Vec<String>,
+    #[allow(dead_code)] // Overview/inspector owns the distribution summary.
     pub sum: u32,
     pub max: u32,
     pub changedtick: i64,
     pub base_tick: i64,
+    #[allow(dead_code)] // Overview/inspector owns the timing summary.
     pub read_ms: f64,
 }
 
@@ -206,6 +215,7 @@ impl LiveView {
     }
 
     /// Sum of all positive changes, counting new functions from zero.
+    #[allow(dead_code)] // Kept for the Overview/inspector delta summary.
     pub(crate) fn positive_delta(&self) -> u32 {
         self.functions
             .iter()
@@ -219,6 +229,7 @@ impl LiveView {
 pub(crate) struct App {
     pub target: PathBuf,
     pub display: String,
+    #[allow(dead_code)] // The calm header no longer titles the editor pane.
     pub editor_label: String,
     pub view: Option<FileView>,
     pub scan_error: Option<String>,
@@ -293,7 +304,7 @@ impl App {
         app
     }
 
-    fn function_count(&self) -> usize {
+    pub(crate) fn function_count(&self) -> usize {
         if self.live_mode() {
             self.live.as_ref().map_or(0, |live| live.functions.len())
         } else {
@@ -305,6 +316,7 @@ impl App {
         self.rpc_status == RpcStatus::Live && self.live.is_some()
     }
 
+    #[allow(dead_code)] // Overview/inspector owns the verbose RPC label.
     pub(crate) fn rpc_label(&self) -> String {
         match self.rpc_status {
             RpcStatus::Connecting => "rpc connecting".to_string(),
@@ -321,6 +333,7 @@ impl App {
         self.live_mode() && self.live.as_ref().is_some_and(LiveView::unsaved)
     }
 
+    #[allow(dead_code)] // The header shows the live +/~ badge instead.
     pub(crate) fn delta_sum(&self) -> Option<u32> {
         self.live.as_ref().map(LiveView::positive_delta)
     }
@@ -1186,6 +1199,79 @@ impl WorkbenchSession {
                 .as_ref()
                 .map(|view| view.functions.clone())
                 .unwrap_or_default()
+        }
+    }
+
+    /// Render the dense function rail into an arbitrary area. Used by the
+    /// unified `tui` single left rail; the standalone sidebar calls the same
+    /// renderer through `ui::render_area`.
+    #[allow(dead_code)] // Wired by the unified `tui` single rail.
+    pub(crate) fn draw_functions_in(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        ui::render_functions_rail(frame, &self.app, area, focused);
+    }
+
+    /// Select a function by rail index, clamping to the available range. It
+    /// deliberately leaves scrolling to the renderer, which recomputes its
+    /// page-aligned offset from `selected` on every frame.
+    #[allow(dead_code)] // Wired by the unified `tui` single rail.
+    pub(crate) fn select_function(&mut self, index: usize) {
+        let count = self.app.function_count();
+        self.app.selected = if count == 0 {
+            0
+        } else {
+            index.min(count.saturating_sub(1))
+        };
+    }
+
+    /// Number of functions currently offered by the rail (live buffer first).
+    #[allow(dead_code)] // Wired by the unified `tui` single rail.
+    pub(crate) fn function_count(&self) -> usize {
+        self.app.function_count()
+    }
+
+    /// Index of the function at the current selection.
+    #[allow(dead_code)] // Wired by the unified `tui` single rail.
+    pub(crate) fn selected_function_index(&self) -> usize {
+        self.app.selected
+    }
+
+    /// Jump the editor to the selected function and focus it.
+    #[allow(dead_code)] // Wired by the unified `tui` single rail.
+    pub(crate) fn jump_selected_function(&mut self) {
+        self.app.jump_selected();
+    }
+
+    /// Map a row in the full rail area (including its one-line header) to a
+    /// function index. Used by the unified rail's mouse handler.
+    #[allow(dead_code)] // Wired by the unified `tui` single rail.
+    pub(crate) fn function_at_row(&self, area: Rect, row: u16) -> Option<usize> {
+        if area.width == 0 || area.height <= 1 {
+            return None;
+        }
+        let list = Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        );
+        let count = self.app.function_count();
+        let visible = ui::visible_functions(list);
+        let offset = ui::list_offset(self.app.selected, visible);
+        ui::function_rail_row_at(area, offset, count, row)
+    }
+
+    /// The function at the current selection, if any.
+    #[allow(dead_code)] // Wired by the unified `tui` single rail.
+    pub(crate) fn selected_function(&self) -> Option<&FunctionCcn> {
+        if self.app.live_mode() {
+            self.app
+                .live
+                .as_ref()?
+                .functions
+                .get(self.app.selected)
+                .map(|row| &row.function)
+        } else {
+            self.app.view.as_ref()?.functions.get(self.app.selected)
         }
     }
 

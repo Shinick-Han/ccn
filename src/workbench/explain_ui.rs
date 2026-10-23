@@ -23,15 +23,43 @@ const LABEL_WIDTH: usize = 8;
 /// Never let one proportional bar dominate an unusually wide panel.
 const BAR_CAP: usize = 24;
 
-fn title_text(function: &str) -> String {
-    format!(" Explain \u{b7} {function} ")
+/// Suffix that keeps the exit key visible in every overlay title.
+const ESC_HINT: &str = " \u{b7} Esc close ";
+
+/// Append the `Esc close` hint, truncating the head instead of the hint.
+fn with_esc_hint(head: String, width: u16) -> String {
+    let budget = usize::from(width.saturating_sub(2));
+    if budget == 0 {
+        return String::new();
+    }
+    let hint_len = ESC_HINT.chars().count();
+    if head.chars().count() + hint_len <= budget {
+        return format!("{head}{ESC_HINT}");
+    }
+    if budget > hint_len + 3 {
+        let keep = budget - hint_len;
+        let head = truncate_chars(&head, u16::try_from(keep).unwrap_or(u16::MAX));
+        return format!("{head}{ESC_HINT}");
+    }
+    truncate_chars(
+        &format!("{head}{ESC_HINT}"),
+        u16::try_from(budget).unwrap_or(u16::MAX),
+    )
 }
 
-fn subtitle_text(explanation: &Explanation) -> String {
-    format!(
-        "heuristic breakdown \u{b7} CCN {} \u{b7} nesting {} \u{b7} {} LOC",
+/// Title line: `Explain · <function> · <breakdown> · Esc close`.
+fn title_text(function: &str, explanation: &Explanation, width: u16) -> String {
+    let mut head = String::from(" Explain");
+    let function = function.trim();
+    if !function.is_empty() {
+        head.push_str(" \u{b7} ");
+        head.push_str(function);
+    }
+    head.push_str(&format!(
+        " \u{b7} heuristic breakdown \u{b7} CCN {} \u{b7} nesting {} \u{b7} {} LOC",
         explanation.ccn, explanation.nesting, explanation.nloc
-    )
+    ));
+    with_esc_hint(head, width)
 }
 
 /// Truncate by characters (never bytes), with an ASCII ellipsis when possible.
@@ -136,10 +164,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, f
     } else {
         palette().border
     };
-    let title = truncate_chars(
-        &title_text(&explanation.function),
-        area.width.saturating_sub(2),
-    );
+    let title = title_text(&explanation.function, explanation, area.width);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
@@ -162,31 +187,13 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, f
         return;
     }
 
-    // Row 0 is the labelled subtitle; the breakdown gets what remains.
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_chars(&subtitle_text(explanation), inner.width),
-            Style::default().fg(palette().muted).bg(palette().card),
-        )))
-        .style(Style::default().bg(palette().card)),
-        Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        },
-    );
-
-    let remaining = inner.height.saturating_sub(1);
-    if remaining == 0 {
-        return;
-    }
-    let body_y = inner.y.saturating_add(1);
+    let remaining = inner.height;
+    let body_y = inner.y;
 
     if explanation.decisions.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_chars("No decision points found", inner.width),
+                truncate_chars("No decision points found \u{b7} Esc close", inner.width),
                 Style::default().fg(palette().muted).bg(palette().card),
             )))
             .style(Style::default().bg(palette().card)),
@@ -342,7 +349,7 @@ mod tests {
     #[test]
     fn renders_title_subtitle_counts_and_top_lines() {
         let explanation = sample();
-        let mut terminal = Terminal::new(TestBackend::new(64, 18)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
         terminal
             .draw(|frame| {
                 render(frame, frame.area(), &explanation, true);
@@ -355,6 +362,7 @@ mod tests {
             text.contains("heuristic breakdown \u{b7} CCN 9 \u{b7} nesting 3 \u{b7} 12 LOC"),
             "{text}"
         );
+        assert!(text.contains("Esc close"), "{text}");
         assert!(text.contains("Top decision lines"), "{text}");
         assert!(text.contains("L4 if"), "{text}");
         assert!(text.contains("L5 &&"), "{text}");
@@ -373,7 +381,7 @@ mod tests {
             decisions: Vec::new(),
             top_lines: Vec::new(),
         };
-        let mut terminal = Terminal::new(TestBackend::new(44, 7)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 7)).unwrap();
         terminal
             .draw(|frame| {
                 render(frame, frame.area(), &explanation, false);

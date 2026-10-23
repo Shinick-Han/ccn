@@ -154,6 +154,13 @@ enum SplitFocus {
 }
 
 #[cfg(feature = "workbench")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RailTab {
+    Files,
+    Functions,
+}
+
+#[cfg(feature = "workbench")]
 struct DiffPane {
     rows: Vec<DiffLine>,
     selected: usize,
@@ -165,6 +172,7 @@ struct DiffPane {
 /// Left dashboard table + right workbench pane. The left pane shrinks first
 /// on narrow terminals, leaving at least ~40 columns for the editor.
 #[cfg(feature = "workbench")]
+#[allow(dead_code)]
 fn split_areas(size: Rect, ratio: u16) -> (Rect, Rect, Rect) {
     let max_left = size.width.saturating_sub(31).max(20);
     let left_width =
@@ -180,15 +188,90 @@ fn split_areas(size: Rect, ratio: u16) -> (Rect, Rect, Rect) {
     (left, divider, right)
 }
 
-/// Layout for the split loop. Alt+Z (fullscreen) gives the whole area to the
-/// workbench and leaves no tree/divider behind.
+/// Width of the single Files/Functions rail. The editor always keeps the
+/// remaining width; below 100 columns the rail floats over the editor instead
+/// of shrinking it.
 #[cfg(feature = "workbench")]
+const RAIL_WIDTH: u16 = 28;
+#[cfg(feature = "workbench")]
+const RAIL_PERSISTENT_MIN: u16 = 100;
+
+/// Layout for the unified shell. Returns `(rail, divider, editor, overlay)`.
+/// Fullscreen and a hidden rail both leave the editor at full width.
+#[cfg(feature = "workbench")]
+fn rail_layout(size: Rect, visible: bool, fullscreen: bool) -> (Rect, Rect, Rect, bool) {
+    if fullscreen || !visible {
+        return (Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0), size, false);
+    }
+    let rail_width = RAIL_WIDTH
+        .min(size.width.saturating_sub(20))
+        .max(16)
+        .min(size.width);
+    let overlay = size.width < RAIL_PERSISTENT_MIN;
+    let rail = Rect::new(size.x, size.y, rail_width, size.height);
+    if overlay {
+        return (rail, Rect::new(0, 0, 0, 0), size, true);
+    }
+    let divider = Rect::new(size.x + rail_width, size.y, 1, size.height);
+    let editor = Rect::new(
+        size.x + rail_width + 1,
+        size.y,
+        size.width.saturating_sub(rail_width + 1),
+        size.height,
+    );
+    (rail, divider, editor, false)
+}
+
+/// Layout for the split loop. Kept for older tests and callers; the unified
+/// shell uses [`rail_layout`].
+#[cfg(feature = "workbench")]
+#[allow(dead_code)]
 fn split_layout(size: Rect, ratio: u16, fullscreen: bool) -> (Rect, Rect, Rect) {
     if fullscreen {
         (Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0), size)
     } else {
         split_areas(size, ratio)
     }
+}
+
+/// Draw the rail's one-line `Files | Functions` tab header.
+#[cfg(feature = "workbench")]
+fn render_rail_tabs(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    tab: RailTab,
+    file_count: usize,
+    function_count: usize,
+    focused: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let pal = crate::theme::palette();
+    let active = Style::default().fg(pal.accent).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(pal.muted);
+    let marker = if focused { "▌" } else { " " };
+    let files = format!(" Files ({file_count}) ");
+    let functions = format!(" Functions ({function_count}) ");
+    let mut spans = vec![Span::styled(marker, active)];
+    spans.push(Span::styled(
+        files,
+        if tab == RailTab::Files { active } else { muted },
+    ));
+    spans.push(Span::styled("│", muted));
+    spans.push(Span::styled(
+        functions,
+        if tab == RailTab::Functions {
+            active
+        } else {
+            muted
+        },
+    ));
+    let line = Line::from(truncate_spans(&spans, area.width as usize));
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(pal.canvas)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
 }
 
 /// Pane focus toggle. Alt+W is the advertised key because many terminals
@@ -205,6 +288,7 @@ fn is_pane_toggle(key: &KeyEvent) -> bool {
 }
 /// Convert a mouse x position into a clamped split percentage.
 #[cfg(feature = "workbench")]
+#[allow(dead_code)]
 fn split_ratio_from_x(x: u16, width: u16) -> u16 {
     let width = u32::from(width.max(1));
     ((u32::from(x) * 100) / width).clamp(20, 70) as u16
@@ -435,7 +519,7 @@ pub fn run_unified(
     #[cfg(feature = "workbench")]
     let saved = crate::session::load(&result.root);
     #[cfg(feature = "workbench")]
-    let mut split_ratio: u16 = saved.split_ratio;
+    let split_ratio: u16 = saved.split_ratio;
     #[cfg(feature = "workbench")]
     let mut reviewed_keys: BTreeSet<String> = saved.reviewed.iter().cloned().collect();
     #[cfg(feature = "workbench")]
@@ -675,7 +759,8 @@ pub fn run_unified(
                         }
                         let size = guard.terminal.size()?;
                         let area = Rect::new(0, 0, size.width, size.height);
-                        let (_, _, right) = split_areas(area, split_ratio);
+                        let (_, _, right, _) =
+                            rail_layout(area, size.width >= RAIL_PERSISTENT_MIN, false);
                         match crate::workbench::WorkbenchSession::open(
                             &target,
                             editor,
@@ -724,9 +809,11 @@ pub fn run_unified(
                         #[cfg(feature = "workbench")]
                         let fuzzy_paths = tree_paths(result);
                         let mut focus = SplitFocus::Workbench;
-                        let mut dragging = false;
+                        let mut rail_tab = RailTab::Files;
+                        let mut rail_visible = guard.terminal.size()?.width >= 100;
                         let mut editor_fullscreen = false;
                         let mut last_right = (0u16, 0u16);
+                        session.set_sidebar(false);
                         guard.set_mouse(true)?;
                         loop {
                             session.tick();
@@ -769,33 +856,63 @@ pub fn run_unified(
                                 }
                                 continue;
                             }
-                            let (left, divider, right) =
-                                split_layout(area, split_ratio, editor_fullscreen);
+                            let (rail, divider, right, rail_overlay) =
+                                rail_layout(area, rail_visible, editor_fullscreen);
                             if last_right != (right.width, right.height) {
                                 session.resize(right.width, right.height);
                                 last_right = (right.width, right.height);
                             }
                             guard.terminal.draw(|frame| {
-                                if !editor_fullscreen {
-                                    tree.render(frame, left, focus == SplitFocus::Files);
-                                }
                                 session.draw_in(frame, right);
-                                if !editor_fullscreen {
-                                    let mut handle = String::new();
-                                    for _ in 0..divider.height {
-                                        handle.push('│');
-                                        handle.push('\n');
+                                if rail_visible && !editor_fullscreen {
+                                    if rail_overlay {
+                                        frame.render_widget(Clear, rail);
+                                        frame.render_widget(
+                                            Block::default().style(
+                                                Style::default().bg(crate::theme::palette().canvas),
+                                            ),
+                                            rail,
+                                        );
                                     }
-                                    frame.render_widget(
-                                        Paragraph::new(handle).style(Style::default().fg(
-                                            if dragging {
-                                                crate::theme::palette().accent
-                                            } else {
-                                                crate::theme::palette().border
-                                            },
-                                        )),
-                                        divider,
+                                    let body = Rect::new(
+                                        rail.x,
+                                        rail.y.saturating_add(1),
+                                        rail.width,
+                                        rail.height.saturating_sub(1),
                                     );
+                                    match rail_tab {
+                                        RailTab::Files => tree.render_rail(
+                                            frame,
+                                            body,
+                                            focus == SplitFocus::Files,
+                                        ),
+                                        RailTab::Functions => session.draw_functions_in(
+                                            frame,
+                                            rail,
+                                            focus == SplitFocus::Files,
+                                        ),
+                                    }
+                                    render_rail_tabs(
+                                        frame,
+                                        rail,
+                                        rail_tab,
+                                        fuzzy_paths.len(),
+                                        session.function_count(),
+                                        focus == SplitFocus::Files,
+                                    );
+                                    if divider.width > 0 {
+                                        let mut handle = String::new();
+                                        for _ in 0..divider.height {
+                                            handle.push('│');
+                                            handle.push('\n');
+                                        }
+                                        frame.render_widget(
+                                            Paragraph::new(handle).style(
+                                                Style::default().fg(crate::theme::palette().border),
+                                            ),
+                                            divider,
+                                        );
+                                    }
                                 }
                                 if fuzzy.is_open() {
                                     crate::fuzzy::render(frame, frame.area(), &fuzzy, &fuzzy_paths);
@@ -943,8 +1060,54 @@ pub fn run_unified(
                                                             review = None;
                                                             fuzzy.close();
                                                         }
+                                                        PaletteAction::SearchWorkspace => {
+                                                            search.open();
+                                                            explanation = None;
+                                                            review = None;
+                                                            diff = None;
+                                                            diagnostics = None;
+                                                            symbols.close();
+                                                            fuzzy.close();
+                                                        }
+                                                        PaletteAction::SearchSymbols => {
+                                                            symbols.open(&session.functions());
+                                                            review = None;
+                                                            diff = None;
+                                                            diagnostics = None;
+                                                            explanation = None;
+                                                            search.close();
+                                                            fuzzy.close();
+                                                        }
+                                                        PaletteAction::ExplainCcn => {
+                                                            explanation =
+                                                                build_explanation(session);
+                                                            review = None;
+                                                            diff = None;
+                                                            diagnostics = None;
+                                                            symbols.close();
+                                                            search.close();
+                                                            fuzzy.close();
+                                                        }
+                                                        PaletteAction::ToggleRail => {
+                                                            rail_visible = !rail_visible;
+                                                            if rail_visible {
+                                                                focus = SplitFocus::Files;
+                                                            } else {
+                                                                focus = SplitFocus::Workbench;
+                                                            }
+                                                        }
+                                                        PaletteAction::FocusRail => {
+                                                            rail_visible = true;
+                                                            focus = SplitFocus::Files;
+                                                        }
+                                                        PaletteAction::ToggleFullscreen => {
+                                                            editor_fullscreen =
+                                                                !editor_fullscreen;
+                                                            focus = SplitFocus::Workbench;
+                                                        }
+                                                        PaletteAction::ShowOverview => break,
                                                         PaletteAction::ShowHelp => session.note(
-                                                            "F6 review - F7 diagnostics - Ctrl+Shift+P commands - F8 panes",
+                                                            "F5 commands - F6 review - F7 diagnostics - F8 rail - F10 overview",
                                                         ),
                                                         PaletteAction::NextTab => {
                                                             if let Err(error) = session.next_tab() {
@@ -962,6 +1125,7 @@ pub fn run_unified(
                                                             }
                                                         }
                                                         PaletteAction::FocusFiles => {
+                                                            rail_visible = true;
                                                             focus = SplitFocus::Files
                                                         }
                                                         PaletteAction::FocusEditor => {
@@ -970,7 +1134,7 @@ pub fn run_unified(
                                                         PaletteAction::FilterFiles => {
                                                             focus = SplitFocus::Files;
                                                             session.note(
-                                                                "split filter is Ctrl+P; / filters the dashboard table",
+                                                                "file filtering lives on the dashboard (/); Ctrl+P stays with Neovim",
                                                             );
                                                         }
                                                         PaletteAction::Rescan => session.rescan(),
@@ -1362,73 +1526,116 @@ pub fn run_unified(
                                         }
                                         continue;
                                     }
-                                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && matches!(key.code, KeyCode::Char('p' | 'P'))
-                                    {
-                                        fuzzy.open(&fuzzy_paths);
-                                        continue;
-                                    }
                                     if key.modifiers.contains(KeyModifiers::ALT)
                                         && matches!(key.code, KeyCode::Char('z' | 'Z'))
                                     {
                                         editor_fullscreen = !editor_fullscreen;
-                                        session.set_sidebar(!editor_fullscreen);
                                         focus = SplitFocus::Workbench;
                                         continue;
                                     }
                                     if is_pane_toggle(&key) {
                                         if editor_fullscreen {
                                             editor_fullscreen = false;
-                                            session.set_sidebar(true);
-                                            focus = SplitFocus::Workbench;
-                                        } else {
-                                            focus = match focus {
-                                                SplitFocus::Files => SplitFocus::Workbench,
-                                                SplitFocus::Workbench => SplitFocus::Files,
-                                            };
                                         }
+                                        focus = match focus {
+                                            SplitFocus::Files => SplitFocus::Workbench,
+                                            SplitFocus::Workbench => {
+                                                rail_visible = true;
+                                                SplitFocus::Files
+                                            }
+                                        };
                                         continue;
                                     }
                                     match focus {
-                                        SplitFocus::Files => match key.code {
-                                            KeyCode::Char('q') => break,
-                                            KeyCode::Char('c')
-                                                if key
-                                                    .modifiers
-                                                    .contains(KeyModifiers::CONTROL) =>
+                                        SplitFocus::Files => {
+                                            if key.code == KeyCode::Char('q')
+                                                || (key.code == KeyCode::Char('c')
+                                                    && key
+                                                        .modifiers
+                                                        .contains(KeyModifiers::CONTROL))
                                             {
-                                                break
-                                            }
-                                            KeyCode::Char('c') => {
-                                                tree.changed_only(!tree.is_changed_only())
-                                            }
-                                            KeyCode::Char('[') => {
-                                                split_ratio = split_ratio.saturating_sub(2).max(20)
-                                            }
-                                            KeyCode::Char(']') => {
-                                                split_ratio = (split_ratio + 2).min(70)
-                                            }
-                                            KeyCode::F(8) => focus = SplitFocus::Workbench,
-                                            KeyCode::F(10) => break,
-                                            _ => {
-                                                if let TreeAction::Open(path) = tree.handle_key(key)
-                                                {
-                                                    let target = Path::new(&result.root).join(path);
-                                                    if let Err(e) = session.open_file(&target) {
-                                                        eprintln!("ccn: {e}");
-                                                    }
-                                                    focus = SplitFocus::Workbench;
-                                                }
-                                            }
-                                        },
-                                        SplitFocus::Workbench => {
-                                            if editor_fullscreen
-                                                && matches!(key.code, KeyCode::F(8) | KeyCode::F(9))
-                                            {
-                                                editor_fullscreen = false;
-                                                session.set_sidebar(true);
+                                                break;
                                             }
                                             if key.code == KeyCode::F(8) {
+                                                rail_visible = false;
+                                                focus = SplitFocus::Workbench;
+                                                continue;
+                                            }
+                                            if key.code == KeyCode::F(10) {
+                                                break;
+                                            }
+                                            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                                                rail_tab = match rail_tab {
+                                                    RailTab::Files => RailTab::Functions,
+                                                    RailTab::Functions => RailTab::Files,
+                                                };
+                                                continue;
+                                            }
+                                            if key.code == KeyCode::Esc {
+                                                if rail_overlay {
+                                                    rail_visible = false;
+                                                }
+                                                focus = SplitFocus::Workbench;
+                                                continue;
+                                            }
+                                            match rail_tab {
+                                                RailTab::Files => {
+                                                    if let TreeAction::Open(path) =
+                                                        tree.handle_key(key)
+                                                    {
+                                                        let target =
+                                                            Path::new(&result.root).join(path);
+                                                        if let Err(e) = session.open_file(&target) {
+                                                            eprintln!("ccn: {e}");
+                                                        }
+                                                        focus = SplitFocus::Workbench;
+                                                    }
+                                                }
+                                                RailTab::Functions => match key.code {
+                                                    KeyCode::Char('j') | KeyCode::Down => {
+                                                        let next =
+                                                            session.selected_function_index() + 1;
+                                                        session.select_function(next);
+                                                    }
+                                                    KeyCode::Char('k') | KeyCode::Up => {
+                                                        let current =
+                                                            session.selected_function_index();
+                                                        session.select_function(
+                                                            current.saturating_sub(1),
+                                                        );
+                                                    }
+                                                    KeyCode::Char('g') | KeyCode::Home => {
+                                                        session.select_function(0)
+                                                    }
+                                                    KeyCode::Char('G') | KeyCode::End => {
+                                                        let last = session
+                                                            .function_count()
+                                                            .saturating_sub(1);
+                                                        session.select_function(last);
+                                                    }
+                                                    KeyCode::Enter | KeyCode::Char('o') => {
+                                                        session.jump_selected_function();
+                                                        focus = SplitFocus::Workbench;
+                                                    }
+                                                    _ => {}
+                                                },
+                                            }
+                                        }
+                                        SplitFocus::Workbench => {
+                                            if key.code == KeyCode::F(8) {
+                                                editor_fullscreen = false;
+                                                rail_visible = !rail_visible;
+                                                focus = if rail_visible {
+                                                    SplitFocus::Files
+                                                } else {
+                                                    SplitFocus::Workbench
+                                                };
+                                                continue;
+                                            }
+                                            if key.code == KeyCode::F(9) {
+                                                editor_fullscreen = false;
+                                                rail_visible = true;
+                                                rail_tab = RailTab::Functions;
                                                 focus = SplitFocus::Files;
                                                 continue;
                                             }
@@ -1440,28 +1647,66 @@ pub fn run_unified(
                                 }
                                 Event::Mouse(mouse) => match mouse.kind {
                                     MouseEventKind::Down(MouseButton::Left)
-                                        if mouse.column >= divider.x
-                                            && mouse.column < divider.x + divider.width =>
-                                    {
-                                        dragging = true;
-                                    }
-                                    MouseEventKind::Down(MouseButton::Left)
                                         if review.is_none()
                                             && diff.is_none()
                                             && diagnostics.is_none()
                                             && !fuzzy.is_open()
                                             && !palette.is_open()
-                                            && mouse.column < left.width =>
+                                            && rail_visible
+                                            && !editor_fullscreen
+                                            && mouse.column >= rail.x
+                                            && mouse.column < rail.right()
+                                            && mouse.row >= rail.y
+                                            && mouse.row < rail.bottom() =>
                                     {
                                         focus = SplitFocus::Files;
-                                        if let TreeAction::Open(path) =
-                                            tree.click(mouse.column, mouse.row, left)
-                                        {
-                                            let target = Path::new(&result.root).join(path);
-                                            if let Err(error) = session.open_file(&target) {
-                                                eprintln!("ccn: {error}");
+                                        if mouse.row == rail.y {
+                                            let files_end =
+                                                rail.x.saturating_add(1).saturating_add(
+                                                    format!(" Files ({}) ", fuzzy_paths.len())
+                                                        .chars()
+                                                        .count()
+                                                        as u16,
+                                                );
+                                            rail_tab = if mouse.column < files_end {
+                                                RailTab::Files
                                             } else {
-                                                focus = SplitFocus::Workbench;
+                                                RailTab::Functions
+                                            };
+                                        } else {
+                                            let body = Rect::new(
+                                                rail.x,
+                                                rail.y.saturating_add(1),
+                                                rail.width,
+                                                rail.height.saturating_sub(1),
+                                            );
+                                            match rail_tab {
+                                                RailTab::Files => {
+                                                    if let TreeAction::Open(path) = tree.click_rail(
+                                                        mouse.column,
+                                                        mouse.row,
+                                                        body,
+                                                    ) {
+                                                        let target =
+                                                            Path::new(&result.root).join(path);
+                                                        if let Err(error) =
+                                                            session.open_file(&target)
+                                                        {
+                                                            eprintln!("ccn: {error}");
+                                                        } else {
+                                                            focus = SplitFocus::Workbench;
+                                                        }
+                                                    }
+                                                }
+                                                RailTab::Functions => {
+                                                    if let Some(index) =
+                                                        session.function_at_row(rail, mouse.row)
+                                                    {
+                                                        session.select_function(index);
+                                                        session.jump_selected_function();
+                                                        focus = SplitFocus::Workbench;
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -1476,10 +1721,6 @@ pub fn run_unified(
                                         session.click_workbench(mouse.column, mouse.row, right);
                                         focus = SplitFocus::Workbench;
                                     }
-                                    MouseEventKind::Drag(MouseButton::Left) if dragging => {
-                                        split_ratio = split_ratio_from_x(mouse.column, area.width);
-                                    }
-                                    MouseEventKind::Up(MouseButton::Left) => dragging = false,
                                     _ => {}
                                 },
                                 Event::Resize(_, _) => {}
@@ -2141,7 +2382,7 @@ pub fn render(frame: &mut Frame, app: &mut App<'_>) {
     }
 
     let rows = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(1),
     ])
@@ -2149,10 +2390,12 @@ pub fn render(frame: &mut Frame, app: &mut App<'_>) {
 
     render_header(frame, app, rows[0]);
 
+    // The file table is the primary surface; charts and the selected-file
+    // inspector sit to its right and fold away first on narrow terminals.
     let body =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(rows[1]);
-    render_left(frame, app, body[0]);
-    render_right(frame, app, body[1], true);
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(rows[1]);
+    render_right(frame, app, body[0], true);
+    render_left(frame, app, body[1]);
     render_footer(frame, app, rows[2]);
 
     match app.overlay {
@@ -2184,10 +2427,10 @@ fn render_footer(frame: &mut Frame, app: &App<'_>, area: Rect) {
             Span::styled("first run · ", chrome),
             Span::styled("?", key),
             Span::styled(" help · ", chrome),
-            Span::styled("F5", key),
-            Span::styled(" palette · ", chrome),
             Span::styled("e", key),
-            Span::styled(" opens the workbench", chrome),
+            Span::styled(" opens the editor · ", chrome),
+            Span::styled("/", key),
+            Span::styled(" filters files", chrome),
         ];
         if let Some(filter) = app.active_filter() {
             spans.push(Span::styled("  ", chrome));
@@ -2202,15 +2445,13 @@ fn render_footer(frame: &mut Frame, app: &App<'_>, area: Rect) {
     }
     let mut spans = vec![
         Span::styled("j/k", key),
-        Span::styled(" move - ", chrome),
+        Span::styled(" move · ", chrome),
         Span::styled("/", key),
-        Span::styled(" filter - ", chrome),
+        Span::styled(" filter · ", chrome),
         Span::styled("e", key),
-        Span::styled(" edit - ", chrome),
-        Span::styled("Ctrl+P", key),
-        Span::styled(" open - ", chrome),
+        Span::styled(" edit · ", chrome),
         Span::styled("?", key),
-        Span::styled(" help - ", chrome),
+        Span::styled(" help · ", chrome),
         Span::styled("q", key),
         Span::styled(" quit", chrome),
     ];
@@ -2241,36 +2482,29 @@ fn panel_block<'a>(focused: bool, title: Line<'a>) -> Block<'a> {
 }
 
 fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().bg(palette().card))
-        .border_style(Style::default().fg(palette().border));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
+    if area.width == 0 || area.height == 0 {
         return;
     }
-
-    let width = inner.width as usize;
-    let text = Style::default().fg(palette().text);
-    let muted = Style::default().fg(palette().muted);
+    let pal = palette();
+    let text = Style::default().fg(pal.text);
+    let muted = Style::default().fg(pal.muted);
+    let width = area.width as usize;
 
     let mut left = vec![
         Span::styled("ccn", muted),
-        Span::styled(" · ", muted),
+        Span::styled("  ", muted),
         Span::styled(app.report.root.replace('\\', "/"), text),
     ];
     if let Some(identity) = &app.vcs_identity {
         left.push(Span::styled("  ", muted));
         left.push(Span::styled(
             identity.as_str(),
-            Style::default().fg(palette().accent_alt),
+            Style::default().fg(pal.accent),
         ));
     }
     if let Some(filter) = app.active_filter() {
-        left.push(Span::styled("  [filter: ", muted));
+        left.push(Span::styled("  /", muted));
         left.push(Span::styled(filter.to_string(), text));
-        left.push(Span::styled("]", muted));
     }
 
     let mut right = match &app.report.health {
@@ -2278,11 +2512,9 @@ fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
             Span::styled("Health ", muted),
             Span::styled(
                 format!("{:.1}", health.score),
-                Style::default()
-                    .fg(palette().text)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(pal.text).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" / 100  grade ", muted),
+            Span::styled("  grade ", muted),
             Span::styled(
                 health.grade.to_string(),
                 Style::default()
@@ -2292,37 +2524,34 @@ fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
         ],
         None => vec![Span::styled("Health n/a", muted)],
     };
-    let counts = format!(
-        " · {} files · {} fns",
-        thousands(app.report.files_measured),
-        thousands(app.report.stats.functions_total)
-    );
-    if spans_width(&left) + spans_width(&right) + counts.chars().count() + 4 <= width {
-        right.push(Span::styled(counts, muted));
-    }
+    right.push(Span::styled(
+        format!(
+            "  {} files  {} fns",
+            thousands(app.report.files_measured),
+            thousands(app.report.stats.functions_total)
+        ),
+        muted,
+    ));
 
-    let right_width = spans_width(&right);
-    let line = if spans_width(&left) + right_width + 2 <= width {
-        let padding = width - spans_width(&left) - right_width;
+    let line = if spans_width(&left) + spans_width(&right) + 2 <= width {
+        let padding = width - spans_width(&left) - spans_width(&right);
         let mut spans = left;
         spans.push(Span::styled(" ".repeat(padding), muted));
         spans.extend(right);
         Line::from(spans)
-    } else if right_width + 1 < width {
-        let mut spans = truncate_spans(&left, width - right_width - 1);
+    } else if spans_width(&right) + 1 < width {
+        let mut spans = truncate_spans(&left, width - spans_width(&right) - 1);
         spans.push(Span::styled(" ", muted));
         spans.extend(right);
         Line::from(spans)
     } else {
         Line::from(truncate_spans(&right, width))
     };
-
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(palette().card)),
-        inner,
+        Paragraph::new(line).style(Style::default().bg(pal.canvas)),
+        area,
     );
 }
-
 fn render_left(frame: &mut Frame, app: &App<'_>, area: Rect) {
     // Keep the original single chart on short terminals. On a normal dashboard
     // the left column becomes contextual: histogram, selected file, repo pulse.
@@ -2970,35 +3199,35 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("j / k", "move selection"),
                 ("/", "filter paths (Enter applies, Esc cancels)"),
                 ("Enter / d", "file detail"),
-                ("e", "open the workbench"),
-                ("Ctrl+P", "open a file by name"),
+                ("e", "open the editor"),
                 ("?", "this help"),
                 ("q / Esc", "quit"),
             ],
         ),
         (
-            "WORKBENCH",
+            "EDITOR",
             &[
-                ("F5", "command palette"),
+                ("F5", "commands · open · search · explain"),
                 ("F6", "baseline review (then d for diff)"),
                 ("F7", "diagnostics"),
-                ("Alt+W", "files / editor panes"),
+                ("F8", "toggle the Files / Functions rail"),
+                ("F9", "focus Functions"),
+                ("Alt+W", "editor / rail focus"),
                 ("Alt+Z", "editor fullscreen"),
-                ("Alt+O", "search functions in this file"),
-                ("Alt+F", "search workspace text"),
-                ("F10", "back to the dashboard"),
+                ("F10", "overview"),
             ],
         ),
         (
             "ADVANCED (still works)",
             &[
-                ("F8 / Ctrl+Shift+E", "pane switch (compatibility)"),
-                ("F9", "editor / function sidebar"),
+                (
+                    "Alt+O / Alt+F / Alt+E",
+                    "symbol / text / explain compatibility",
+                ),
+                ("Tab", "rail: Files / Functions"),
                 ("g / G", "first / last"),
-                ("Tab", "chart: CCN per function / LOC per file"),
-                ("s / S", "sort key / reverse direction"),
-                ("1 / 2", "chart tab"),
-                ("[ / ]", "resize the split from the file pane"),
+                ("s / S", "dashboard sort key / direction"),
+                ("1 / 2", "dashboard chart tab"),
                 ("F2 / F3 / F4", "previous / next / close tab"),
                 ("Ctrl+C", "quit confirmation / interrupt in the editor"),
             ],
@@ -3402,10 +3631,7 @@ mod tests {
         assert_eq!(app.view.len(), 1);
 
         let text = draw(&mut app, 100, 30);
-        assert!(
-            text.contains("[filter: tui]"),
-            "filter chip missing:\n{text}"
-        );
+        assert!(text.contains("/tui"), "filter chip missing:\n{text}");
         assert!(text.contains("tui_app.py"), "{text}");
         assert!(
             !text.contains("beta.rs"),
@@ -3528,10 +3754,13 @@ mod tests {
         app.first_run = true;
         let text = draw(&mut app, 100, 30);
         assert!(text.contains("first run"), "hint missing:\n{text}");
-        assert!(text.contains("F5"), "palette hint missing:\n{text}");
         assert!(
-            text.contains("opens the workbench"),
-            "workbench hint missing:\n{text}"
+            text.contains("opens the editor"),
+            "editor hint missing:\n{text}"
+        );
+        assert!(
+            text.contains("/ filters files"),
+            "filter hint missing:\n{text}"
         );
         assert!(
             !text.contains("j/k move"),
@@ -3592,6 +3821,31 @@ mod tests {
             .expect("a startup file");
         assert_eq!(path, PathBuf::from(&result.files[0].path));
         assert!(result.files[0].ccn.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "workbench")]
+    fn rail_keeps_the_editor_wide_and_floats_below_100_columns() {
+        let narrow = Rect::new(0, 0, 80, 24);
+        let (rail, _, editor, overlay) = rail_layout(narrow, true, false);
+        assert!(overlay, "the rail must float at 80 columns");
+        assert_eq!(editor, narrow);
+        assert_eq!(rail.width, RAIL_WIDTH);
+
+        let wide = Rect::new(0, 0, 120, 30);
+        let (rail, divider, editor, overlay) = rail_layout(wide, true, false);
+        assert!(!overlay);
+        assert_eq!(rail.width, RAIL_WIDTH);
+        assert_eq!(divider.width, 1);
+        assert!(editor.width >= 90, "editor was {}", editor.width);
+
+        let (rail, _, editor, _) = rail_layout(wide, false, false);
+        assert_eq!(rail.width, 0);
+        assert_eq!(editor, wide);
+
+        let (rail, _, editor, _) = rail_layout(wide, true, true);
+        assert_eq!(rail.width, 0);
+        assert_eq!(editor, wide);
     }
 
     #[test]
@@ -3739,7 +3993,8 @@ mod tests {
         let marker_x = path_x - 4;
         assert_eq!(buffer[(marker_x, y)].symbol(), "▌");
 
-        for x in marker_x..width - 1 {
+        let table_end = width.saturating_mul(62) / 100;
+        for x in marker_x..table_end.saturating_sub(1) {
             assert_eq!(
                 buffer[(x, y)].bg,
                 palette().pill,

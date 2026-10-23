@@ -1,10 +1,16 @@
-//! Command palette (Ctrl+Shift+P style) for the unified TUI.
+//! Command palette (F5) for the unified TUI.
 //!
 //! The palette is a small, dependency-free list of app actions. Filtering
 //! reuses [`crate::fuzzy::rank`] over the command labels, so typing `diag`
 //! narrows the list to `Diagnostics` with the same scoring as file search.
 //! The palette owns its query, selection and ranked match indices; rendering
-//! is a centered popup with a selected pill.
+//! is a single centered popup: one border, one query line and one shortcut
+//! column, with a `▌` marker on the selected row.
+//!
+//! The empty-query catalog is deliberately short and named after the outcome
+//! the user wants (`Open file`, `Show overview`, ...) rather than after the
+//! widget that implements it. Tabs, pane focus and the legacy filter entry stay
+//! reachable by typing, but do not crowd the first screen.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -18,6 +24,9 @@ use crate::theme::palette;
 /// Maximum number of command rows drawn at once.
 pub const MAX_ROWS: usize = 12;
 
+/// Marker drawn on the selected row instead of a filled background pill.
+const SELECTED_MARKER: char = '▌';
+
 /// Action requested by a palette command.
 ///
 /// The caller maps these onto its own key handling; the palette itself never
@@ -25,17 +34,27 @@ pub const MAX_ROWS: usize = 12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteAction {
     OpenFilePicker,
+    SearchWorkspace,
+    SearchSymbols,
+    ExplainCcn,
+    ToggleRail,
+    FocusRail,
+    FocusEditor,
+    ToggleFullscreen,
+    ShowOverview,
     ToggleReview,
     ToggleDiagnostics,
     ShowHelp,
     NextTab,
     PrevTab,
     CloseTab,
-    FocusFiles,
-    FocusEditor,
-    FilterFiles,
     Rescan,
     Quit,
+    /// Legacy action kept as a compatibility alias for existing key handlers.
+    /// It stays out of the empty-query catalog and is only reachable by typing.
+    FilterFiles,
+    /// Legacy pane-focus action, likewise kept for compatibility.
+    FocusFiles,
 }
 
 /// One entry in the command list.
@@ -45,94 +64,178 @@ pub struct Command {
     pub id: &'static str,
     /// ASCII label shown in the popup and matched by the fuzzy filter.
     pub label: &'static str,
-    /// ASCII shortcut hint shown on the right of the row.
+    /// ASCII shortcut hint shown on the right of the row. May be empty for
+    /// actions whose only entry point is this palette.
     pub shortcut: &'static str,
     /// Action emitted when the row is accepted.
     pub action: PaletteAction,
+    /// Rows kept out of the empty-query catalog: tab and pane commands that
+    /// would crowd the first screen, plus legacy compatibility entries. They
+    /// still participate in fuzzy filtering once the user types something.
+    pub hidden: bool,
 }
 
 /// The command catalog in declaration order.
 ///
-/// Declaration order is the order shown for an empty query. The index into
+/// Declaration order is the order shown for an empty query, and the first
+/// [`MAX_ROWS`] visible entries are the whole first screen. The index into
 /// this slice is what [`Palette`] stores as a match.
 const COMMANDS: &[Command] = &[
     Command {
         id: "open_file",
         label: "Open file",
-        shortcut: "Ctrl+P",
+        // F5 is the palette itself; `Ctrl+P` belongs to Neovim and must not be
+        // advertised here.
+        shortcut: "F5",
         action: PaletteAction::OpenFilePicker,
+        hidden: false,
+    },
+    Command {
+        id: "search_workspace",
+        label: "Search workspace",
+        shortcut: "Alt+F",
+        action: PaletteAction::SearchWorkspace,
+        hidden: false,
+    },
+    Command {
+        id: "search_symbols",
+        label: "Functions",
+        shortcut: "Alt+O",
+        action: PaletteAction::SearchSymbols,
+        hidden: false,
+    },
+    Command {
+        id: "explain_ccn",
+        label: "Explain CCN",
+        shortcut: "Alt+E",
+        action: PaletteAction::ExplainCcn,
+        hidden: false,
+    },
+    Command {
+        id: "show_overview",
+        label: "Show overview",
+        shortcut: "F10",
+        action: PaletteAction::ShowOverview,
+        hidden: false,
+    },
+    Command {
+        id: "toggle_rail",
+        label: "Toggle rail",
+        shortcut: "F9",
+        action: PaletteAction::ToggleRail,
+        hidden: false,
     },
     Command {
         id: "baseline_review",
         label: "Baseline review",
         shortcut: "F6",
         action: PaletteAction::ToggleReview,
+        hidden: false,
     },
     Command {
         id: "diagnostics",
         label: "Diagnostics",
         shortcut: "F7",
         action: PaletteAction::ToggleDiagnostics,
+        hidden: false,
+    },
+    Command {
+        id: "toggle_fullscreen",
+        label: "Toggle fullscreen",
+        shortcut: "Alt+Z",
+        action: PaletteAction::ToggleFullscreen,
+        hidden: false,
     },
     Command {
         id: "help",
         label: "Help",
         shortcut: "?",
         action: PaletteAction::ShowHelp,
-    },
-    Command {
-        id: "next_tab",
-        label: "Next tab",
-        shortcut: "F3",
-        action: PaletteAction::NextTab,
-    },
-    Command {
-        id: "prev_tab",
-        label: "Previous tab",
-        shortcut: "F2",
-        action: PaletteAction::PrevTab,
-    },
-    Command {
-        id: "close_tab",
-        label: "Close tab",
-        shortcut: "F4",
-        action: PaletteAction::CloseTab,
-    },
-    Command {
-        id: "focus_files",
-        label: "Focus files",
-        shortcut: "F8",
-        action: PaletteAction::FocusFiles,
-    },
-    Command {
-        id: "focus_editor",
-        label: "Focus editor",
-        shortcut: "F8",
-        action: PaletteAction::FocusEditor,
-    },
-    Command {
-        id: "filter_files",
-        label: "Filter files",
-        shortcut: "/",
-        action: PaletteAction::FilterFiles,
+        hidden: false,
     },
     Command {
         id: "rescan",
-        label: "Rescan file",
+        label: "Rescan",
         shortcut: "r",
         action: PaletteAction::Rescan,
+        hidden: false,
     },
     Command {
         id: "quit",
         label: "Quit",
         shortcut: "q",
         action: PaletteAction::Quit,
+        hidden: false,
+    },
+    // Below-the-fold entries: discoverable by typing, kept out of the first
+    // screen so the catalog stays short.
+    Command {
+        id: "focus_rail",
+        label: "Focus rail",
+        shortcut: "F9",
+        action: PaletteAction::FocusRail,
+        hidden: true,
+    },
+    Command {
+        id: "focus_editor",
+        label: "Focus editor",
+        shortcut: "F8",
+        action: PaletteAction::FocusEditor,
+        hidden: true,
+    },
+    Command {
+        id: "next_tab",
+        label: "Next tab",
+        shortcut: "F3",
+        action: PaletteAction::NextTab,
+        hidden: true,
+    },
+    Command {
+        id: "prev_tab",
+        label: "Previous tab",
+        shortcut: "F2",
+        action: PaletteAction::PrevTab,
+        hidden: true,
+    },
+    Command {
+        id: "close_tab",
+        label: "Close tab",
+        shortcut: "F4",
+        action: PaletteAction::CloseTab,
+        hidden: true,
+    },
+    // Compatibility entries: preserved for callers, hidden from the catalog.
+    Command {
+        id: "focus_files",
+        label: "Focus files",
+        shortcut: "F8",
+        action: PaletteAction::FocusFiles,
+        hidden: true,
+    },
+    Command {
+        id: "filter_files",
+        label: "Filter files",
+        shortcut: "/",
+        action: PaletteAction::FilterFiles,
+        hidden: true,
     },
 ];
 
 /// Return a copy of the full command catalog in declaration order.
+///
+/// This includes hidden compatibility entries so callers and tests can still
+/// resolve them; use [`catalog`] for the rows the palette advertises.
 pub fn commands() -> Vec<Command> {
     COMMANDS.to_vec()
+}
+
+/// The rows shown for an empty query: the advertised catalog, in order.
+pub fn catalog() -> Vec<Command> {
+    COMMANDS
+        .iter()
+        .filter(|command| !command.hidden)
+        .cloned()
+        .collect()
 }
 
 /// Popup state: query, selected row and ranked command indices.
@@ -158,7 +261,7 @@ impl Palette {
         self.open
     }
 
-    /// Open the palette, reset the query and selection, and show all commands.
+    /// Open the palette, reset the query and selection, and show the catalog.
     pub fn open(&mut self) {
         self.open = true;
         self.query.clear();
@@ -223,22 +326,36 @@ impl Palette {
             .collect()
     }
 
-    /// Re-rank the catalog, keeping at most [`MAX_ROWS`] entries.
+    /// Re-rank the visible catalog, keeping at most [`MAX_ROWS`] entries.
+    ///
+    /// Hidden compatibility entries only enter the ranking once the query is
+    /// non-empty, so they never occupy the first screen but remain reachable
+    /// by name.
     fn refresh(&mut self) {
-        let labels: Vec<String> = COMMANDS
+        let include_hidden = !self.query.is_empty();
+        let visible: Vec<(usize, &Command)> = COMMANDS
             .iter()
-            .map(|command| command.label.to_string())
+            .enumerate()
+            .filter(|(_, command)| include_hidden || !command.hidden)
             .collect();
-        self.matches = rank(&labels, &self.query, MAX_ROWS);
+        let labels: Vec<String> = visible
+            .iter()
+            .map(|(_, command)| command.label.to_string())
+            .collect();
+        self.matches = rank(&labels, &self.query, MAX_ROWS)
+            .into_iter()
+            .filter_map(|position| visible.get(position).map(|(index, _)| *index))
+            .collect();
         self.selected = 0;
     }
 }
 
-/// Draw a centered `COMMANDS` popup over `area`.
+/// Draw a centered command popup over `area`.
 ///
-/// The popup is only drawn while the palette is open. It shows the query line
-/// followed by up to [`MAX_ROWS`] commands with right-aligned shortcut hints.
-/// Areas too small for the popup are ignored rather than panicking.
+/// The popup is only drawn while the palette is open. It is one bordered card
+/// with a query line followed by up to [`MAX_ROWS`] commands, each with a
+/// right-aligned shortcut hint and a `▌` marker on the selected row. Areas too
+/// small for the popup are ignored rather than panicking.
 pub fn render(frame: &mut Frame, area: Rect, state: &Palette) {
     if !state.is_open() || area.width < 12 || area.height < 5 {
         return;
@@ -257,12 +374,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &Palette) {
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().bg(palette().card))
-        .border_style(Style::default().fg(palette().border_focus))
-        .title(Line::from(Span::styled(
-            " COMMANDS - Esc closes ",
-            Style::default().fg(palette().accent),
-        )));
+        .border_style(Style::default().fg(palette().border_focus));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if inner.width == 0 || inner.height == 0 {
@@ -292,35 +404,29 @@ pub fn render(frame: &mut Frame, area: Rect, state: &Palette) {
             let Some(command) = COMMANDS.get(index) else {
                 continue;
             };
-            let text = row_text(command.label, command.shortcut, width);
-            if position == state.selected {
-                lines.push(Line::from(Span::styled(
-                    text,
-                    Style::default()
-                        .fg(palette().text)
-                        .bg(palette().pill)
-                        .add_modifier(Modifier::BOLD),
-                )));
+            let selected = position == state.selected;
+            let text = row_text(command.label, command.shortcut, width, selected);
+            let style = if selected {
+                Style::default()
+                    .fg(palette().text)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                lines.push(Line::from(Span::styled(
-                    text,
-                    Style::default().fg(palette().text),
-                )));
-            }
+                Style::default().fg(palette().text)
+            };
+            lines.push(Line::from(Span::styled(text, style)));
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(palette().card)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Compose one row: padded label on the left, shortcut on the right.
-fn row_text(label: &str, shortcut: &str, width: usize) -> String {
+/// Compose one row: marker and label on the left, shortcut on the right.
+fn row_text(label: &str, shortcut: &str, width: usize, selected: bool) -> String {
+    let marker = if selected { SELECTED_MARKER } else { ' ' };
     let shortcut_width = shortcut.chars().count();
     let label_space = width.saturating_sub(shortcut_width + 3);
-    let mut text = format!("  {label}");
+    let prefix = format!("{marker} ");
+    let mut text = format!("{prefix}{label}");
     if text.chars().count() > label_space {
         text = truncate(&text, label_space);
     }
@@ -379,7 +485,7 @@ mod tests {
         palette.open();
         assert!(palette.is_open());
         assert_eq!(palette.query(), "");
-        assert_eq!(palette.matches().len(), commands().len());
+        assert_eq!(palette.matches().len(), catalog().len().min(MAX_ROWS));
 
         palette.type_char('q');
         assert_eq!(palette.query(), "q");
@@ -406,7 +512,7 @@ mod tests {
     #[test]
     fn every_command_has_a_label_and_shortcut() {
         let all = commands();
-        assert_eq!(all.len(), 12);
+        assert!(all.len() >= 12);
         for command in &all {
             assert!(!command.id.is_empty());
             assert!(!command.label.is_empty());
@@ -414,21 +520,139 @@ mod tests {
             assert!(command.label.is_ascii());
             assert!(command.shortcut.is_ascii());
         }
+        let advertised = catalog();
+        let ids: Vec<&str> = advertised.iter().map(|command| command.id).collect();
+        assert!(
+            !ids.contains(&"filter_files"),
+            "compat entry must be hidden"
+        );
+        assert!(!ids.contains(&"focus_files"), "compat entry must be hidden");
         let shortcuts: Vec<&str> = all.iter().map(|command| command.shortcut).collect();
-        assert!(shortcuts.contains(&"Ctrl+P"));
+        assert!(shortcuts.contains(&"F5"));
         assert!(shortcuts.contains(&"F6"));
         assert!(shortcuts.contains(&"F7"));
+        assert!(shortcuts.contains(&"F10"));
         assert!(shortcuts.contains(&"?"));
-        assert!(shortcuts.contains(&"/"));
         assert!(shortcuts.contains(&"r"));
         assert!(shortcuts.contains(&"q"));
+    }
+
+    #[test]
+    fn ctrl_p_is_never_advertised() {
+        for command in commands() {
+            assert!(
+                !command.shortcut.to_lowercase().contains("ctrl+p"),
+                "{} advertises Ctrl+P",
+                command.id
+            );
+        }
+        let palette = filtered("");
+        let text = render_text(&palette, 60, 22);
+        assert!(!text.to_lowercase().contains("ctrl+p"), "{text}");
+    }
+
+    #[test]
+    fn catalog_is_short_and_outcome_named() {
+        let ids: Vec<&str> = catalog().iter().map(|command| command.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "open_file",
+                "search_workspace",
+                "search_symbols",
+                "explain_ccn",
+                "show_overview",
+                "toggle_rail",
+                "baseline_review",
+                "diagnostics",
+                "toggle_fullscreen",
+                "help",
+                "rescan",
+                "quit",
+            ]
+        );
+        assert_eq!(catalog().len(), MAX_ROWS);
+    }
+
+    #[test]
+    fn catalog_contains_new_actions() {
+        // Tab and pane actions sit below the fold but stay in the command list.
+        let actions: Vec<PaletteAction> = commands().iter().map(|command| command.action).collect();
+        for expected in [
+            PaletteAction::OpenFilePicker,
+            PaletteAction::SearchWorkspace,
+            PaletteAction::SearchSymbols,
+            PaletteAction::ExplainCcn,
+            PaletteAction::ToggleRail,
+            PaletteAction::FocusRail,
+            PaletteAction::FocusEditor,
+            PaletteAction::ToggleFullscreen,
+            PaletteAction::ShowOverview,
+            PaletteAction::ToggleReview,
+            PaletteAction::ToggleDiagnostics,
+            PaletteAction::ShowHelp,
+            PaletteAction::NextTab,
+            PaletteAction::PrevTab,
+            PaletteAction::CloseTab,
+            PaletteAction::Rescan,
+            PaletteAction::Quit,
+        ] {
+            assert!(
+                actions.contains(&expected),
+                "{expected:?} missing from the catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn filtering_finds_new_actions() {
+        for (query, id) in [
+            ("open", "open_file"),
+            ("work", "search_workspace"),
+            ("fun", "search_symbols"),
+            ("expl", "explain_ccn"),
+            ("rail", "toggle_rail"),
+            ("focus r", "focus_rail"),
+            ("full", "toggle_fullscreen"),
+            ("over", "show_overview"),
+            ("base", "baseline_review"),
+            ("diag", "diagnostics"),
+            ("nex", "next_tab"),
+            ("prev", "prev_tab"),
+            ("clos", "close_tab"),
+            ("resc", "rescan"),
+            ("qui", "quit"),
+        ] {
+            let palette = filtered(query);
+            let ids: Vec<&str> = palette.matches().iter().map(|command| command.id).collect();
+            assert!(ids.contains(&id), "query {query:?} missed {id}: {ids:?}");
+        }
+    }
+
+    #[test]
+    fn hidden_compat_entry_appears_only_while_typing() {
+        let empty = filtered("");
+        assert!(!empty
+            .matches()
+            .iter()
+            .any(|command| command.id == "filter_files"));
+
+        let typed = filtered("filter");
+        assert!(typed
+            .matches()
+            .iter()
+            .any(|command| command.id == "filter_files"));
     }
 
     #[test]
     fn empty_query_keeps_declaration_order() {
         let palette = filtered("");
         let shown: Vec<&str> = palette.matches().iter().map(|command| command.id).collect();
-        let expected: Vec<&str> = commands().iter().map(|command| command.id).collect();
+        let expected: Vec<&str> = catalog()
+            .iter()
+            .take(MAX_ROWS)
+            .map(|command| command.id)
+            .collect();
         assert_eq!(shown, expected);
         assert_eq!(palette.selected().unwrap().id, "open_file");
 
@@ -443,7 +667,7 @@ mod tests {
         assert_eq!(palette.selected().unwrap().id, "open_file");
 
         palette.move_selection(1);
-        assert_eq!(palette.selected().unwrap().id, "baseline_review");
+        assert_eq!(palette.selected().unwrap().id, "search_workspace");
         palette.move_selection(-99);
         assert_eq!(palette.selected().unwrap().id, "open_file");
         palette.move_selection(999);
@@ -466,23 +690,43 @@ mod tests {
         palette.backspace();
         palette.backspace();
         assert_eq!(palette.query(), "");
-        assert_eq!(palette.matches().len(), commands().len());
+        assert_eq!(palette.matches().len(), catalog().len().min(MAX_ROWS));
+    }
+
+    fn render_text(palette: &Palette, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| render(frame, frame.area(), palette))
+            .expect("draw palette");
+        buffer_text(terminal.backend().buffer())
     }
 
     #[test]
-    fn renders_popup_with_title_and_shortcuts() {
+    fn renders_one_flattened_popup_with_shortcuts() {
         let palette = filtered("");
-        let backend = TestBackend::new(50, 20);
-        let mut terminal = Terminal::new(backend).expect("test backend");
-        terminal
-            .draw(|frame| render(frame, frame.area(), &palette))
-            .expect("draw palette");
-        let text = buffer_text(terminal.backend().buffer());
-        assert!(text.contains("COMMANDS"), "{text}");
+        let text = render_text(&palette, 50, 20);
         assert!(text.contains("Open file"), "{text}");
-        assert!(text.contains("Ctrl+P"), "{text}");
+        assert!(text.contains("F5"), "{text}");
         assert!(text.contains("Diagnostics"), "{text}");
         assert!(text.contains("F7"), "{text}");
+        assert!(text.contains("Alt+F"), "{text}");
+        assert!(text.contains(SELECTED_MARKER), "{text}");
+        assert!(!text.contains("COMMANDS"), "no uppercase eyebrow: {text}");
+    }
+
+    #[test]
+    fn selected_row_is_marked_not_filled() {
+        let palette = filtered("");
+        let text = render_text(&palette, 50, 20);
+        let selected_line = text
+            .lines()
+            .find(|line| line.contains("Open file"))
+            .expect("open file row");
+        assert!(
+            selected_line.contains(&format!("{SELECTED_MARKER} Open file")),
+            "{text}"
+        );
     }
 
     #[test]
@@ -500,12 +744,7 @@ mod tests {
     #[test]
     fn closed_palette_draws_nothing() {
         let palette = Palette::new();
-        let backend = TestBackend::new(40, 12);
-        let mut terminal = Terminal::new(backend).expect("test backend");
-        terminal
-            .draw(|frame| render(frame, frame.area(), &palette))
-            .expect("draw closed palette");
-        let text = buffer_text(terminal.backend().buffer());
-        assert!(!text.contains("COMMANDS"), "{text}");
+        let text = render_text(&palette, 40, 12);
+        assert!(!text.contains("Open file"), "{text}");
     }
 }

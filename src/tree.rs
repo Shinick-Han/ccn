@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::status::FileChange;
-use crate::theme::palette;
+use crate::theme::{palette, Palette};
 
 /// What a key press asked the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,23 +512,24 @@ impl Tree {
     /// Draw the tree into `area`. `focused` swaps the border and adds the same
     /// accent marker the dashboard's file table uses.
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+        let pal = palette();
         let title = Line::from(vec![
             Span::styled(
                 if focused { "▌" } else { " " },
-                Style::default().fg(palette().accent),
+                Style::default().fg(pal.accent),
             ),
             Span::styled(
                 format!(" Files ({}) ", self.total_files),
-                Style::default().fg(palette().muted),
+                Style::default().fg(pal.muted),
             ),
         ]);
         let block = Block::default()
             .borders(Borders::ALL)
-            .style(Style::default().bg(palette().card))
+            .style(Style::default().bg(pal.card))
             .border_style(Style::default().fg(if focused {
-                palette().border_focus
+                pal.border_focus
             } else {
-                palette().border
+                pal.border
             }))
             .title(title);
         let inner = block.inner(area);
@@ -539,11 +540,8 @@ impl Tree {
 
         if self.rows.is_empty() {
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "no files",
-                    Style::default().fg(palette().muted),
-                ))
-                .style(Style::default().bg(palette().card)),
+                Paragraph::new(Span::styled("no files", Style::default().fg(pal.muted)))
+                    .style(Style::default().bg(pal.card)),
                 inner,
             );
             return;
@@ -552,6 +550,86 @@ impl Tree {
         let width = inner.width as usize;
         let header_height = usize::from(inner.height >= 2);
         let rows_height = (inner.height as usize).saturating_sub(header_height);
+        self.scroll_to_selection(rows_height);
+
+        let mut lines: Vec<Line> = Vec::with_capacity(rows_height + header_height);
+
+        if header_height == 1 {
+            let path = self.selected_path().unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                truncate_right(path, width),
+                Style::default().fg(pal.muted).add_modifier(Modifier::DIM),
+            )));
+        }
+        lines.extend(self.row_lines(width, rows_height, None, pal));
+
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(pal.card)),
+            inner,
+        );
+    }
+
+    /// Draw the tree as a borderless navigation rail.
+    ///
+    /// The caller owns the tab header (`Files | Functions`) and any surrounding
+    /// chrome, so this method paints rows only: no `Block`, no border and no
+    /// in-widget title. The rows, indentation, expansion markers and change
+    /// markers are identical to [`Tree::render`], clipped to `area`.
+    ///
+    /// Focus replaces the border: a focused rail reserves the first column for a
+    /// one-column `▌` marker on the selected row. The marker is a glyph, not a
+    /// colour, so it stays visible under `NO_COLOR`.
+    pub fn render_rail(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let pal = palette();
+        let width = area.width as usize;
+        let rows_height = area.height as usize;
+        self.scroll_to_selection(rows_height);
+
+        if self.rows.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled("no files", Style::default().fg(pal.muted))),
+                area,
+            );
+            return;
+        }
+
+        let lines = self.row_lines(width, rows_height, Some(focused), pal);
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Hit-test a click inside a rail drawn by [`Tree::render_rail`].
+    ///
+    /// Unlike [`Tree::click`], rail rows start at the top edge of `area`: there
+    /// is no border and no in-widget header, because the caller draws the tab
+    /// header. The current scroll offset is used, exactly as for rendering.
+    pub fn click_rail(&mut self, column: u16, row: u16, area: Rect) -> TreeAction {
+        if column < area.x
+            || column >= area.right()
+            || row < area.y
+            || row >= area.bottom()
+            || area.width == 0
+            || area.height == 0
+        {
+            return TreeAction::None;
+        }
+        let index = self.offset + usize::from(row - area.y);
+        let Some(tree_row) = self.rows.get(index) else {
+            return TreeAction::None;
+        };
+        self.selected = index;
+        if tree_row.is_dir {
+            self.toggle();
+            TreeAction::None
+        } else {
+            TreeAction::Open(PathBuf::from(&tree_row.path))
+        }
+    }
+
+    /// Keep the selected row inside a viewport of `rows_height` rows.
+    fn scroll_to_selection(&mut self, rows_height: usize) {
         self.clamp_selection();
 
         if self.selected < self.offset {
@@ -564,20 +642,26 @@ impl Tree {
         if self.offset > max_offset {
             self.offset = max_offset;
         }
+    }
 
-        let mut lines: Vec<Line> = Vec::with_capacity(rows_height + header_height);
-
-        if header_height == 1 {
-            let path = self.selected_path().unwrap_or_default();
-            lines.push(Line::from(Span::styled(
-                truncate_right(path, width),
-                Style::default()
-                    .fg(palette().muted)
-                    .add_modifier(Modifier::DIM),
-            )));
-        }
-
+    /// Build the visible row lines.
+    ///
+    /// `rail` is `None` for the bordered [`Tree::render`] and `Some(focused)`
+    /// for [`Tree::render_rail`]; a rail reserves one leading column for the
+    /// selection marker. `width` is the full drawable width in both modes.
+    fn row_lines(
+        &self,
+        width: usize,
+        rows_height: usize,
+        rail: Option<bool>,
+        pal: Palette,
+    ) -> Vec<Line<'static>> {
+        let lead = rail.is_some();
+        let focused = rail.unwrap_or(false);
+        let content_width = if lead { width.saturating_sub(1) } else { width };
+        let mut lines = Vec::with_capacity(rows_height);
         let end = (self.offset + rows_height).min(self.rows.len());
+
         for position in self.offset..end {
             let row = &self.rows[position];
             let selected = position == self.selected;
@@ -607,43 +691,47 @@ impl Tree {
 
             let prefix_width = prefix.chars().count();
             let suffix_width = suffix.chars().count();
-            let name_width = width
+            let name_width = content_width
                 .saturating_sub(prefix_width)
                 .saturating_sub(suffix_width);
             let name = truncate_right(&row.name, name_width);
 
             let base = if selected {
-                Style::default().fg(palette().text).bg(palette().pill)
+                Style::default().fg(pal.text).bg(pal.pill)
             } else if row.is_dir {
-                Style::default()
-                    .fg(palette().muted)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(pal.muted).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(palette().text)
+                Style::default().fg(pal.text)
             };
             let marker_style = match marker_color {
-                Some(color) if selected => Style::default().fg(color).bg(palette().pill),
+                Some(color) if selected => Style::default().fg(color).bg(pal.pill),
                 Some(color) => Style::default().fg(color),
                 None => base,
             };
 
             let used = prefix_width + name.chars().count() + suffix_width;
-            let fill = width.saturating_sub(used);
-            let mut spans = vec![
-                Span::styled(prefix, marker_style),
-                Span::styled(format!("{name}{suffix}"), base),
-            ];
+            let fill = content_width.saturating_sub(used);
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+            if lead {
+                // A glyph, not a colour: this survives the monochrome palette.
+                let (symbol, style) = if selected && focused {
+                    ("▌", Style::default().fg(pal.accent).bg(pal.pill))
+                } else if selected {
+                    (" ", Style::default().fg(pal.text).bg(pal.pill))
+                } else {
+                    (" ", Style::default())
+                };
+                spans.push(Span::styled(symbol, style));
+            }
+            spans.push(Span::styled(prefix, marker_style));
+            spans.push(Span::styled(format!("{name}{suffix}"), base));
             if selected && fill > 0 {
                 // The pill must cover the whole row, not just the text.
                 spans.push(Span::styled(" ".repeat(fill), base));
             }
             lines.push(Line::from(spans));
         }
-
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(palette().card)),
-            inner,
-        );
+        lines
     }
 }
 
@@ -1033,6 +1121,112 @@ mod tests {
         tree.restore_expanded(&[]);
         assert!(tree.collapsed().is_empty());
         assert!(!paths(&tree).is_empty());
+    }
+
+    #[test]
+    fn rail_renders_rows_without_border_or_title_at_28x20() {
+        let mut tree = tree();
+        let backend = TestBackend::new(28, 20);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| tree.render_rail(frame, frame.area(), true))
+            .expect("draw rail");
+        let buffer = terminal.backend().buffer();
+        let text = buffer_text(buffer);
+
+        assert_eq!(text.lines().count(), 20);
+        assert!(
+            !text.contains("Files ("),
+            "the caller owns the title: {text}"
+        );
+        for border in ['┌', '┐', '└', '┘', '─', '│', '╭', '╮', '╰', '╯'] {
+            assert!(
+                !text.contains(border),
+                "rail must not draw {border:?}: {text}"
+            );
+        }
+
+        // Rows start at the top edge, with the same labels as `render`.
+        let first_row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(first_row.contains("▾ src"), "{first_row:?}");
+        assert!(text.contains("a.cpp"), "{text}");
+        assert!(text.contains("b.c"), "{text}");
+        assert!(text.contains("top.c"), "{text}");
+    }
+
+    #[test]
+    fn rail_selected_marker_is_a_glyph_in_monochrome() {
+        let mut tree = tree();
+        // The monochrome palette turns every colour into `Reset`, so the
+        // selection marker can only be visible as a glyph.
+        let mono = crate::theme::palette_from(true);
+        let lines = tree.row_lines(24, 5, Some(true), mono);
+        let first: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(first.starts_with('▌'), "mono selection marker: {first:?}");
+
+        let backend = TestBackend::new(24, 5);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| tree.render_rail(frame, frame.area(), true))
+            .expect("draw mono rail");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "▌");
+        let selected_row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(selected_row.contains("src"), "{selected_row:?}");
+
+        // Without focus the borderless rail still has no border, and the
+        // marker column is blank rather than accented.
+        let lines = tree.row_lines(24, 5, Some(false), mono);
+        let first: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(first.starts_with(' '), "unfocused rail: {first:?}");
+    }
+
+    #[test]
+    fn rail_is_safe_at_one_by_one_and_zero_by_zero() {
+        let mut tree = tree();
+        let backend = TestBackend::new(4, 4);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| {
+                tree.render_rail(frame, Rect::new(0, 0, 1, 1), true);
+                tree.render_rail(frame, Rect::new(0, 0, 0, 0), true);
+            })
+            .expect("tiny rail areas must not panic");
+
+        let mut empty = Tree::new(Vec::<String>::new());
+        terminal
+            .draw(|frame| {
+                empty.render_rail(frame, Rect::new(0, 0, 1, 1), true);
+                empty.render_rail(frame, Rect::new(0, 0, 0, 0), true);
+            })
+            .expect("tiny empty rail areas must not panic");
+    }
+
+    #[test]
+    fn rail_click_uses_the_unbordered_row_grid() {
+        let mut tree = tree();
+        let area = Rect::new(2, 0, 20, 6);
+        // Row 0 is `src`, row 3 is `src/a.cpp`.
+        assert_eq!(
+            tree.click_rail(3, 3, area),
+            TreeAction::Open("src/a.cpp".into())
+        );
+        assert_eq!(tree.selected_path(), Some("src/a.cpp"));
+        // Outside the rail, nothing happens.
+        assert_eq!(tree.click_rail(1, 3, area), TreeAction::None);
+        assert_eq!(tree.click_rail(3, 6, area), TreeAction::None);
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {

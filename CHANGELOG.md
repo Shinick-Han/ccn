@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.26.0 (2026-10-23)
+
+Calm, editor-first workbench.
+
+- The workbench shell is now one editor + one `Files | Functions` rail + one
+  status line. The 3-row header, 2-row footer and editor/sidebar borders are
+  gone. The editor keeps the full width at 80 columns; the 28-column rail floats
+  on demand below 100 columns and pins above that.
+- `F8` toggles the rail, `F9` focuses Functions, `Tab` switches tabs while the
+  rail is focused, `Alt+W` switches focus and `Alt+Z` remains fullscreen. Mouse
+  clicks work on rail tabs, files, functions and the editor.
+- `Ctrl+P` is no longer intercepted; it goes to Neovim. `F5` is the single
+  command/search entry and now includes Open file, workspace search, Functions,
+  Explain CCN, overview, rail/fullscreen toggles, review and diagnostics.
+- Overlay headers use one consistent `Title · context · Esc close` line, with a
+  `▌` selection marker that survives `NO_COLOR`.
+- Overview puts the file table first (62%) with charts and the selected-file
+  inspector as a secondary 38% column; its header is one line.
+- 750 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; rail layout,
+  80×24/120×30 and colour-independent selection covered.
+
 ## 0.25.0 (2026-10-23)
 
 Editor-first entry point.
