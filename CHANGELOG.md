@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.22.0 (2026-10-22)
+
+Configuration and workspace search.
+
+- `.ccn.toml` per-repo configuration for `editor`, `baseline`, and `keymap`
+  (`simple`/`advanced`); CLI flags take precedence. Parser is dependency-free
+  and malformed files fall back to defaults. See `docs/config.md`.
+- `Alt+F` opens workspace text search over measured source files; results show
+  `path:line`, Enter opens the file as a tab and jumps to the line.
+- 711 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; WSL+tmux
+  verified workspace search.
+
 ## 0.21.0 (2026-10-22)
 
 Workspace awareness and Explain CCN.

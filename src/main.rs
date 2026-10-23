@@ -50,7 +50,7 @@ fn main() {
         std::process::exit(code);
     }
 
-    let cli = ccn::cli::Cli::parse();
+    let mut cli = ccn::cli::Cli::parse();
 
     // Usage checks run before the scan and before any output, so a bad
     // invocation cannot print half a document and then fail.
@@ -67,6 +67,27 @@ fn main() {
         usage_error(format_args!(
             "--sarif - cannot be combined with --json or --report-json: both write a document to stdout"
         ));
+    }
+
+    // Repository defaults from `<root>/.ccn.toml`. This is applied after the
+    // usage checks and only where the command line stayed at its default, so
+    // the CLI always wins. A missing or malformed file is silently ignored.
+    let config = ccn::config::load(&cli.path);
+    if cli.editor == "nvim" {
+        // `nvim` is clap's default, so an explicit `--editor nvim` is
+        // indistinguishable from "not given"; the config wins in both cases.
+        if let Some(editor) = config.editor {
+            cli.editor = editor;
+        }
+    }
+    if cli.baseline.is_none() {
+        cli.baseline = config.baseline;
+    }
+    if std::env::var_os("CCN_KEYMAP").is_none() && config.keymap.as_deref() == Some("advanced") {
+        // The dashboard reads this variable at startup; the environment is
+        // the only channel and an explicit variable already set by the caller
+        // must keep precedence over the file.
+        std::env::set_var("CCN_KEYMAP", "advanced");
     }
 
     let mut result = match ccn::loc::scan(&cli.scan_options()) {

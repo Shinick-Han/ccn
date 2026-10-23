@@ -67,9 +67,12 @@ implementation; the public entry point is `ccn workbench` (single file) and
 - The dashboard header shows the git branch when available (Perforce shows the
   backend label without blocking startup on network commands).
 - `Alt+O` opens the current-file symbol palette; fuzzy-match a function and
-  Enter jumps to it. The function sidebar is display-only for navigation:
+  Enter jumps to it. `Alt+F` searches workspace text and opens the selected
+  `path:line` in a tab. The function sidebar is display-only for navigation:
   click a function row to jump, or use Alt+O. `F9` remains an advanced focus
   alias for compatibility.
+- `.ccn.toml` can set `editor`, `baseline`, and `keymap`; CLI flags win. See
+  [`docs/config.md`](config.md).
 - The header shows the selected function's breadcrumb
   (`namespace > class > function(params)`), derived from the stable identity.
   The embedded editor remains the only place that performs edits.

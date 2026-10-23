@@ -61,7 +61,7 @@ $ ccn workbench file.c --editor nvim
 $ ccn . --tui   # press e on a file to open it here
 ```
 
-Requirements: `nvim` on `PATH` or `--editor <path>`. In the dashboard, `e` opens the selected file in a **split view**: a collapsible file tree on the left, Neovim and the live function sidebar on the right. Drag the divider with the mouse to resize the panes. The primary keys are deliberately few: `j/k` move, `/` filter, `e` edit, `Ctrl+P` open by name, `F5` command palette, `F6` baseline review (`d` opens the line diff, `s` side-by-side, `x` reviewed), `F7` diagnostics, `Alt+W` panes, `Alt+O` function search, `Alt+E` explain CCN, `F10` dashboard, `?` help, and `q` quit. The first `q`/`Esc`/`Ctrl+C` on a live editor asks for confirmation; press `q` or `Ctrl+C` again to discard. The nvim session, open buffers, split ratio, and dashboard selection are restored on the next run. Clipboard paste uses bracketed paste; mouse reporting is enabled only in the split (use Shift+drag for normal terminal selection/copy). In the split, click a file in the tree to open it and click either pane to focus it; the divider is draggable. Tree rows show Git/P4 change markers and `c` toggles changed-files-only. Use `Alt+O` (or click a function row) to jump to a function in the current file. The embedded editor is real Neovim; line numbers are enabled by default (`:set nonumber` to turn them off). The review panel needs a baseline run: `ccn . --tui --baseline <rev>`.
+Requirements: `nvim` on `PATH` or `--editor <path>`. In the dashboard, `e` opens the selected file in a **split view**: a collapsible file tree on the left, Neovim and the live function sidebar on the right. Drag the divider with the mouse to resize the panes. The primary keys are deliberately few: `j/k` move, `/` filter, `e` edit, `Ctrl+P` open by name, `F5` command palette, `F6` baseline review (`d` opens the line diff, `s` side-by-side, `x` reviewed), `F7` diagnostics, `Alt+W` panes, `Alt+O` function search, `Alt+F` workspace search, `Alt+E` explain CCN, `F10` dashboard, `?` help, and `q` quit. The first `q`/`Esc`/`Ctrl+C` on a live editor asks for confirmation; press `q` or `Ctrl+C` again to discard. The nvim session, open buffers, split ratio, and dashboard selection are restored on the next run. Clipboard paste uses bracketed paste; mouse reporting is enabled only in the split (use Shift+drag for normal terminal selection/copy). In the split, click a file in the tree to open it and click either pane to focus it; the divider is draggable. Tree rows show Git/P4 change markers and `c` toggles changed-files-only. Use `Alt+O` (or click a function row) to jump to a function in the current file. The embedded editor is real Neovim; line numbers are enabled by default (`:set nonumber` to turn them off). The review panel needs a baseline run: `ccn . --tui --baseline <rev>`.
 
 Advanced keys still work but are not shown in the footer: `F8`/`Ctrl+Shift+E` pane switch (compatibility), `F9` function sidebar, `F2`/`F3` previous/next tab, `F4` close tab, `[`/`]` resize from the file pane, `Tab` chart tab, `s`/`S` sort key/direction, `g`/`G` first/last. Set `CCN_KEYMAP=advanced` to show the advanced section in `?`. On AlmaLinux/RHEL 8 use
 the EPEL `neovim` (0.8 works; the official Neovim Linux tarball requires glibc
@@ -327,6 +327,13 @@ The default lookup trusts mtime+size. On a gate or an NFS checkout — where mti
 can be restored, coarse, or rewritten by a copy — pass `--verify-cache` to hash
 the file contents before reusing an entry. It costs more per file but cannot
 serve a stale measurement as the candidate's.
+
+## Configuration
+
+An optional `.ccn.toml` in the scanned directory can set the dashboard `editor`,
+a default `baseline`, and the `keymap` (`simple`/`advanced`). The command line
+always wins; a missing or malformed file is ignored. See
+[`docs/config.md`](docs/config.md).
 
 ## Design decisions that are not obvious
 

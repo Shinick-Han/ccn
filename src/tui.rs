@@ -38,6 +38,8 @@ use crate::palette::{Palette, PaletteAction};
 #[cfg(feature = "workbench")]
 use crate::review::ReviewQueue;
 #[cfg(feature = "workbench")]
+use crate::search::SearchState;
+#[cfg(feature = "workbench")]
 use crate::symbols::SymbolPalette;
 #[cfg(feature = "workbench")]
 use crate::tree::{Tree, TreeAction};
@@ -404,6 +406,8 @@ pub fn run_unified(
     #[cfg(feature = "workbench")]
     let mut symbols = SymbolPalette::new();
     #[cfg(feature = "workbench")]
+    let mut search = SearchState::new();
+    #[cfg(feature = "workbench")]
     let mut review_current_only = false;
     #[cfg(feature = "workbench")]
     let mut tree_state: Option<Tree> = None;
@@ -752,6 +756,9 @@ pub fn run_unified(
                                         true,
                                     );
                                 }
+                                if search.is_open() {
+                                    crate::search::render(frame, frame.area(), &search);
+                                }
                                 crate::palette::render(frame, frame.area(), &palette);
                             })?;
                             if !event::poll(Duration::from_millis(16))? {
@@ -928,6 +935,48 @@ pub fn run_unified(
                                         && matches!(key.code, KeyCode::Char('e' | 'E'))
                                     {
                                         explanation = build_explanation(session);
+                                        review = None;
+                                        diff = None;
+                                        diagnostics = None;
+                                        fuzzy.close();
+                                        continue;
+                                    }
+                                    if search.is_open() {
+                                        match key.code {
+                                            KeyCode::Esc => search.close(),
+                                            KeyCode::Up => search.move_selection(-1),
+                                            KeyCode::Down => search.move_selection(1),
+                                            KeyCode::Backspace => {
+                                                search.backspace(&result.root, &fuzzy_paths)
+                                            }
+                                            KeyCode::Enter => {
+                                                if let Some(item) = search.selected().cloned() {
+                                                    search.close();
+                                                    let target =
+                                                        Path::new(&result.root).join(&item.path);
+                                                    if let Err(error) = session.open_file(&target) {
+                                                        session.note(error);
+                                                    } else {
+                                                        session.jump_line(item.line);
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Char(ch)
+                                                if !key
+                                                    .modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                search.type_char(ch, &result.root, &fuzzy_paths)
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if key.modifiers.contains(KeyModifiers::ALT)
+                                        && matches!(key.code, KeyCode::Char('f' | 'F'))
+                                    {
+                                        search.open();
+                                        explanation = None;
                                         review = None;
                                         diff = None;
                                         diagnostics = None;
@@ -2763,6 +2812,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("F7", "diagnostics"),
                 ("Alt+W", "files / editor panes"),
                 ("Alt+O", "search functions in this file"),
+                ("Alt+F", "search workspace text"),
                 ("F10", "back to the dashboard"),
             ],
         ),
