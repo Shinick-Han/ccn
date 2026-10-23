@@ -37,6 +37,9 @@ implementation; the public entry point is `ccn workbench` (single file) and
 - Focus model: editor by default. `F9` toggles sidebar; `j/k`, `g/G` move,
   `r` rescans, `F9`/`Esc` returns. While the editor is focused, every key
   except `F9`/`F10` and the tab keys goes to Neovim.
+- `ccn . --tui` enters the editor-first split view: it restores the last active
+  tab or opens the first measured file. F10 shows the dashboard;
+  `--tui --dashboard` preserves the old dashboard-first entry point.
 - Split navigation: the left pane is a collapsible directory tree (`j/k`,
   `g/G`, `Enter`/Space toggles a directory, `e`/`Enter` opens a file). `F8`
   switches tree/editor focus; `[`/`]` or dragging the divider changes the

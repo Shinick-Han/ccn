@@ -140,6 +140,7 @@ fn main() {
             cli.hotspots,
             cli.history_limit,
             &cli.editor,
+            !cli.dashboard,
         ) {
             Ok(()) => tui_handled = true,
             Err(e) => {

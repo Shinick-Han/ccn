@@ -387,6 +387,26 @@ fn build_explanation(session: &crate::workbench::WorkbenchSession) -> Option<Exp
     ))
 }
 
+/// Pick the file the editor-first flow should open. Prefer the restored active
+/// tab, then any restored tab, then the first measured file. The path is
+/// scan-relative, matching `TuiAction::Edit`.
+#[cfg(feature = "workbench")]
+fn startup_editor_file(result: &ScanResult, saved: &crate::session::Session) -> Option<PathBuf> {
+    let root = Path::new(&result.root);
+    let (open_files, active_file) = crate::session::restore_order(saved);
+    for relative in active_file.into_iter().chain(open_files) {
+        if root.join(&relative).is_file() {
+            return Some(PathBuf::from(relative));
+        }
+    }
+    result
+        .files
+        .iter()
+        .find(|file| file.ccn.is_some())
+        .or_else(|| result.files.first())
+        .map(|file| PathBuf::from(&file.path))
+}
+
 /// Run the dashboard and workbench in one terminal and one event loop.
 ///
 /// The dashboard is rebuilt after a workbench session so the scan/report and
@@ -399,6 +419,7 @@ pub fn run_unified(
     hotspots: bool,
     history_limit: u32,
     editor: &str,
+    start_in_editor: bool,
 ) -> io::Result<()> {
     if !is_interactive() {
         return Err(io::Error::other(
@@ -406,7 +427,7 @@ pub fn run_unified(
         ));
     }
     #[cfg(not(feature = "workbench"))]
-    let _ = (options, hotspots, history_limit, editor);
+    let _ = (options, hotspots, history_limit, editor, start_in_editor);
 
     let mut guard = TerminalGuard::enter()?;
     #[cfg(feature = "workbench")]
@@ -465,9 +486,24 @@ pub fn run_unified(
     // root. Computed once: exiting saves a session, so later App instances in
     // the same process keep showing the hint until the run ends.
     let first_run = !crate::session::exists(&result.root);
+    #[cfg(feature = "workbench")]
+    let mut startup_edit = if start_in_editor {
+        startup_editor_file(result, &saved)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "workbench"))]
+    let mut startup_edit: Option<PathBuf> = None;
 
     loop {
-        let (action, state) = {
+        let (action, state) = if let Some(path) = startup_edit.take() {
+            (
+                TuiAction::Edit(path),
+                dashboard_state
+                    .clone()
+                    .expect("editor-first requires dashboard state"),
+            )
+        } else {
             let mut app = App::new(result, report);
             app.first_run = first_run;
             if let Some(state) = &dashboard_state {
@@ -3546,6 +3582,16 @@ mod tests {
 
         assert_eq!(split_ratio_from_x(0, 140), 20);
         assert_eq!(split_ratio_from_x(140, 140), 70);
+    }
+
+    #[test]
+    #[cfg(feature = "workbench")]
+    fn editor_first_opens_the_first_measured_file_without_a_session() {
+        let (result, _) = fixture();
+        let path = startup_editor_file(&result, &crate::session::Session::default())
+            .expect("a startup file");
+        assert_eq!(path, PathBuf::from(&result.files[0].path));
+        assert!(result.files[0].ccn.is_some());
     }
 
     #[test]

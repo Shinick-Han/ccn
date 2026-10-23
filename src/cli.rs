@@ -9,7 +9,7 @@ use clap::Parser;
     version,
     about,
     long_about = None,
-    after_help = "Run `ccn workbench <file>` for the embedded-Neovim workbench.\nRun `ccn . --tui` for the file dashboard; press `e` there to open the workbench."
+    after_help = "Run `ccn workbench <file>` for the embedded-Neovim workbench.\nRun `ccn . --tui` to open the editor first; F10 shows the file dashboard.\nUse `ccn . --tui --dashboard` to start on the dashboard instead."
 )]
 pub struct Cli {
     /// Directory to scan.
@@ -169,9 +169,13 @@ pub struct Cli {
     #[arg(long)]
     pub open: bool,
 
-    /// Open the interactive terminal dashboard instead of printing the summary.
+    /// Open the interactive terminal UI instead of printing the summary.
     #[arg(long, conflicts_with_all = ["json", "report_json", "ci", "view"])]
     pub tui: bool,
+
+    /// Start on the file dashboard instead of opening the editor first.
+    #[arg(long)]
+    pub dashboard: bool,
 
     /// Editor command used by the dashboard's `e` key (default: nvim).
     #[arg(long, default_value = "nvim")]
@@ -383,6 +387,10 @@ mod tests {
         assert!(Cli::try_parse_from(["ccn", "--tui", "--json"]).is_err());
         assert!(Cli::try_parse_from(["ccn", "--tui", "--ci"]).is_err());
         assert!(Cli::try_parse_from(["ccn", "--tui", "--view"]).is_err());
+
+        let cli = Cli::parse_from(["ccn", "--tui", "--dashboard"]);
+        assert!(cli.tui && cli.dashboard);
+        assert!(!Cli::parse_from(["ccn", "--tui"]).dashboard);
     }
 
     #[test]

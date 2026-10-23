@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.25.0 (2026-10-23)
+
+Editor-first entry point.
+
+- `ccn . --tui` now opens the editor split immediately, restoring the last
+  active tab or opening the first measured file. `F10` still opens the
+  dashboard.
+- `ccn . --tui --dashboard` keeps the previous dashboard-first workflow.
+- The editor-first transition reuses the saved tab order, split ratio, tree
+  state, and function sidebar; it does not start a second Neovim process.
+- 727 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; startup file
+  selection and fullscreen/split layouts have unit coverage.
+
 ## 0.24.0 (2026-10-23)
 
 Editor fullscreen.
