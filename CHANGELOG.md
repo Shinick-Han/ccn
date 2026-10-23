@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.27.0 (2026-10-23)
+
+Zero-config LSP and build/test tasks.
+
+- The embedded Neovim now attaches `ccn lsp` automatically for supported
+  filetypes via a one-line Lua command. `lsp = "off"` disables it. No user Lua
+  is required.
+- `F5` includes **Build**, **Test**, **Run last task** and **Run task...** for
+  any named task. It auto-detects Cargo, CMake, Make, Meson and package.json
+  scripts, or uses `task.*` entries from `.ccn.toml`.
+- Tasks run on a worker thread; output is captured in an overlay with
+  scrolling, error selection, `Enter` jump to `file:line`, `r` rerun and
+  `Esc` detach. GCC/Clang, MSVC and Rust/Cargo diagnostics are parsed.
+- `.ccn.toml` gains `lsp = "auto"|"off"` and `task.<name> = "command"`.
+- 812 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; LSP process
+  attachment and a real Cargo build task verified in a native PTY.
+
 ## 0.26.1 (2026-10-23)
 
 Daily-driver hardening.

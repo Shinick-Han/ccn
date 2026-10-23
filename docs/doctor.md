@@ -48,7 +48,7 @@ P4 commands.
 
 ```json
 {
-  "version": "0.26.1",
+  "version": "0.27.0",
   "path": ".",
   "checks": [
     { "name": "nvim", "status": "ok", "detail": "found: NVIM v0.10.4" }

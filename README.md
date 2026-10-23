@@ -71,7 +71,8 @@ line. At 80 columns the rail floats on demand and the editor keeps the full
 width; at 100+ columns it pins to 28 columns. `F8` toggles the rail, `F9`
 focuses Functions, `Alt+W` switches focus, `Alt+Z` is editor fullscreen and
 `F10` opens Overview. `F5` is the single command/search entry (open file,
-workspace text, functions, Explain CCN, review, diagnostics, fullscreen).
+Build/Test tasks, workspace text, functions, Explain CCN, review, diagnostics,
+fullscreen).
 `Ctrl+P` is deliberately left to Neovim. `F6` review and `F7` diagnostics
 stay direct. In Overview, `e` opens the selected file in the editor. The first
 `q`/`Esc`/`Ctrl+C` on a live editor asks for confirmation; press it again to
@@ -359,9 +360,10 @@ serve a stale measurement as the candidate's.
 ## Configuration
 
 An optional `.ccn.toml` in the scanned directory can set the dashboard `editor`,
-a default `baseline`, and the `keymap` (`simple`/`advanced`). The command line
-always wins; a missing or malformed file is ignored. See
-[`docs/config.md`](docs/config.md).
+a default `baseline`, the `keymap` (`simple`/`advanced`), the `lsp` mode
+(`auto`/`off`), and named `task.*` commands (`task.build = "cargo build"`). The
+command line always wins where it overlaps; a missing or malformed file falls
+back to the defaults. See [`docs/config.md`](docs/config.md).
 
 ## Setup and diagnostics
 
@@ -377,6 +379,11 @@ $ ccn update --apply      # update a global npm install
 `nvim`) and `0` with warnings otherwise. The update command never overwrites a
 native binary; it prints the release asset and replacement steps. See
 [`docs/doctor.md`](docs/doctor.md).
+
+The embedded workbench attaches `ccn lsp` automatically; `lsp = "off"` disables
+it. Build/Test tasks are detected from Cargo, CMake, Make, Meson and
+`package.json`, or declared with `task.*`; see [`docs/tasks.md`](docs/tasks.md).
+Output opens in an overlay and compiler errors jump to `file:line`.
 
 ## Design decisions that are not obvious
 

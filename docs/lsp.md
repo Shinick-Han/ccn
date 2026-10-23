@@ -79,6 +79,13 @@ setup for an npm install.
 real Neovim process, so it can start the same client with the same config; the
 server needs no workbench feature and no workbench state.
 
+The embedded workbench attaches the client automatically: it passes a
+single-line Lua `-c` command to Neovim that starts `ccn lsp` for supported
+filetypes, using the absolute path of the running executable and
+`root_dir = vim.fn.getcwd()`. No user Lua is required. Set `lsp = "off"` in
+`.ccn.toml` to disable this. `ccn setup nvim` remains available for ordinary
+(non-embedded) Neovim installs.
+
 ## Troubleshooting
 
 - **Nothing happens in the terminal** — expected: the server waits on stdin.

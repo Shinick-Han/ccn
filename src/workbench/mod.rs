@@ -941,6 +941,22 @@ fn apply_editor_defaults(program: &str, args: &mut Vec<String>) {
         args.push("set number".to_string());
     }
 }
+
+/// `-c` arguments that auto-start `ccn lsp` in a Neovim editor.
+///
+/// Returns nothing for non-Neovim editors, when `lsp = "off"` is configured, or
+/// when the current executable cannot be resolved. The generated Lua is
+/// single-line and pcall-guarded, so a missing or broken server cannot stop the
+/// editor from opening.
+fn lsp_editor_args(program: &str, target: &Path) -> Vec<String> {
+    if !rpc::is_nvim_program(program) || crate::embedded_lsp::lsp_disabled(target) {
+        return Vec::new();
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    vec!["-c".to_string(), crate::embedded_lsp::lua_command(&exe)]
+}
 fn native_path(path: &Path) -> String {
     let text = path.display().to_string();
     text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
@@ -1049,6 +1065,7 @@ impl WorkbenchSession {
         }
         apply_editor_defaults(&program, &mut editor_args);
         editor_args.push(native_path(&target));
+        editor_args.extend(lsp_editor_args(&program, &target));
         let child = Pty::spawn(
             &program,
             &editor_args,
@@ -2164,6 +2181,20 @@ mod tests {
         // F9/F10 are owned by the workbench, not forwarded.
         assert!(encode_key(&press(KeyCode::F(9))).is_none());
         assert!(encode_key(&press(KeyCode::F(10))).is_none());
+    }
+
+    #[test]
+    fn lsp_args_are_only_added_for_neovim() {
+        let target = Path::new("src/main.rs");
+        let args = lsp_editor_args("nvim", target);
+        assert_eq!(args.len(), 2, "nvim gets -c <lua>");
+        assert_eq!(args[0], "-c");
+        assert!(args[1].starts_with("lua "));
+        assert!(args[1].contains("vim.lsp.start"));
+
+        // A fake editor must keep its original argument list.
+        assert!(lsp_editor_args("cat", target).is_empty());
+        assert!(lsp_editor_args("sh", target).is_empty());
     }
 
     #[test]

@@ -42,6 +42,8 @@ use crate::search::SearchState;
 #[cfg(feature = "workbench")]
 use crate::symbols::SymbolPalette;
 #[cfg(feature = "workbench")]
+use crate::tasks::{TaskAction, TaskKind, TaskState};
+#[cfg(feature = "workbench")]
 use crate::tree::{Tree, TreeAction};
 use crossterm::cursor::{Hide, Show};
 #[cfg(feature = "workbench")]
@@ -272,6 +274,64 @@ fn render_rail_tabs(
         Paragraph::new(line).style(Style::default().bg(pal.canvas)),
         Rect::new(area.x, area.y, area.width, 1),
     );
+}
+
+/// Pick a configured/auto-detected task when more than build/test are present.
+#[cfg(feature = "workbench")]
+fn render_task_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    tasks: &[crate::tasks::Task],
+    selected: usize,
+) {
+    if tasks.is_empty() || area.width < 24 || area.height < 6 {
+        return;
+    }
+    let width = area.width.saturating_sub(4).min(76);
+    let height = (tasks.len() as u16 + 3).min(area.height.saturating_sub(2));
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let pal = crate::theme::palette();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(pal.canvas))
+        .border_style(Style::default().fg(pal.border_focus))
+        .title(Line::from(Span::styled(
+            " Run task · Esc close ",
+            Style::default().fg(pal.accent),
+        )));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rows = tasks
+        .iter()
+        .enumerate()
+        .take(inner.height as usize)
+        .map(|(index, task)| {
+            let active = index == selected;
+            let marker = if active { "▌ " } else { "  " };
+            let style = if active {
+                Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(pal.text)
+            };
+            Line::from(vec![
+                Span::styled(marker, Style::default().fg(pal.accent)),
+                Span::styled(task.name.clone(), style),
+                Span::styled(
+                    format!("  {}", task.command),
+                    Style::default().fg(pal.muted),
+                ),
+            ])
+        });
+    frame.render_widget(Paragraph::new(rows.collect::<Vec<_>>()), inner);
 }
 
 /// Pane focus toggle. Alt+W is the advertised key because many terminals
@@ -840,6 +900,11 @@ pub fn run_unified(
                         tree.set_changes(&changes);
                         #[cfg(feature = "workbench")]
                         let fuzzy_paths = tree_paths(result);
+                        let task_config = crate::config::load(Path::new(&result.root));
+                        let task_catalog =
+                            crate::tasks::detect(Path::new(&result.root), &task_config);
+                        let mut task_state = TaskState::new();
+                        let mut task_picker: Option<usize> = None;
                         let mut focus = SplitFocus::Workbench;
                         let mut rail_tab = RailTab::Files;
                         let mut rail_visible = guard.terminal.size()?.width >= 100;
@@ -849,6 +914,7 @@ pub fn run_unified(
                         guard.set_mouse(true)?;
                         loop {
                             session.tick();
+                            task_state.poll();
                             session.app.split = true;
                             let size = guard.terminal.size()?;
                             let area = Rect::new(0, 0, size.width, size.height);
@@ -1019,6 +1085,18 @@ pub fn run_unified(
                                 if search.is_open() {
                                     crate::search::render(frame, frame.area(), &search);
                                 }
+                                if task_state.is_open() {
+                                    frame.render_widget(Clear, right);
+                                    crate::tasks::render(frame, right, &task_state);
+                                }
+                                if let Some(selected) = task_picker {
+                                    render_task_picker(
+                                        frame,
+                                        frame.area(),
+                                        &task_catalog,
+                                        selected,
+                                    );
+                                }
                                 crate::palette::render(frame, frame.area(), &palette);
                             })?;
                             if !event::poll(Duration::from_millis(16))? {
@@ -1050,6 +1128,68 @@ pub fn run_unified(
                                                     match action {
                                                         PaletteAction::OpenFilePicker => {
                                                             fuzzy.open(&fuzzy_paths)
+                                                        }
+                                                        PaletteAction::RunBuild => {
+                                                            if let Some(task) = task_catalog
+                                                                .iter()
+                                                                .find(|task| {
+                                                                    task.kind == TaskKind::Build
+                                                                })
+                                                                .cloned()
+                                                            {
+                                                                task_state.start(
+                                                                    task,
+                                                                    Path::new(&result.root),
+                                                                );
+                                                                review = None;
+                                                                diff = None;
+                                                                diagnostics = None;
+                                                                explanation = None;
+                                                            } else {
+                                                                session.note(
+                                                                    "no build task; add task.build to .ccn.toml",
+                                                                );
+                                                            }
+                                                        }
+                                                        PaletteAction::RunTest => {
+                                                            if let Some(task) = task_catalog
+                                                                .iter()
+                                                                .find(|task| {
+                                                                    task.kind == TaskKind::Test
+                                                                })
+                                                                .cloned()
+                                                            {
+                                                                task_state.start(
+                                                                    task,
+                                                                    Path::new(&result.root),
+                                                                );
+                                                                review = None;
+                                                                diff = None;
+                                                                diagnostics = None;
+                                                                explanation = None;
+                                                            } else {
+                                                                session.note(
+                                                                    "no test task; add task.test to .ccn.toml",
+                                                                );
+                                                            }
+                                                        }
+                                                        PaletteAction::RunLastTask => {
+                                                            if task_state.task().is_some() {
+                                                                task_state.rerun();
+                                                            } else {
+                                                                session.note(
+                                                                    "no task has run yet; choose Build or Test",
+                                                                );
+                                                            }
+                                                        }
+                                                        PaletteAction::ChooseTask => {
+                                                            if task_catalog.is_empty() {
+                                                                session.note(
+                                                                    "no tasks detected; add task.build to .ccn.toml",
+                                                                );
+                                                            } else {
+                                                                task_picker = Some(0);
+                                                            }
                                                         }
                                                         PaletteAction::ToggleReview => {
                                                             if let Some(base) =
@@ -1227,6 +1367,52 @@ pub fn run_unified(
                                             && matches!(key.code, KeyCode::Char('p' | 'P')))
                                     {
                                         palette.open();
+                                        continue;
+                                    }
+                                    if let Some(selected) = task_picker {
+                                        if key.code == KeyCode::F(10) {
+                                            break;
+                                        }
+                                        match key.code {
+                                            KeyCode::Esc => task_picker = None,
+                                            KeyCode::Char('j') | KeyCode::Down => {
+                                                task_picker = Some(
+                                                    (selected + 1)
+                                                        .min(task_catalog.len().saturating_sub(1)),
+                                                );
+                                            }
+                                            KeyCode::Char('k') | KeyCode::Up => {
+                                                task_picker = Some(selected.saturating_sub(1));
+                                            }
+                                            KeyCode::Enter => {
+                                                if let Some(task) =
+                                                    task_catalog.get(selected).cloned()
+                                                {
+                                                    task_state.start(task, Path::new(&result.root));
+                                                }
+                                                task_picker = None;
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if task_state.is_open() {
+                                        if key.code == KeyCode::F(10) {
+                                            break;
+                                        }
+                                        if let TaskAction::Jump { path, line } =
+                                            task_state.handle_key(key)
+                                        {
+                                            let target = Path::new(&result.root).join(&path);
+                                            let target =
+                                                std::fs::canonicalize(&target).unwrap_or(target);
+                                            if let Err(error) = session.open_file(&target) {
+                                                session.note(error);
+                                            } else {
+                                                session.jump_line(line);
+                                                focus = SplitFocus::Workbench;
+                                            }
+                                        }
                                         continue;
                                     }
                                     if explanation.is_some() {

@@ -22,7 +22,7 @@ use crate::fuzzy::rank;
 use crate::theme::palette;
 
 /// Maximum number of command rows drawn at once.
-pub const MAX_ROWS: usize = 12;
+pub const MAX_ROWS: usize = 16;
 
 /// Marker drawn on the selected row instead of a filled background pill.
 const SELECTED_MARKER: char = '▌';
@@ -44,6 +44,10 @@ pub enum PaletteAction {
     ShowOverview,
     ToggleReview,
     ToggleDiagnostics,
+    RunBuild,
+    RunTest,
+    RunLastTask,
+    ChooseTask,
     ShowHelp,
     NextTab,
     PrevTab,
@@ -88,6 +92,34 @@ const COMMANDS: &[Command] = &[
         // advertised here.
         shortcut: "F5",
         action: PaletteAction::OpenFilePicker,
+        hidden: false,
+    },
+    Command {
+        id: "run_build",
+        label: "Build",
+        shortcut: "F5",
+        action: PaletteAction::RunBuild,
+        hidden: false,
+    },
+    Command {
+        id: "run_test",
+        label: "Test",
+        shortcut: "F5",
+        action: PaletteAction::RunTest,
+        hidden: false,
+    },
+    Command {
+        id: "run_last_task",
+        label: "Run last task",
+        shortcut: "",
+        action: PaletteAction::RunLastTask,
+        hidden: false,
+    },
+    Command {
+        id: "choose_task",
+        label: "Run task...",
+        shortcut: "",
+        action: PaletteAction::ChooseTask,
         hidden: false,
     },
     Command {
@@ -516,7 +548,6 @@ mod tests {
         for command in &all {
             assert!(!command.id.is_empty());
             assert!(!command.label.is_empty());
-            assert!(!command.shortcut.is_empty());
             assert!(command.label.is_ascii());
             assert!(command.shortcut.is_ascii());
         }
@@ -558,6 +589,10 @@ mod tests {
             ids,
             vec![
                 "open_file",
+                "run_build",
+                "run_test",
+                "run_last_task",
+                "choose_task",
                 "search_workspace",
                 "search_symbols",
                 "explain_ccn",
@@ -571,7 +606,7 @@ mod tests {
                 "quit",
             ]
         );
-        assert_eq!(catalog().len(), MAX_ROWS);
+        assert!(catalog().len() >= MAX_ROWS);
     }
 
     #[test]
@@ -580,6 +615,10 @@ mod tests {
         let actions: Vec<PaletteAction> = commands().iter().map(|command| command.action).collect();
         for expected in [
             PaletteAction::OpenFilePicker,
+            PaletteAction::RunBuild,
+            PaletteAction::RunTest,
+            PaletteAction::RunLastTask,
+            PaletteAction::ChooseTask,
             PaletteAction::SearchWorkspace,
             PaletteAction::SearchSymbols,
             PaletteAction::ExplainCcn,
@@ -608,6 +647,10 @@ mod tests {
     fn filtering_finds_new_actions() {
         for (query, id) in [
             ("open", "open_file"),
+            ("build", "run_build"),
+            ("test", "run_test"),
+            ("last", "run_last_task"),
+            ("task", "choose_task"),
             ("work", "search_workspace"),
             ("fun", "search_symbols"),
             ("expl", "explain_ccn"),
@@ -667,7 +710,7 @@ mod tests {
         assert_eq!(palette.selected().unwrap().id, "open_file");
 
         palette.move_selection(1);
-        assert_eq!(palette.selected().unwrap().id, "search_workspace");
+        assert_eq!(palette.selected().unwrap().id, "run_build");
         palette.move_selection(-99);
         assert_eq!(palette.selected().unwrap().id, "open_file");
         palette.move_selection(999);

@@ -6,6 +6,7 @@
 //! problem (missing file, unreadable file, malformed line, empty value, unknown
 //! keymap) collapses to [`Config::default`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Values read from `<root>/.ccn.toml`.
@@ -19,6 +20,12 @@ pub struct Config {
     pub keymap: Option<String>,
     /// Colour mode: `auto` (default) or `never`.
     pub color: Option<String>,
+    /// Embedded LSP mode: `auto` (default) or `off`.
+    pub lsp: Option<String>,
+    /// Named task commands, declared as `task.<name> = "command"`.
+    ///
+    /// Sorted by name (the file itself may declare them in any order).
+    pub tasks: BTreeMap<String, String>,
 }
 
 /// Location of the configuration file for `root`: `<root>/.ccn.toml`.
@@ -43,10 +50,11 @@ pub fn load(root: &Path) -> Config {
 /// Parse the supported TOML subset.
 ///
 /// Supported: `key = "value"`, `#` comments (whole-line or trailing), blank
-/// lines, and table headers (which are ignored). Only `editor`, `baseline`,
-/// `keymap`, and `color` are recognised; unknown keys are ignored. Any
-/// malformed line rejects the whole file, returning the default configuration,
-/// so a partially understood file can never apply half of its settings.
+/// lines, and table headers (which are ignored). `editor`, `baseline`,
+/// `keymap`, `color`, `lsp`, and `task.<name>` are recognised; unknown keys are
+/// ignored. Any malformed line rejects the whole file, returning the default
+/// configuration, so a partially understood file can never apply half of its
+/// settings.
 fn parse(text: &str) -> Config {
     let mut config = Config::default();
 
@@ -88,9 +96,24 @@ fn parse(text: &str) -> Config {
                 }
                 config.color = Some(value);
             }
-            // Unknown keys are ignored on purpose: a newer ccn may add keys,
-            // and an older ccn must still read the rest of the file.
-            _ => {}
+            "lsp" => {
+                if value != "auto" && value != "off" {
+                    return Config::default();
+                }
+                config.lsp = Some(value);
+            }
+            _ => {
+                if let Some(name) = key.strip_prefix("task.") {
+                    if !valid_task_name(name) {
+                        return Config::default();
+                    }
+                    // Duplicate names are allowed: the last declaration wins.
+                    config.tasks.insert(name.to_string(), value);
+                }
+                // Any other unknown key is ignored on purpose: a newer ccn may
+                // add keys, and an older ccn must still read the rest of the
+                // file.
+            }
         }
     }
 
@@ -108,6 +131,16 @@ fn strip_comment(line: &str) -> &str {
         }
     }
     line
+}
+
+/// A task name is non-empty and made only of ASCII letters, digits, `_`, and
+/// `-`. Rejecting anything else keeps names usable as command-line selectors
+/// without quoting surprises.
+fn valid_task_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
 /// Parse a non-empty double-quoted string. There are no escape sequences: the
@@ -164,6 +197,9 @@ editor = "/usr/local/bin/nvim"
 baseline = "origin/main"
 keymap = "advanced"
 color = "never"
+lsp = "off"
+task.build = "cargo build"
+task.test = "cargo test"
 "#,
         );
         let config = load(&scratch.0);
@@ -171,6 +207,15 @@ color = "never"
         assert_eq!(config.baseline.as_deref(), Some("origin/main"));
         assert_eq!(config.keymap.as_deref(), Some("advanced"));
         assert_eq!(config.color.as_deref(), Some("never"));
+        assert_eq!(config.lsp.as_deref(), Some("off"));
+        assert_eq!(
+            config.tasks.get("build").map(String::as_str),
+            Some("cargo build")
+        );
+        assert_eq!(
+            config.tasks.get("test").map(String::as_str),
+            Some("cargo test")
+        );
     }
 
     #[test]
@@ -185,6 +230,13 @@ color = "never"
             "[ccn\n",
             "keymap = \"fancy\"\n",
             "color = \"always\"\n",
+            "lsp = \"always\"\n",
+            "task. = \"cargo build\"\n",
+            "task.build = \"\"\n",
+            "task.bad name = \"cargo build\"\n",
+            "task.bad/name = \"cargo build\"\n",
+            "task.bad.name = \"cargo build\"\n",
+            "task.név = \"cargo build\"\n",
         ] {
             let scratch = Scratch::with_file("malformed", text);
             assert_eq!(
@@ -232,6 +284,8 @@ another = "ignored"
                 baseline: Some("HEAD~1".to_string()),
                 keymap: None,
                 color: None,
+                lsp: None,
+                tasks: BTreeMap::new(),
             }
         );
     }
@@ -268,5 +322,142 @@ another = "ignored"
             let scratch = Scratch::with_file("color", &format!("color = \"{value}\"\n"));
             assert_eq!(load(&scratch.0).color.as_deref(), expected);
         }
+    }
+
+    #[test]
+    fn lsp_accepts_only_auto_or_off() {
+        for (value, expected) in [("auto", Some("auto")), ("off", Some("off"))] {
+            let scratch = Scratch::with_file("lsp", &format!("lsp = \"{value}\"\n"));
+            assert_eq!(load(&scratch.0).lsp.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn lsp_rejects_other_values() {
+        for value in ["on", "true", "", "AUTO"] {
+            let scratch = Scratch::with_file("lsp-invalid", &format!("lsp = \"{value}\"\n"));
+            assert_eq!(
+                load(&scratch.0),
+                Config::default(),
+                "expected defaults for lsp = {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tasks_are_parsed_and_sorted_by_name() {
+        let scratch = Scratch::with_file(
+            "tasks",
+            r#"
+task.test = "cargo test"
+task.build = "cargo build --release"
+task.fmt_all = "cargo fmt --all"
+task.lint-1 = "cargo clippy --all-targets"
+"#,
+        );
+        let config = load(&scratch.0);
+        let tasks: Vec<_> = config
+            .tasks
+            .iter()
+            .map(|(name, command)| (name.as_str(), command.as_str()))
+            .collect();
+        assert_eq!(
+            tasks,
+            vec![
+                ("build", "cargo build --release"),
+                ("fmt_all", "cargo fmt --all"),
+                ("lint-1", "cargo clippy --all-targets"),
+                ("test", "cargo test"),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_task_names_take_the_last_declaration() {
+        let scratch = Scratch::with_file(
+            "tasks-duplicate",
+            "task.build = \"cargo build\"\ntask.build = \"make build\"\n",
+        );
+        let config = load(&scratch.0);
+        assert_eq!(config.tasks.len(), 1);
+        assert_eq!(
+            config.tasks.get("build").map(String::as_str),
+            Some("make build")
+        );
+    }
+
+    #[test]
+    fn task_names_reject_empty_or_non_ascii_identifiers() {
+        for key in [
+            "task.",
+            "task.bad name",
+            "task.bad/name",
+            "task.bad.name",
+            "task.név",
+            "task.tab\tname",
+        ] {
+            let scratch =
+                Scratch::with_file("tasks-invalid-name", &format!("{key} = \"cargo build\"\n"));
+            assert_eq!(
+                load(&scratch.0),
+                Config::default(),
+                "expected defaults for key {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_commands_must_be_non_empty() {
+        for text in [
+            "task.build = \"\"\n",
+            "task.build =\n",
+            "task.build = \"cargo build\n",
+            "task.build = \"cargo \"build\"\n",
+        ] {
+            let scratch = Scratch::with_file("tasks-empty-command", text);
+            assert_eq!(
+                load(&scratch.0),
+                Config::default(),
+                "expected defaults for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_task_key_is_an_unknown_key() {
+        // `task` without a name is not a task declaration; like any other
+        // unknown key it is ignored rather than rejecting the file.
+        let scratch = Scratch::with_file("task-bare", "task = \"ignored\"\nbaseline = \"HEAD\"\n");
+        let config = load(&scratch.0);
+        assert_eq!(config.baseline.as_deref(), Some("HEAD"));
+        assert!(config.tasks.is_empty());
+    }
+
+    #[test]
+    fn files_without_lsp_or_tasks_keep_working() {
+        // Backward compatibility: an older file gains no LSP/task settings and
+        // keeps exactly the values it declares.
+        let scratch = Scratch::with_file(
+            "backward-compatible",
+            r#"
+[ccn]
+editor = "nvim"
+baseline = "origin/main"
+keymap = "simple"
+color = "auto"
+"#,
+        );
+        let config = load(&scratch.0);
+        assert_eq!(
+            config,
+            Config {
+                editor: Some("nvim".to_string()),
+                baseline: Some("origin/main".to_string()),
+                keymap: Some("simple".to_string()),
+                color: Some("auto".to_string()),
+                lsp: None,
+                tasks: BTreeMap::new(),
+            }
+        );
     }
 }
