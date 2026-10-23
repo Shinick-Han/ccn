@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.28.0 (2026-10-23)
+
+Agent-oriented complexity brief.
+
+- Added `ccn brief [PATH]`: a bounded Markdown or JSON context document over the
+  normal scan. It selects the highest-CCN functions and attaches capped source
+  snippets.
+- Options: `--top`, `--min-ccn`, `--baseline`, `--json`, `--max-lines`,
+  `--no-source`, plus the usual language/cache/ignore controls.
+- `--baseline` reuses the PR gate comparison and reports `base_ccn`,
+  `change: added|worsened` and `reasons`.
+- The JSON contract is stable and machine-readable; Markdown is intended for a
+  human or an agent prompt.
+- 4 new brief tests; fmt/clippy clean.
+
 ## 0.27.0 (2026-10-23)
 
 Zero-config LSP and build/test tasks.

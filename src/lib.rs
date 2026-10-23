@@ -5,6 +5,7 @@
 
 pub mod baseline;
 pub mod breadcrumb;
+pub mod brief;
 pub mod cache;
 pub mod ccn;
 pub mod cli;

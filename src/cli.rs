@@ -9,7 +9,7 @@ use clap::Parser;
     version,
     about,
     long_about = None,
-    after_help = "Run `ccn workbench <file>` for the embedded-Neovim workbench.\nRun `ccn . --tui` to open the editor first; F10 shows the file dashboard.\nUse `ccn . --tui --dashboard` to start on the dashboard instead.\nRun `ccn doctor`, `ccn setup nvim`, or `ccn update --check` to diagnose and configure the setup."
+    after_help = "Run `ccn brief .` for a bounded Markdown brief for an agent.\nRun `ccn workbench <file>` for the embedded-Neovim workbench.\nRun `ccn . --tui` to open the editor first; F10 shows the file dashboard.\nUse `ccn . --tui --dashboard` to start on the dashboard instead.\nRun `ccn doctor`, `ccn setup nvim`, or `ccn update --check` to diagnose and configure the setup."
 )]
 pub struct Cli {
     /// Directory to scan.

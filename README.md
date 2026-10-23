@@ -29,6 +29,7 @@ $ ccn . --tui --dashboard     # start on the dashboard instead
 $ ccn . --view                # write to a temp file and open it
 $ ccn . --open                # ...or open the report in the repo
 $ ccn . --json                # machine-readable contract (no report)
+$ ccn brief .                 # bounded Markdown brief for an agent
 $ ccn . --ci                  # ASCII-only, with terminal histograms
 $ ccn . --hotspots            # + git churn ranking and ownership (runs git log)
 $ ccn . --trend               # compare with the previous scan, and record this one
@@ -97,6 +98,50 @@ inspector: [Shinick-Han/ttt-ccn](https://github.com/Shinick-Han/ttt-ccn).
 TTT remains the editor, LSP, Git and terminal shell; ccn supplies the
 complexity data. Install it from the TTT Plugins panel or with
 **Plugins: Install from URL**.
+
+### Agent brief (`ccn brief`)
+
+`ccn brief` turns a scan into a bounded, deterministic context document. It
+selects the most complex functions, optionally filters to a baseline, and
+attaches capped source snippets. It does not call a model or use the network.
+
+```console
+$ ccn brief .                       # Markdown, top 8 functions at CCN >= 10
+$ ccn brief . --top 12 --min-ccn 15
+$ ccn brief . --baseline HEAD~1     # only added/worsened functions
+$ ccn brief . --json --no-source    # metrics-only machine contract
+```
+
+Markdown output is intended for a human or an agent prompt:
+
+````text
+# CCN brief
+
+Root: `C:/work/project`
+Mode: workspace hotspots
+Threshold: CCN >= 10
+Functions: 124 measured · 8 returned
+
+## 1. `src/parser.c:parse_expr` — CCN 21
+- line 143–188, 46 nloc, nesting 6, 3 params
+
+```c
+int parse_expr(...) {
+  ...
+}
+```
+````
+
+`--baseline` reads `baseline.changes` from the same comparison used by the PR
+gate, so rows carry `base_ccn`, `change: added|worsened` and `reasons` such as
+`ccn +19`. `--json` emits a stable object with `root`, `mode`, `threshold`,
+`total_functions`, `returned` and per-function source ranges. `--top`,
+`--min-ccn`, `--max-lines` and `--no-source` bound the output.
+
+This is deliberately *pre-processing*, not refactoring: the agent still has to
+read call sites, tests and intent. The value is prioritisation and a bounded
+starting context, not an automatic fix. See [`docs/brief.md`](docs/brief.md) for
+the selection rules and JSON schema.
 
 ### Editor integration (`ccn lsp`)
 

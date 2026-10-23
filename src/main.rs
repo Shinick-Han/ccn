@@ -42,6 +42,18 @@ fn dispatch_lsp() -> Option<i32> {
     Some(ccn::lsp::run())
 }
 
+/// `ccn brief` is dispatched before clap for the same reason as `doctor`: the
+/// normal CLI has a positional scan root, so a directory literally named
+/// `brief` would otherwise be scanned. `ccn ./brief` still scans that directory.
+fn dispatch_brief() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("brief")) {
+        return None;
+    }
+    Some(ccn::brief::run(&args.collect::<Vec<_>>()))
+}
+
 /// `ccn doctor` is dispatched before clap: the normal CLI has a positional
 /// scan root, so a directory literally named `doctor` would otherwise be
 /// scanned. `ccn ./doctor` still scans that directory.
@@ -79,6 +91,9 @@ fn main() {
         std::process::exit(code);
     }
     if let Some(code) = dispatch_lsp() {
+        std::process::exit(code);
+    }
+    if let Some(code) = dispatch_brief() {
         std::process::exit(code);
     }
     if let Some(code) = dispatch_doctor() {
