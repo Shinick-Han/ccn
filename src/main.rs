@@ -27,8 +27,26 @@ fn dispatch_workbench() -> Option<i32> {
     }
 }
 
+/// `ccn lsp` is dispatched before clap for the same reason as `workbench`: the
+/// CLI has a positional scan root, so a directory literally named `lsp` would
+/// otherwise be scanned instead of starting the server. The server is a stdio
+/// LSP, so every argument is forwarded untouched (editors pass none) and
+/// `--help` must not be intercepted by clap.
+fn dispatch_lsp() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("lsp")) {
+        return None;
+    }
+
+    Some(ccn::lsp::run())
+}
+
 fn main() {
     if let Some(code) = dispatch_workbench() {
+        std::process::exit(code);
+    }
+    if let Some(code) = dispatch_lsp() {
         std::process::exit(code);
     }
 

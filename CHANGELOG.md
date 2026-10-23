@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.20.0 (2026-10-22)
+
+Editor-agnostic LSP.
+
+- `ccn lsp` runs a stdio LSP server (same binary, no TUI/network).
+- Capabilities: full-text sync, advisory diagnostics for functions above CCN 10,
+  hover (`CCN · nesting · LOC`) and document symbols.
+- Neovim 0.10+/0.11 setup documented in `docs/lsp.md`; no plugin required.
+- LSP is independent of the workbench; the embedded Neovim can launch it too.
+- 659 lib + 1 main + 2 fixture + 17 CLI tests; JSON-RPC framing/initialize/
+  didOpen/hover/symbols/shutdown smoke passed.
+
 ## 0.19.0 (2026-10-22)
 
 Editor and review polish.

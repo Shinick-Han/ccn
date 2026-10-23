@@ -15,6 +15,7 @@ pub mod generated;
 pub mod git;
 pub mod history;
 pub mod loc;
+pub mod lsp;
 pub mod metrics;
 pub mod model;
 pub mod p4;

@@ -70,6 +70,13 @@ mtime-based sidebar. See [`docs/workbench-spike.md`](docs/workbench-spike.md)
 for the compatibility matrix, keys, and limitations. The workbench is
 experimental; the scanner behavior is unchanged.
 
+### Editor integration (`ccn lsp`)
+
+`ccn lsp` runs the same binary as a **stdio Language Server Protocol server** —
+editor-agnostic, no network, no TUI. It publishes advisory diagnostics for
+functions above CCN 10, plus hover and document symbols; there is no formatting
+or completion. See [`docs/lsp.md`](docs/lsp.md) for the Neovim 0.10+/0.11 setup.
+
 
 ```
 ccn 0.1.0
