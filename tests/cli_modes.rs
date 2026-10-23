@@ -761,3 +761,37 @@ fn git(dir: &Path, args: &[&str]) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
+#[test]
+fn brief_emits_bounded_markdown_and_json() {
+    let dir = TempDir::new();
+    dir.write(
+        "complex.c",
+        "int classify(int x) {\n  if (x > 0) { if (x > 1) return 2; }\n  return 1;\n}\n",
+    );
+
+    let markdown = run(&dir, &["brief", ".", "--top", "1", "--min-ccn", "1"]);
+    assert_eq!(markdown.status, 0, "stderr: {}", markdown.stderr);
+    assert!(markdown.stdout.contains("# CCN brief"));
+    assert!(markdown.stdout.contains("classify"));
+    assert!(markdown.stdout.contains("```c"));
+
+    let json = run(
+        &dir,
+        &[
+            "brief",
+            ".",
+            "--top",
+            "1",
+            "--min-ccn",
+            "1",
+            "--json",
+            "--no-source",
+        ],
+    );
+    assert_eq!(json.status, 0, "stderr: {}", json.stderr);
+    let value: Value = serde_json::from_str(&json.stdout).expect("brief JSON");
+    assert_eq!(value["returned"], 1);
+    assert_eq!(value["functions"][0]["name"], "classify");
+    assert!(value["functions"][0].get("source").is_none());
+}
