@@ -74,7 +74,7 @@
 //! - `p4 files`/`p4 opened` are lists of revisions, not diffs, so
 //!   [`changed_since`] is likewise path-only.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -84,6 +84,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::git::{Churn, UNKNOWN_AUTHOR};
+use crate::status::FileChange;
 use crate::vcs::FileAt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -306,6 +307,169 @@ pub fn changed_since(dir: &Path, rev: &str) -> Option<HashSet<String>> {
     }
 
     Some(changed)
+}
+
+/// Working-tree changes for `dir`, keyed by scan-root-relative `/` paths.
+///
+/// Perforce has no working-tree status command, so `p4 opened -ztag` is the
+/// source: it lists every file open on this client with an action. The scan
+/// root's client view ([`mapping_cached`]) turns each depot path into the same
+/// key the tree uses; a tagged `clientFile` is the fallback when the view cannot
+/// be read, and anything that still does not map under `root` is dropped.
+///
+/// Best effort throughout: a missing `p4`, an expired ticket, a timeout or
+/// unparseable output yields an empty map, never an error or a panic.
+pub(crate) fn status_changes(dir: &Path) -> HashMap<String, FileChange> {
+    if !dir.is_dir() {
+        return HashMap::new();
+    }
+    let Some(tagged) = run_p4(dir, &["opened", "-ztag"]) else {
+        return HashMap::new();
+    };
+    let mut opened = parse_opened_status(&tagged);
+    if opened.is_empty() {
+        // An old server/client may not understand `-ztag`; the plain form still
+        // carries the depot path and action.
+        if let Some(plain) = run_p4(dir, &["opened"]) {
+            opened = parse_opened_status(&plain);
+        }
+    }
+    if opened.is_empty() {
+        return HashMap::new();
+    }
+
+    let mapping = mapping_cached(dir);
+    let mut changes = HashMap::new();
+    for file in opened {
+        let relative = mapping
+            .as_ref()
+            .and_then(|mapping| mapping.relative(&file.depot))
+            .or_else(|| {
+                file.local
+                    .as_deref()
+                    .and_then(|local| relative_under_root(dir, local))
+            });
+        if let Some(relative) = relative {
+            if let Some(key) = crate::status::relative_key(&relative) {
+                changes.insert(key, action_change(&file.action));
+            }
+        }
+    }
+    changes
+}
+
+/// One `p4 opened` record, reduced to what the tree needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenedFile {
+    /// Depot path without the `#rev` suffix.
+    depot: String,
+    /// Local path from `-ztag` (`clientFile`), when present.
+    local: Option<String>,
+    /// Perforce action (`edit`, `add`, `delete`, `move/add`, ...).
+    action: String,
+}
+
+/// Grouped `-ztag` fields for one opened file, in index order.
+#[derive(Debug, Default)]
+struct OpenedFields {
+    depot: Option<String>,
+    local: Option<String>,
+    action: Option<String>,
+}
+
+/// Parse `p4 opened` output in either `-ztag` or the plain form.
+///
+/// Tagged output is a stream of `... key<N> value` fields; the numeric suffix
+/// groups one file, so the result is ordered by that index rather than hash
+/// order. Plain output is `//depot/path#rev - action change CL (type)` per line.
+fn parse_opened_status(text: &str) -> Vec<OpenedFile> {
+    let mut grouped: BTreeMap<u32, OpenedFields> = BTreeMap::new();
+    for (key, value) in ztag(text) {
+        let Some((name, index)) = split_tag_index(key) else {
+            continue;
+        };
+        let slot = grouped.entry(index).or_default();
+        match name {
+            "depotFile" => slot.depot = Some(value.to_string()),
+            "clientFile" => slot.local = Some(value.to_string()),
+            "action" => slot.action = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    let mut files = Vec::new();
+    for (_, fields) in grouped {
+        if let Some(depot) = fields.depot {
+            files.push(OpenedFile {
+                depot,
+                local: fields.local,
+                action: fields.action.unwrap_or_else(|| "edit".to_string()),
+            });
+        }
+    }
+    if !files.is_empty() {
+        return files;
+    }
+
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let Some(depot) = depot_path(line) else {
+            continue;
+        };
+        let action = line
+            .split_once(" - ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or("edit")
+            .to_string();
+        files.push(OpenedFile {
+            depot,
+            local: None,
+            action,
+        });
+    }
+    files
+}
+
+/// Split a `-ztag` key such as `depotFile12` into `("depotFile", 12)`.
+fn split_tag_index(key: &str) -> Option<(&str, u32)> {
+    let name = key.trim_end_matches(|c: char| c.is_ascii_digit());
+    if name.len() == key.len() {
+        return None;
+    }
+    let index = key[name.len()..].parse().ok()?;
+    Some((name, index))
+}
+
+/// Map a tagged local path onto the scan root, relative and `/`-separated.
+fn relative_under_root(root: &Path, local: &str) -> Option<String> {
+    let root = normalize(root);
+    let local = normalize(Path::new(local.trim_start_matches(r"\\?\")));
+    let relative = local.strip_prefix(&root).ok()?;
+    let parts: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+/// Fold a Perforce action into the shared [`FileChange`] vocabulary.
+///
+/// A `move` shows up as two records (`move/add` + `move/delete`), so the new
+/// side is `Added`; the old side is `Deleted`. That is the honest reading of
+/// Perforce's model (it does not track renames as a pair the way git does).
+fn action_change(action: &str) -> FileChange {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "add" | "branch" | "import" | "move/add" => FileChange::Added,
+        "delete" | "purge" | "move/delete" => FileChange::Deleted,
+        _ => FileChange::Modified,
+    }
 }
 
 /// True when `rev` is a changelist the server knows about.
@@ -2740,5 +2904,58 @@ no files to display
             Existence::Unavailable,
             "success without a revision line proves nothing"
         );
+    }
+
+    #[test]
+    fn parse_opened_groups_ztag_fields_by_index() {
+        let text = "... depotFile0 //depot/proj/a.rs\n\
+                    ... clientFile0 C:\\ws\\proj\\a.rs\n\
+                    ... action0 edit\n\
+                    ... depotFile1 //depot/proj/b.rs\n\
+                    ... clientFile1 C:\\ws\\proj\\b.rs\n\
+                    ... action1 add\n";
+        let files = parse_opened_status(text);
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].depot, "//depot/proj/a.rs");
+        assert_eq!(files[0].local.as_deref(), Some("C:\\ws\\proj\\a.rs"));
+        assert_eq!(files[0].action, "edit");
+        assert_eq!(files[1].depot, "//depot/proj/b.rs");
+        assert_eq!(files[1].action, "add");
+    }
+
+    #[test]
+    fn parse_opened_reads_the_plain_form() {
+        let text = "//depot/proj/a.rs#3 - edit change 12345 (text)\n\
+                    //depot/proj/b.rs#1 - add default change (text)\n\
+                    //depot/proj/c.rs#2 - move/delete change 9 (text)\n\
+                    File(s) not opened on this client.\n";
+        let files = parse_opened_status(text);
+
+        assert_eq!(files.len(), 3, "diagnostics are skipped");
+        assert_eq!(files[0].depot, "//depot/proj/a.rs");
+        assert_eq!(files[0].action, "edit");
+        assert_eq!(files[2].action, "move/delete");
+        assert!(files.iter().all(|file| file.local.is_none()));
+    }
+
+    #[test]
+    fn opened_actions_fold_into_file_changes() {
+        assert_eq!(action_change("edit"), FileChange::Modified);
+        assert_eq!(action_change("integrate"), FileChange::Modified);
+        assert_eq!(action_change("add"), FileChange::Added);
+        assert_eq!(action_change("branch"), FileChange::Added);
+        assert_eq!(action_change("import"), FileChange::Added);
+        assert_eq!(action_change("move/add"), FileChange::Added);
+        assert_eq!(action_change("delete"), FileChange::Deleted);
+        assert_eq!(action_change("purge"), FileChange::Deleted);
+        assert_eq!(action_change("move/delete"), FileChange::Deleted);
+        assert_eq!(action_change(" EDIT "), FileChange::Modified);
+    }
+
+    #[test]
+    fn status_changes_is_empty_for_a_missing_directory() {
+        let missing = Path::new("ccn-p4-status-definitely-missing");
+        assert!(status_changes(missing).is_empty());
     }
 }

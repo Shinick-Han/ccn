@@ -30,6 +30,8 @@ use crate::diagnostics::{Area, Diagnostic, Diagnostics, Filter as DiagFilter, Se
 #[cfg(feature = "workbench")]
 use crate::diff::{diff_lines, hunks, next_hunk, prev_hunk, DiffLine, Hunk};
 #[cfg(feature = "workbench")]
+use crate::explain::Explanation;
+#[cfg(feature = "workbench")]
 use crate::fuzzy::FuzzyState;
 #[cfg(feature = "workbench")]
 use crate::palette::{Palette, PaletteAction};
@@ -216,6 +218,7 @@ fn save_workspace(
     state: &Option<DashboardState>,
     session: Option<&crate::workbench::WorkbenchSession>,
     reviewed: &BTreeSet<String>,
+    tree: Option<&Tree>,
 ) {
     let mut saved = crate::session::Session {
         split_ratio,
@@ -229,6 +232,9 @@ fn save_workspace(
         saved.left_tab = state.left_tab.persisted().to_string();
     }
     saved.reviewed = reviewed.iter().cloned().collect();
+    if let Some(tree) = tree {
+        saved.tree_expanded = tree.expanded_paths();
+    }
     if let Some(session) = session {
         for path in session.tabs().paths() {
             if let Some(relative) = relative_to_root(root, &path) {
@@ -328,6 +334,29 @@ fn build_diff_pane(
     })
 }
 
+#[cfg(feature = "workbench")]
+fn build_explanation(session: &crate::workbench::WorkbenchSession) -> Option<Explanation> {
+    let (function, source) = if session.app.live_mode() {
+        let live = session.app.live.as_ref()?;
+        let function = live.functions.get(session.app.selected)?.function.clone();
+        let source = live.lines.join("\n");
+        (function, source)
+    } else {
+        let view = session.app.view.as_ref()?;
+        let function = view.functions.get(session.app.selected)?.clone();
+        let source = std::fs::read_to_string(&session.app.target).unwrap_or_default();
+        (function, source)
+    };
+    Some(crate::explain::explain(
+        &source,
+        function.line,
+        function.end_line,
+        &function.name,
+        function.ccn,
+        function.max_nesting,
+    ))
+}
+
 /// Run the dashboard and workbench in one terminal and one event loop.
 ///
 /// The dashboard is rebuilt after a workbench session so the scan/report and
@@ -368,6 +397,8 @@ pub fn run_unified(
     let mut diag_filter = DiagFilter::default();
     #[cfg(feature = "workbench")]
     let mut diff: Option<DiffPane> = None;
+    #[cfg(feature = "workbench")]
+    let mut explanation: Option<Explanation> = None;
     #[cfg(feature = "workbench")]
     let mut review: Option<ReviewQueue> = None;
     #[cfg(feature = "workbench")]
@@ -524,6 +555,7 @@ pub fn run_unified(
                         &dashboard_state,
                         session.as_ref(),
                         &reviewed_keys,
+                        tree_state.as_ref(),
                     );
                     if let Some(session) = session.take() {
                         session.close();
@@ -603,6 +635,8 @@ pub fn run_unified(
                     }
 
                     if let Some(session) = session.as_mut() {
+                        let changes = crate::status::changes(Path::new(&result.root));
+                        let fresh_tree = tree_state.is_none();
                         let mut tree = match tree_state.take() {
                             Some(mut tree) => {
                                 tree.rebuild(tree_paths(result));
@@ -610,6 +644,10 @@ pub fn run_unified(
                             }
                             None => Tree::new(tree_paths(result)),
                         };
+                        if fresh_tree && !saved.tree_expanded.is_empty() {
+                            tree.restore_expanded(&saved.tree_expanded);
+                        }
+                        tree.set_changes(&changes);
                         #[cfg(feature = "workbench")]
                         let fuzzy_paths = tree_paths(result);
                         let mut focus = SplitFocus::Workbench;
@@ -704,6 +742,15 @@ pub fn run_unified(
                                 }
                                 if symbols.is_open() {
                                     crate::symbols::render(frame, frame.area(), &symbols);
+                                }
+                                if let Some(explanation) = &explanation {
+                                    frame.render_widget(Clear, right);
+                                    crate::workbench::explain_ui::render(
+                                        frame,
+                                        right,
+                                        explanation,
+                                        true,
+                                    );
                                 }
                                 crate::palette::render(frame, frame.area(), &palette);
                             })?;
@@ -866,6 +913,25 @@ pub fn run_unified(
                                             && matches!(key.code, KeyCode::Char('p' | 'P')))
                                     {
                                         palette.open();
+                                        continue;
+                                    }
+                                    if explanation.is_some() {
+                                        if key.code == KeyCode::Esc
+                                            || (key.modifiers.contains(KeyModifiers::ALT)
+                                                && matches!(key.code, KeyCode::Char('e' | 'E')))
+                                        {
+                                            explanation = None;
+                                        }
+                                        continue;
+                                    }
+                                    if key.modifiers.contains(KeyModifiers::ALT)
+                                        && matches!(key.code, KeyCode::Char('e' | 'E'))
+                                    {
+                                        explanation = build_explanation(session);
+                                        review = None;
+                                        diff = None;
+                                        diagnostics = None;
+                                        fuzzy.close();
                                         continue;
                                     }
                                     if let Some(pane) = diff.as_mut() {
@@ -1159,6 +1225,9 @@ pub fn run_unified(
                                             {
                                                 break
                                             }
+                                            KeyCode::Char('c') => {
+                                                tree.changed_only(!tree.is_changed_only())
+                                            }
                                             KeyCode::Char('[') => {
                                                 split_ratio = split_ratio.saturating_sub(2).max(20)
                                             }
@@ -1247,6 +1316,7 @@ pub fn run_unified(
                         &dashboard_state,
                         session.as_ref(),
                         &reviewed_keys,
+                        tree_state.as_ref(),
                     );
                     if session.as_ref().is_some_and(|s| s.tabs().is_empty()) {
                         if let Some(empty) = session.take() {

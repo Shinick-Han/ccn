@@ -40,7 +40,12 @@ implementation; the public entry point is `ccn workbench` (single file) and
 - Split navigation: the left pane is a collapsible directory tree (`j/k`,
   `g/G`, `Enter`/Space toggles a directory, `e`/`Enter` opens a file). `F8`
   switches tree/editor focus; `[`/`]` or dragging the divider changes the
-  split ratio (20-70%, minimum pane widths).
+  split ratio (20-70%, minimum pane widths). Tree rows show Git/P4 change
+  markers; `c` toggles changed-files-only.
+- `Alt+E` opens the Explain CCN view for the selected function: a heuristic
+  decision breakdown (if/for/while/case/catch/&&/||/?) with the top decision
+  lines. The tree-sitter CCN remains authoritative.
+- Expanded tree directories are persisted in the session.
 - `Ctrl+P` fuzzy file picker ranks measured source paths with a dependency-free
   subsequence scorer and opens the selected file as a tab.
 - Multi-buffer tabs use one Neovim process: a new file is opened with a Lua

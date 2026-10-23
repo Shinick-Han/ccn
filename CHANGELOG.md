@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.21.0 (2026-10-22)
+
+Workspace awareness and Explain CCN.
+
+- File tree shows Git/P4 status markers (`M/A/D/?/R/!`) and `c` filters to
+  changed files only; the filter restores the full tree when toggled back.
+- Expanded directories are saved in the session and restored on the next run.
+- Dashboard header shows the git branch (P4 stays backend-only to avoid blocking
+  startup on network commands).
+- `Alt+E` in the workbench opens **Explain CCN**: a heuristic decision breakdown
+  (if/for/while/case/catch/&&/||/?) for the selected function, with top decision
+  lines. It is explicitly labelled heuristic; the tree-sitter CCN remains the
+  authoritative score.
+- 694 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; WSL+tmux
+  verified status markers, changed-only, and Explain CCN.
+
 ## 0.20.0 (2026-10-22)
 
 Editor-agnostic LSP.

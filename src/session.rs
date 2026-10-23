@@ -92,6 +92,16 @@ impl Session {
         self.active_file = self.active_file.take().filter(|p| safe_relative(p));
         self.open_files.retain(|p| safe_relative(p));
         self.tree_expanded.retain(|p| safe_relative(p));
+        self.tree_expanded = self
+            .tree_expanded
+            .drain(..)
+            .filter_map(|path| normalize_directory(&path))
+            .fold(Vec::new(), |mut kept, path| {
+                if !kept.contains(&path) {
+                    kept.push(path);
+                }
+                kept
+            });
 
         // `active_file` only means something while it is one of the open
         // files. A dangling entry is dropped so startup restores a tab that
@@ -222,6 +232,31 @@ pub fn save_to(path: &Path, session: &Session) -> io::Result<()> {
             let _ = std::fs::remove_file(&tmp);
             Err(error)
         }
+    }
+}
+
+/// Canonical `/`-separated form of an expanded directory.
+///
+/// Empty and `.` segments are dropped, `\` becomes `/`, and a path with `..`
+/// (or nothing left after normalisation) is rejected. This keeps the saved
+/// `tree_expanded` list identical across a Windows and a Unix load, so
+/// [`crate::tree::Tree::restore_expanded`] matches the same directories.
+fn normalize_directory(path: &str) -> Option<String> {
+    if !safe_relative(path) {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in path.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => return None,
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
     }
 }
 
@@ -458,6 +493,38 @@ mod tests {
         assert_eq!(loaded.active_file, None);
         assert_eq!(loaded.open_files, vec!["src/ok.rs".to_string()]);
         assert_eq!(loaded.tree_expanded, vec!["src/good".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_expanded_is_normalised_deduplicated_and_round_trips() {
+        let dir = temp_dir("tree-expanded");
+        let path = dir.join("session.json");
+        let session = Session {
+            tree_expanded: vec![
+                "src\\workbench".into(),
+                "src/workbench/".into(),
+                "./src".into(),
+                "src".into(),
+                "..".into(),
+                "src/../escape".into(),
+                "".into(),
+            ],
+            ..Session::default()
+        };
+        write_raw(&path, &session);
+
+        let loaded = load_from(&path);
+        assert_eq!(
+            loaded.tree_expanded,
+            vec!["src/workbench".to_string(), "src".to_string()],
+            "separators are canonicalised and duplicates collapsed"
+        );
+
+        save_to(&path, &loaded).expect("save");
+        let reloaded = load_from(&path);
+        assert_eq!(reloaded.tree_expanded, loaded.tree_expanded);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

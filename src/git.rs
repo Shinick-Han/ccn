@@ -50,6 +50,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::status::FileChange;
 use crate::vcs::FileAt;
 
 /// Per-file change history, in the last 365 days.
@@ -477,6 +478,177 @@ pub fn prefix_relative_to(root: &Path, top: &Path) -> String {
 
 fn normalize(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Working-tree status for `dir`, keyed by scan-root-relative `/` paths.
+///
+/// Runs `git status --porcelain=v1 -z` (the NUL-separated form, which cannot be
+/// confused by a path containing a newline or ` -> `), falling back to the
+/// line-oriented form for a git too old to know `-z`. Both use the module's
+/// bounded [`run`] helper, so a hung repository degrades to `None` after
+/// [`TIMEOUT`] instead of blocking the UI. `None` also means git could not
+/// answer at all (not a work tree, missing binary); an empty map means "clean".
+///
+/// `--untracked-files=all` is deliberate: the default porcelain output collapses
+/// a wholly untracked directory into one `dir/` entry, which would leave every
+/// file inside it without a marker.
+pub(crate) fn status_changes(dir: &Path) -> Option<HashMap<String, FileChange>> {
+    let work_tree = work_tree(dir)?;
+    let prefix = status_prefix(dir, &work_tree);
+
+    let mut z = Command::new("git");
+    z.arg("-c")
+        .arg("core.quotepath=false")
+        .arg("-C")
+        .arg(dir)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    let changes = match run(z) {
+        Some(out) => parse_status_z(&out),
+        None => {
+            let mut plain = Command::new("git");
+            plain
+                .arg("-c")
+                .arg("core.quotepath=false")
+                .arg("-C")
+                .arg(dir)
+                .args(["status", "--porcelain=v1", "--untracked-files=all"]);
+            let out = run(plain)?;
+            parse_status_text(&String::from_utf8_lossy(&out))
+        }
+    };
+    Some(rebase_status(changes, &prefix))
+}
+
+/// Prefix of `root` inside `top`, or `""` when the containment cannot be
+/// established (the fallback then behaves like a scan of the whole work tree).
+fn status_prefix(root: &Path, top: &Path) -> String {
+    match (std::fs::canonicalize(root), std::fs::canonicalize(top)) {
+        (Ok(root), Ok(top)) if root.starts_with(&top) => prefix_relative_to(&root, &top),
+        _ => String::new(),
+    }
+}
+
+/// Keep only work-tree-relative keys under `prefix` and strip it.
+fn rebase_status(
+    changes: HashMap<String, FileChange>,
+    prefix: &str,
+) -> HashMap<String, FileChange> {
+    changes
+        .into_iter()
+        .filter_map(|(path, change)| {
+            let relative = if prefix.is_empty() {
+                path.as_str()
+            } else {
+                path.strip_prefix(prefix)?
+            };
+            crate::status::relative_key(relative).map(|key| (key, change))
+        })
+        .collect()
+}
+
+/// Parse `git status --porcelain=v1 -z`.
+///
+/// Each record is `XY <path>`, except that a rename/copy is followed by one
+/// extra record holding the *original* path (no ` -> ` marker in the `-z`
+/// form). The new path is the key, matching what the tree displays.
+fn parse_status_z(bytes: &[u8]) -> HashMap<String, FileChange> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut records = text.split('\0');
+    let mut changes = HashMap::new();
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let Some((status, path)) = split_status_record(record) else {
+            continue;
+        };
+        if status.starts_with('R') || status.starts_with('C') {
+            // Consume the original path that belongs to this rename/copy.
+            let _ = records.next();
+        }
+        if let Some(key) = crate::status::relative_key(path) {
+            changes.insert(key, classify_status(status));
+        }
+    }
+    changes
+}
+
+/// Parse the line-oriented `git status --porcelain=v1` form.
+///
+/// Used only when the `-z` invocation failed. A rename line is
+/// `R  old -> new`; the part after the final ` -> ` is the new path. Git quotes
+/// paths containing unusual characters and `core.quotepath=false` keeps UTF-8
+/// verbatim; surrounding quotes are stripped, interior escapes are left as git
+/// wrote them rather than guessed at.
+fn parse_status_text(text: &str) -> HashMap<String, FileChange> {
+    let mut changes = HashMap::new();
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let Some(status) = line.get(..2) else {
+            continue;
+        };
+        let Some(rest) = line.get(3..) else {
+            continue;
+        };
+        let path = if status.starts_with('R') || status.starts_with('C') {
+            rest.rsplit(" -> ").next().unwrap_or(rest)
+        } else {
+            rest
+        };
+        let path = unquote_path(path);
+        if let Some(key) = crate::status::relative_key(path) {
+            changes.insert(key, classify_status(status));
+        }
+    }
+    changes
+}
+
+/// Split `XY <path>` into the two status characters and the path.
+fn split_status_record(record: &str) -> Option<(&str, &str)> {
+    if record.len() < 3 {
+        return None;
+    }
+    let status = record.get(..2)?;
+    let rest = record.get(2..)?;
+    Some((status, rest.strip_prefix(' ').unwrap_or(rest)))
+}
+
+/// Strip the quotes git puts around an unusual path (line-oriented form only).
+fn unquote_path(path: &str) -> &str {
+    let path = path.trim();
+    if path.len() >= 2 && path.starts_with('"') && path.ends_with('"') {
+        &path[1..path.len() - 1]
+    } else {
+        path
+    }
+}
+
+/// Fold a porcelain `XY` pair into one [`FileChange`].
+///
+/// Conflict detection comes before add/delete because an unmerged pair such as
+/// `UU`, `AA` or `DD` is a conflict, not two ordinary changes. A rename/copy is
+/// recognised on either side so `RM` (rename staged, modified after) still keys
+/// the new path as a rename.
+fn classify_status(status: &str) -> FileChange {
+    let mut chars = status.chars();
+    let x = chars.next().unwrap_or(' ');
+    let y = chars.next().unwrap_or(' ');
+    if x == '?' || x == '!' {
+        return FileChange::Untracked;
+    }
+    if x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D') {
+        return FileChange::Conflicted;
+    }
+    if x == 'R' || y == 'R' || x == 'C' || y == 'C' {
+        return FileChange::Renamed;
+    }
+    if x == 'A' || y == 'A' {
+        return FileChange::Added;
+    }
+    if x == 'D' || y == 'D' {
+        return FileChange::Deleted;
+    }
+    FileChange::Modified
 }
 
 /// Parse `git log --format=%x01%an --numstat` output.
@@ -1247,6 +1419,101 @@ mod tests {
         let tmp = TempDir::new("identity-none");
         assert!(branch(tmp.path()).is_none());
         assert!(branch(&tmp.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn parses_porcelain_z_with_rename_new_paths_and_conflicts() {
+        let out = b" M src/a.rs\0?? new.c\0R  src/new.rs\0src/old.rs\0UU conflict.c\0A  added.rs\0D  gone.rs\0C  copy.rs\0source.rs\0";
+        let changes = parse_status_z(out);
+
+        assert_eq!(changes["src/a.rs"], FileChange::Modified);
+        assert_eq!(changes["new.c"], FileChange::Untracked);
+        assert_eq!(changes["src/new.rs"], FileChange::Renamed);
+        assert!(
+            !changes.contains_key("src/old.rs"),
+            "the old rename path is consumed, not reported as a second entry"
+        );
+        assert_eq!(changes["conflict.c"], FileChange::Conflicted);
+        assert_eq!(changes["added.rs"], FileChange::Added);
+        assert_eq!(changes["gone.rs"], FileChange::Deleted);
+        assert_eq!(changes["copy.rs"], FileChange::Renamed);
+    }
+
+    #[test]
+    fn classifies_every_unmerged_porcelain_pair_as_a_conflict() {
+        for status in ["UU", "AA", "DD", "AU", "UA", "DU", "UD"] {
+            assert_eq!(
+                classify_status(status),
+                FileChange::Conflicted,
+                "{status} is unmerged"
+            );
+        }
+        assert_eq!(classify_status("RM"), FileChange::Renamed);
+        assert_eq!(classify_status("AM"), FileChange::Added);
+        assert_eq!(classify_status(" M"), FileChange::Modified);
+        assert_eq!(classify_status("T "), FileChange::Modified);
+        assert_eq!(classify_status("??"), FileChange::Untracked);
+    }
+
+    #[test]
+    fn parses_line_oriented_porcelain_as_a_fallback() {
+        let stdout = " M dir/a.rs\nR  old.rs -> dir/new.rs\n?? x y.c\nD  gone.rs\n";
+        let changes = parse_status_text(stdout);
+
+        assert_eq!(changes["dir/a.rs"], FileChange::Modified);
+        assert_eq!(
+            changes["dir/new.rs"],
+            FileChange::Renamed,
+            "the new path after the final -> is the key"
+        );
+        assert!(!changes.contains_key("old.rs"));
+        assert_eq!(
+            changes["x y.c"],
+            FileChange::Untracked,
+            "spaces in a path are preserved"
+        );
+        assert_eq!(changes["gone.rs"], FileChange::Deleted);
+    }
+
+    #[test]
+    fn status_changes_rebases_onto_a_subdirectory_scan_root() {
+        if !git_works() {
+            return;
+        }
+        let tmp = TempDir::new("status-sub");
+        let repo = tmp.path();
+        init_repo(repo);
+        write(repo, "sub/a.rs", "1\n");
+        write(repo, "outside.rs", "1\n");
+        commit(repo, "first");
+
+        write(repo, "sub/a.rs", "1\n2\n");
+        write(repo, "outside.rs", "1\n2\n");
+        write(repo, "sub/new.rs", "new\n");
+
+        let changes = status_changes(&repo.join("sub")).expect("status for a subdirectory");
+        assert_eq!(changes["a.rs"], FileChange::Modified);
+        assert_eq!(changes["new.rs"], FileChange::Untracked);
+        assert!(
+            !changes.contains_key("outside.rs") && !changes.contains_key("sub/a.rs"),
+            "keys are scan-root relative and outside files are dropped: {changes:?}"
+        );
+
+        let clean = status_changes(repo).expect("status for the work tree");
+        assert_eq!(clean["sub/a.rs"], FileChange::Modified);
+        assert_eq!(clean["outside.rs"], FileChange::Modified);
+
+        commit(repo, "second");
+        assert!(status_changes(repo)
+            .expect("status after commit")
+            .is_empty());
+    }
+
+    #[test]
+    fn status_changes_is_none_outside_a_work_tree() {
+        let tmp = TempDir::new("status-none");
+        assert!(status_changes(tmp.path()).is_none());
+        assert!(status_changes(&tmp.path().join("missing")).is_none());
     }
 
     #[test]

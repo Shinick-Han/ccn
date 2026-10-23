@@ -7,6 +7,7 @@
 
 pub(crate) mod diagnostics_ui;
 pub(crate) mod diff_ui;
+pub(crate) mod explain_ui;
 mod pty;
 pub(crate) mod review_ui;
 mod rpc;

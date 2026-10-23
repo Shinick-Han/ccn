@@ -5,16 +5,17 @@
 //! (selection, collapsed directories, scroll offset); the caller decides what
 //! an `Open(path)` request means.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::status::FileChange;
 use crate::theme::AURA;
 
 /// What a key press asked the caller to do.
@@ -133,6 +134,8 @@ pub struct TreeRow {
     pub expanded: bool,
     /// Recursive file count for directories; 0 for files.
     pub file_count: usize,
+    /// Working-tree status of a file row, when the backend reported one.
+    pub change: Option<FileChange>,
 }
 
 /// Directory tree state that survives a rescan.
@@ -145,6 +148,13 @@ pub struct Tree {
     /// Collapsed directories, keyed by their scan-relative path.
     collapsed: BTreeSet<String>,
     total_files: usize,
+    /// Every scan-relative file, before the changed-only view is applied, so
+    /// turning the filter off restores the complete tree.
+    all_paths: Vec<String>,
+    /// Working-tree status per scan-relative file.
+    changes: HashMap<String, FileChange>,
+    /// When true, only files present in `changes` are shown.
+    changed_only: bool,
 }
 
 impl Tree {
@@ -162,6 +172,9 @@ impl Tree {
             offset: 0,
             collapsed: BTreeSet::new(),
             total_files: 0,
+            all_paths: Vec::new(),
+            changes: HashMap::new(),
+            changed_only: false,
         };
         tree.rebuild(paths);
         tree
@@ -169,14 +182,16 @@ impl Tree {
 
     /// Rebuild from a fresh path list, preserving collapsed directories and
     /// the selected path when it still exists.
+    ///
+    /// The full list is kept internally so [`Tree::set_changed_filter`] can be
+    /// turned back off without another scan.
     pub fn rebuild<I, S>(&mut self, paths: I)
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let previous = self.selected_path().map(str::to_string);
         let mut seen: HashSet<String> = HashSet::new();
-        let mut root = Dir::root();
+        let mut all = Vec::new();
 
         for path in paths {
             let normalised: Vec<&str> = path
@@ -188,10 +203,30 @@ impl Tree {
                 continue;
             }
             let full = normalised.join("/");
-            if !seen.insert(full.clone()) {
-                continue;
+            if seen.insert(full.clone()) {
+                all.push(full);
             }
-            root.insert(&normalised, &full);
+        }
+
+        self.all_paths = all;
+        self.rebuild_view();
+    }
+
+    /// Rebuild the visible hierarchy from `all_paths`, applying the changed-only
+    /// filter, the collapsed set and the previous selection.
+    fn rebuild_view(&mut self) {
+        let previous = self.selected_path().map(str::to_string);
+        let visible: Vec<String> = self
+            .all_paths
+            .iter()
+            .filter(|path| !self.changed_only || self.changes.contains_key(*path))
+            .cloned()
+            .collect();
+
+        let mut root = Dir::root();
+        for path in &visible {
+            let parts: Vec<&str> = path.split('/').collect();
+            root.insert(&parts, path);
         }
 
         root.sort();
@@ -207,10 +242,117 @@ impl Tree {
         self.clamp_selection();
     }
 
+    /// Attach working-tree status to the tree.
+    ///
+    /// Markers update immediately; when the changed-only filter is on, the
+    /// visible hierarchy is rebuilt from the new map (a file that is no longer
+    /// changed disappears). The full path set is untouched.
+    pub fn set_changes(&mut self, changes: &HashMap<String, FileChange>) {
+        self.changes = changes.clone();
+        self.rebuild_view();
+    }
+
+    /// Show only files with a change status (`enabled`) or every file.
+    ///
+    /// Directory counts and [`Tree::total_files`] reflect the filtered set;
+    /// disabling the filter restores the full tree from the retained path list.
+    pub fn set_changed_filter(&mut self, enabled: bool) {
+        if self.changed_only == enabled {
+            return;
+        }
+        self.changed_only = enabled;
+        self.rebuild_view();
+    }
+
+    /// [`Tree::set_changed_filter`] under the name the callers asked for.
+    pub fn changed_only(&mut self, enabled: bool) {
+        self.set_changed_filter(enabled);
+    }
+
+    /// True when only changed files are visible.
+    pub fn is_changed_only(&self) -> bool {
+        self.changed_only
+    }
+
+    /// Working-tree status for `path`, if one was reported.
+    pub fn change_of(&self, path: &str) -> Option<FileChange> {
+        self.changes.get(path).copied()
+    }
+
+    /// Directories that are currently expanded, sorted.
+    ///
+    /// Derived from the full path set and the collapsed set, so directories
+    /// hidden by the changed-only filter still round-trip through a session.
+    pub fn expanded_paths(&self) -> Vec<String> {
+        self.all_directories()
+            .into_iter()
+            .filter(|dir| !self.collapsed.contains(dir))
+            .collect()
+    }
+
+    /// Restore expansion from [`Tree::expanded_paths`].
+    ///
+    /// Every listed directory is expanded together with all of its ancestors,
+    /// and every known directory that is not listed is collapsed, so a saved
+    /// list round-trips exactly. An empty list is a no-op: an old session that
+    /// predates this field must keep the default "everything expanded" view
+    /// rather than collapsing the whole tree.
+    pub fn restore_expanded(&mut self, paths: &[String]) {
+        let mut expanded = BTreeSet::new();
+        for path in paths {
+            let parts: Vec<&str> = path
+                .split(['/', '\\'])
+                .filter(|part| !part.is_empty() && *part != ".")
+                .collect();
+            if parts.is_empty() || parts.contains(&"..") {
+                continue;
+            }
+            let mut prefix = String::new();
+            for part in parts {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                expanded.insert(prefix.clone());
+            }
+        }
+        if expanded.is_empty() {
+            return;
+        }
+
+        let directories = self.all_directories();
+        self.collapsed = directories.difference(&expanded).cloned().collect();
+        self.root.apply_collapsed(&self.collapsed);
+        self.rebuild_rows();
+        self.clamp_selection();
+    }
+
+    /// Every directory path implied by the full file list, sorted.
+    fn all_directories(&self) -> BTreeSet<String> {
+        let mut directories = BTreeSet::new();
+        for path in &self.all_paths {
+            let mut parts = path.split('/');
+            let mut prefix = String::new();
+            // The last component is the file itself.
+            let count = path.split('/').count().saturating_sub(1);
+            for _ in 0..count {
+                let Some(part) = parts.next() else {
+                    break;
+                };
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                directories.insert(prefix.clone());
+            }
+        }
+        directories
+    }
+
     fn rebuild_rows(&mut self) {
         self.rows.clear();
         let mut rows = Vec::new();
-        collect_rows(&self.root, 0, &mut rows);
+        collect_rows(&self.root, 0, &self.changes, &mut rows);
         self.rows = rows;
     }
 
@@ -435,16 +577,23 @@ impl Tree {
             let row = &self.rows[position];
             let selected = position == self.selected;
 
-            let marker = if row.is_dir {
-                if row.expanded {
-                    "▾ "
-                } else {
-                    "▸ "
-                }
+            let indent = "  ".repeat(row.depth);
+            let (marker, marker_color) = if row.is_dir {
+                (
+                    if row.expanded {
+                        "▾ ".to_string()
+                    } else {
+                        "▸ ".to_string()
+                    },
+                    None,
+                )
             } else {
-                "  "
+                match row.change {
+                    Some(change) => (format!("{} ", change.marker()), Some(change_color(change))),
+                    None => ("  ".to_string(), None),
+                }
             };
-            let prefix = format!("{}{}", "  ".repeat(row.depth), marker);
+            let prefix = format!("{indent}{marker}");
             let suffix = if row.is_dir {
                 format!(" ({})", row.file_count)
             } else {
@@ -457,7 +606,6 @@ impl Tree {
                 .saturating_sub(prefix_width)
                 .saturating_sub(suffix_width);
             let name = truncate_right(&row.name, name_width);
-            let text = truncate_right(&format!("{prefix}{name}{suffix}"), width);
 
             let base = if selected {
                 Style::default().fg(AURA.text).bg(AURA.pill)
@@ -466,10 +614,18 @@ impl Tree {
             } else {
                 Style::default().fg(AURA.text)
             };
+            let marker_style = match marker_color {
+                Some(color) if selected => Style::default().fg(color).bg(AURA.pill),
+                Some(color) => Style::default().fg(color),
+                None => base,
+            };
 
-            let used = text.chars().count();
+            let used = prefix_width + name.chars().count() + suffix_width;
             let fill = width.saturating_sub(used);
-            let mut spans = vec![Span::styled(text, base)];
+            let mut spans = vec![
+                Span::styled(prefix, marker_style),
+                Span::styled(format!("{name}{suffix}"), base),
+            ];
             if selected && fill > 0 {
                 // The pill must cover the whole row, not just the text.
                 spans.push(Span::styled(" ".repeat(fill), base));
@@ -484,7 +640,12 @@ impl Tree {
     }
 }
 
-fn collect_rows(dir: &Dir, depth: usize, out: &mut Vec<TreeRow>) {
+fn collect_rows(
+    dir: &Dir,
+    depth: usize,
+    changes: &HashMap<String, FileChange>,
+    out: &mut Vec<TreeRow>,
+) {
     for child in &dir.dirs {
         out.push(TreeRow {
             path: child.path.clone(),
@@ -493,9 +654,10 @@ fn collect_rows(dir: &Dir, depth: usize, out: &mut Vec<TreeRow>) {
             is_dir: true,
             expanded: child.expanded,
             file_count: child.count,
+            change: None,
         });
         if child.expanded {
-            collect_rows(child, depth + 1, out);
+            collect_rows(child, depth + 1, changes, out);
         }
     }
     for file in &dir.files {
@@ -506,7 +668,18 @@ fn collect_rows(dir: &Dir, depth: usize, out: &mut Vec<TreeRow>) {
             is_dir: false,
             expanded: false,
             file_count: 0,
+            change: changes.get(&file.path).copied(),
         });
+    }
+}
+
+/// Colour for a status marker: additions green, removals red, everything else
+/// (a modification, rename or untracked file) amber.
+fn change_color(change: FileChange) -> Color {
+    match change {
+        FileChange::Added => AURA.ok,
+        FileChange::Deleted | FileChange::Conflicted => AURA.danger,
+        FileChange::Modified | FileChange::Untracked | FileChange::Renamed => AURA.warn,
     }
 }
 
@@ -734,6 +907,121 @@ mod tests {
         }
         let y = selected_y.expect("selected directory row");
         assert_eq!(buffer[(2, y)].bg, AURA.pill, "selected row needs the pill");
+    }
+
+    #[test]
+    fn status_markers_render_before_file_names() {
+        let mut tree = tree();
+        let changes = HashMap::from([
+            ("src/a.cpp".to_string(), FileChange::Modified),
+            ("top.c".to_string(), FileChange::Added),
+        ]);
+        tree.set_changes(&changes);
+
+        assert_eq!(
+            tree.change_of("src/a.cpp"),
+            Some(FileChange::Modified),
+            "the map is attached to the tree"
+        );
+        let file_row = tree
+            .visible_rows()
+            .iter()
+            .find(|row| row.path == "src/a.cpp")
+            .expect("file row");
+        assert_eq!(file_row.change, Some(FileChange::Modified));
+        assert_eq!(
+            tree.visible_rows()
+                .iter()
+                .find(|row| row.path == "top.c")
+                .and_then(|row| row.change),
+            Some(FileChange::Added)
+        );
+        assert_eq!(
+            tree.visible_rows()
+                .iter()
+                .find(|row| row.path == "src/sub/b.c")
+                .and_then(|row| row.change),
+            None,
+            "an unchanged file has no marker"
+        );
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).expect("test backend");
+        terminal
+            .draw(|frame| tree.render(frame, frame.area(), true))
+            .expect("draw tree");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("M a.cpp"), "{text}");
+        assert!(text.contains("A top.c"), "{text}");
+    }
+
+    #[test]
+    fn changed_only_filter_hides_unchanged_files_and_restores_them() {
+        let mut tree = tree();
+        let changes = HashMap::from([
+            ("src/sub/b.c".to_string(), FileChange::Modified),
+            ("top.c".to_string(), FileChange::Untracked),
+        ]);
+        tree.set_changes(&changes);
+
+        tree.set_changed_filter(true);
+        assert!(tree.is_changed_only());
+        assert_eq!(tree.total_files(), 2);
+        assert_eq!(paths(&tree), vec!["src", "src/sub", "src/sub/b.c", "top.c"]);
+        assert_eq!(
+            tree.visible_rows()[0].file_count,
+            1,
+            "directory counts reflect the filtered files"
+        );
+
+        tree.set_changed_filter(false);
+        assert!(!tree.is_changed_only());
+        assert_eq!(tree.total_files(), 3);
+        assert_eq!(
+            paths(&tree),
+            vec!["src", "src/sub", "src/sub/b.c", "src/a.cpp", "top.c"],
+            "the full path set was retained"
+        );
+        assert_eq!(tree.visible_rows()[0].file_count, 2);
+    }
+
+    #[test]
+    fn expanded_paths_round_trip_through_restore() {
+        let mut original = tree();
+        assert!(original.select_path("src/sub"));
+        assert!(original.toggle(), "collapse src/sub");
+        let expanded = original.expanded_paths();
+        assert!(expanded.contains(&"src".to_string()), "{expanded:?}");
+        assert!(!expanded.contains(&"src/sub".to_string()), "{expanded:?}");
+
+        let mut restored = tree();
+        restored.restore_expanded(&expanded);
+        assert_eq!(
+            restored.collapsed(),
+            original.collapsed(),
+            "the collapsed set is reproduced from the expanded list"
+        );
+        assert_eq!(paths(&restored), paths(&original));
+
+        // Listing a nested directory expands its ancestors too.
+        let mut nested = tree();
+        nested.collapsed = ["src".to_string(), "src/sub".to_string()]
+            .into_iter()
+            .collect();
+        nested.restore_expanded(&["src/sub".to_string()]);
+        assert!(nested.collapsed().is_empty());
+        assert_eq!(
+            paths(&nested),
+            vec!["src", "src/sub", "src/sub/b.c", "src/a.cpp", "top.c"]
+        );
+    }
+
+    #[test]
+    fn an_empty_expanded_list_keeps_the_current_state() {
+        let mut tree = tree();
+        tree.restore_expanded(&[]);
+        assert!(tree.collapsed().is_empty());
+        assert!(!paths(&tree).is_empty());
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
