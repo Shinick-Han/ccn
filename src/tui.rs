@@ -251,8 +251,8 @@ fn render_rail_tabs(
     let active = Style::default().fg(pal.accent).add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(pal.muted);
     let marker = if focused { "▌" } else { " " };
-    let files = format!(" Files ({file_count}) ");
-    let functions = format!(" Functions ({function_count}) ");
+    let files = format!(" Files {file_count} ");
+    let functions = format!(" Functions {function_count} ");
     let mut spans = vec![Span::styled(marker, active)];
     spans.push(Span::styled(
         files,
@@ -483,10 +483,18 @@ fn startup_editor_file(result: &ScanResult, saved: &crate::session::Session) -> 
             return Some(PathBuf::from(relative));
         }
     }
+    // Prefer a file with actual function detail over reStructuredText, JSON,
+    // changelogs and other measured-but-not-editorial files. The dashboard is
+    // still one key away when the user wants a docs view.
     result
         .files
         .iter()
-        .find(|file| file.ccn.is_some())
+        .find(|file| {
+            file.ccn
+                .as_ref()
+                .is_some_and(|summary| !summary.detail.is_empty())
+        })
+        .or_else(|| result.files.iter().find(|file| file.ccn.is_some()))
         .or_else(|| result.files.first())
         .map(|file| PathBuf::from(&file.path))
 }
@@ -731,7 +739,12 @@ pub fn run_unified(
                         std::fs::canonicalize(&joined).unwrap_or(joined)
                     });
                     let target = if session.is_none() {
-                        restore_active_path.clone().unwrap_or(target)
+                        // A stale session can name a deleted/renamed tab. Keep
+                        // the startup fallback instead of failing to open it.
+                        restore_active_path
+                            .clone()
+                            .filter(|path| path.is_file())
+                            .unwrap_or(target)
                     } else {
                         target
                     };
@@ -761,6 +774,25 @@ pub fn run_unified(
                         let area = Rect::new(0, 0, size.width, size.height);
                         let (_, _, right, _) =
                             rail_layout(area, size.width >= RAIL_PERSISTENT_MIN, false);
+                        let _ = guard.terminal.draw(|frame| {
+                            frame.render_widget(Clear, area);
+                            frame.render_widget(
+                                Paragraph::new(vec![
+                                    Line::from(Span::styled(
+                                        "Starting editor...",
+                                        Style::default()
+                                            .fg(crate::theme::palette().accent)
+                                            .add_modifier(Modifier::BOLD),
+                                    )),
+                                    Line::from(Span::styled(
+                                        "preparing Neovim · F10 returns to the dashboard after startup",
+                                        Style::default().fg(crate::theme::palette().muted),
+                                    )),
+                                ])
+                                .alignment(Alignment::Center),
+                                area,
+                            );
+                        });
                         match crate::workbench::WorkbenchSession::open(
                             &target,
                             editor,
@@ -1663,7 +1695,7 @@ pub fn run_unified(
                                         if mouse.row == rail.y {
                                             let files_end =
                                                 rail.x.saturating_add(1).saturating_add(
-                                                    format!(" Files ({}) ", fuzzy_paths.len())
+                                                    format!(" Files {} ", fuzzy_paths.len())
                                                         .chars()
                                                         .count()
                                                         as u16,

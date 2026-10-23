@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.26.1 (2026-10-23)
+
+Daily-driver hardening.
+
+- `ccn doctor [PATH] [--json]` checks ccn, nvim, the configured editor, VCS,
+  compile database/build files, cache writability and TTY. Exit 2 on a required
+  failure.
+- `ccn update [--check|--apply]` compares with npm and updates a global npm
+  install; native installs get release instructions and are never overwritten.
+- `ccn setup nvim [--print|--write]` emits/installs a Neovim 0.10+ snippet for
+  `ccn lsp`.
+- `--tui` now prefers a file with function detail over CHANGELOG/JSON/docs when
+  restoring a session, skips stale deleted tabs, and draws a "Starting editor"
+  state before opening Neovim.
+- Rail tabs fit 28 columns without truncation.
+- 768 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean.
+
 ## 0.26.0 (2026-10-23)
 
 Calm, editor-first workbench.

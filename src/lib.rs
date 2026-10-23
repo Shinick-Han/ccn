@@ -11,6 +11,7 @@ pub mod cli;
 pub mod config;
 pub mod diagnostics;
 pub mod diff;
+pub mod doctor;
 pub mod explain;
 pub mod fuzzy;
 pub mod generated;
@@ -27,12 +28,14 @@ pub mod review;
 pub mod sarif;
 pub mod search;
 pub mod session;
+pub mod setup;
 pub mod status;
 pub mod symbols;
 pub mod terminal;
 pub mod theme;
 pub mod tree;
 pub mod tui;
+pub mod update;
 pub mod vcs;
 
 #[cfg(feature = "workbench")]

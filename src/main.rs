@@ -42,11 +42,52 @@ fn dispatch_lsp() -> Option<i32> {
     Some(ccn::lsp::run())
 }
 
+/// `ccn doctor` is dispatched before clap: the normal CLI has a positional
+/// scan root, so a directory literally named `doctor` would otherwise be
+/// scanned. `ccn ./doctor` still scans that directory.
+fn dispatch_doctor() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("doctor")) {
+        return None;
+    }
+    Some(ccn::doctor::run(&args.collect::<Vec<_>>()))
+}
+
+/// `ccn update` is dispatched before clap for the same reason as `doctor`.
+fn dispatch_update() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("update")) {
+        return None;
+    }
+    Some(ccn::update::run(&args.collect::<Vec<_>>()))
+}
+
+/// `ccn setup nvim` is dispatched before clap for the same reason as `doctor`.
+fn dispatch_setup() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("setup")) {
+        return None;
+    }
+    Some(ccn::setup::run(&args.collect::<Vec<_>>()))
+}
+
 fn main() {
     if let Some(code) = dispatch_workbench() {
         std::process::exit(code);
     }
     if let Some(code) = dispatch_lsp() {
+        std::process::exit(code);
+    }
+    if let Some(code) = dispatch_doctor() {
+        std::process::exit(code);
+    }
+    if let Some(code) = dispatch_update() {
+        std::process::exit(code);
+    }
+    if let Some(code) = dispatch_setup() {
         std::process::exit(code);
     }
 

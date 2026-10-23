@@ -363,6 +363,21 @@ a default `baseline`, and the `keymap` (`simple`/`advanced`). The command line
 always wins; a missing or malformed file is ignored. See
 [`docs/config.md`](docs/config.md).
 
+## Setup and diagnostics
+
+```console
+$ ccn doctor              # nvim, VCS, compile DB, cache, TTY checks
+$ ccn setup nvim          # print the ccn LSP snippet for Neovim
+$ ccn setup nvim --write  # install it under the user's Neovim config
+$ ccn update --check      # compare with the published npm version
+$ ccn update --apply      # update a global npm install
+```
+
+`ccn doctor` exits `2` when a required check fails (currently a missing
+`nvim`) and `0` with warnings otherwise. The update command never overwrites a
+native binary; it prints the release asset and replacement steps. See
+[`docs/doctor.md`](docs/doctor.md).
+
 ## Design decisions that are not obvious
 
 - **LOC comes from `tokei`, CCN will come from `tree-sitter`.** `scc`'s
