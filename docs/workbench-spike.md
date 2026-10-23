@@ -85,6 +85,11 @@ implementation; the public entry point is `ccn workbench` (single file) and
   active buffers, reviewed findings) is stored in the OS cache sidecar, never in
   the scanned tree. Restored tabs are lazy: the first switch issues `:edit`.
 - Window resize calls `MasterPty::resize` and `vt100::Parser::set_size`.
+- The split needs at least `60x16`. Below that ccn clears the split area and
+  shows a centred `terminal too small for split` message instead of squeezing
+  the panes (and the editor PTY) into an unusable size. The editor session and
+  its tabs stay open; `F10` still returns to the dashboard, and growing the
+  terminal resumes normal rendering.
 - Child exit leaves the workbench open, marks `[editor exited]`, stops the RPC
   worker, and `F10` quits.
 - `--no-rpc`, a non-Neovim editor, or a failed connection keeps the existing

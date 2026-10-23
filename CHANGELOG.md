@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.23.0 (2026-10-23)
+
+Accessibility and first-run polish.
+
+- `--no-color`, a non-empty `NO_COLOR`, and `.ccn.toml` `color = "never"` all
+  select a monochrome palette; semantic grade/risk/bin colours follow the same
+  decision. Colour is resolved once before rendering.
+- The split view guards terminals below 60x16 with a clear message. The editor
+  session stays alive; F10 returns to the dashboard and resizing larger resumes
+  the split without restarting it.
+- The first interactive run for a repository shows a concise footer hint
+  (`? help`, `F5 palette`, `e` workbench). Once a session is saved the normal
+  footer returns.
+- 724 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; WSL+tmux
+  verified zero RGB sequences under `--no-color`, the first-run hint, and the
+  50x12 guard followed by resize recovery.
+
 ## 0.22.0 (2026-10-22)
 
 Configuration and workspace search.

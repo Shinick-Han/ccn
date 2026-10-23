@@ -17,6 +17,8 @@ pub struct Config {
     pub baseline: Option<String>,
     /// Keymap shown by the dashboard: `simple` or `advanced`.
     pub keymap: Option<String>,
+    /// Colour mode: `auto` (default) or `never`.
+    pub color: Option<String>,
 }
 
 /// Location of the configuration file for `root`: `<root>/.ccn.toml`.
@@ -41,10 +43,10 @@ pub fn load(root: &Path) -> Config {
 /// Parse the supported TOML subset.
 ///
 /// Supported: `key = "value"`, `#` comments (whole-line or trailing), blank
-/// lines, and table headers (which are ignored). Only `editor`, `baseline`, and
-/// `keymap` are recognised; unknown keys are ignored. Any malformed line
-/// rejects the whole file, returning the default configuration, so a partially
-/// understood file can never apply half of its settings.
+/// lines, and table headers (which are ignored). Only `editor`, `baseline`,
+/// `keymap`, and `color` are recognised; unknown keys are ignored. Any
+/// malformed line rejects the whole file, returning the default configuration,
+/// so a partially understood file can never apply half of its settings.
 fn parse(text: &str) -> Config {
     let mut config = Config::default();
 
@@ -79,6 +81,12 @@ fn parse(text: &str) -> Config {
                     return Config::default();
                 }
                 config.keymap = Some(value);
+            }
+            "color" => {
+                if value != "auto" && value != "never" {
+                    return Config::default();
+                }
+                config.color = Some(value);
             }
             // Unknown keys are ignored on purpose: a newer ccn may add keys,
             // and an older ccn must still read the rest of the file.
@@ -155,12 +163,14 @@ mod tests {
 editor = "/usr/local/bin/nvim"
 baseline = "origin/main"
 keymap = "advanced"
+color = "never"
 "#,
         );
         let config = load(&scratch.0);
         assert_eq!(config.editor.as_deref(), Some("/usr/local/bin/nvim"));
         assert_eq!(config.baseline.as_deref(), Some("origin/main"));
         assert_eq!(config.keymap.as_deref(), Some("advanced"));
+        assert_eq!(config.color.as_deref(), Some("never"));
     }
 
     #[test]
@@ -174,6 +184,7 @@ keymap = "advanced"
             "editor = \"a\" trailing\n",
             "[ccn\n",
             "keymap = \"fancy\"\n",
+            "color = \"always\"\n",
         ] {
             let scratch = Scratch::with_file("malformed", text);
             assert_eq!(
@@ -220,6 +231,7 @@ another = "ignored"
                 editor: None,
                 baseline: Some("HEAD~1".to_string()),
                 keymap: None,
+                color: None,
             }
         );
     }
@@ -247,6 +259,14 @@ another = "ignored"
         for (value, expected) in [("simple", Some("simple")), ("advanced", Some("advanced"))] {
             let scratch = Scratch::with_file("keymap", &format!("keymap = \"{value}\"\n"));
             assert_eq!(load(&scratch.0).keymap.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn color_accepts_only_auto_or_never() {
+        for (value, expected) in [("auto", Some("auto")), ("never", Some("never"))] {
+            let scratch = Scratch::with_file("color", &format!("color = \"{value}\"\n"));
+            assert_eq!(load(&scratch.0).color.as_deref(), expected);
         }
     }
 }

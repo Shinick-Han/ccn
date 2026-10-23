@@ -9,6 +9,7 @@ command's positional path, default `.`):
 editor = "code --wait"
 baseline = "origin/main"
 keymap = "advanced"
+color = "never"
 ```
 
 All keys are optional and all values are strings.
@@ -18,6 +19,7 @@ All keys are optional and all values are strings.
 | `editor` | Editor command used by the dashboard's `e` key. |
 | `baseline` | Revision used when `--baseline` is not given (Git rev or Perforce changelist). |
 | `keymap` | `simple` or `advanced`; `advanced` shows the advanced keys in the dashboard help. |
+| `color` | `auto` (default) or `never`; `never` disables colour in the dashboard. |
 
 ## Precedence
 
@@ -31,6 +33,12 @@ Command line > `.ccn.toml` > built-in defaults.
   override the file with Neovim.
 - `CCN_KEYMAP` already set in the environment overrides `keymap`. Otherwise
   `keymap = "advanced"` sets `CCN_KEYMAP=advanced` for this process.
+- `--no-color` disables colour. `color = "never"` does the same; `color = "auto"`
+  is the default and leaves the decision to `NO_COLOR`. The flag wins over
+  `auto` because it always disables colour; `never` and an existing non-empty
+  `NO_COLOR` are equally authoritative (all three mean "no colour").
+- `NO_COLOR` follows the de-facto standard: colour is disabled when the
+  variable is present and non-empty. `NO_COLOR=` (empty) keeps colour on.
 - Flags that depend on a baseline keep clap's validation: `--fail-on-new` and
   `--manifest` still require `--baseline` on the command line, even when
   `.ccn.toml` supplies one.
@@ -50,6 +58,8 @@ subset of TOML:
 - Values are double-quoted and taken literally: there are no escape sequences,
   and a value cannot contain another `"`. An empty value is rejected.
 - `keymap` must be exactly `simple` or `advanced`.
+- `color` must be exactly `auto` or `never`; any other value, including an
+  empty string, rejects the whole file.
 - Any other malformed line rejects the whole file: the defaults apply, silently.
   A file is never applied partially.
 - Only `<root>/.ccn.toml` is read. There is no parent-directory or home-directory

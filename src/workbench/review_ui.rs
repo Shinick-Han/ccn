@@ -6,7 +6,7 @@
 
 use crate::baseline::{Change, Kind};
 use crate::review::key;
-use crate::theme::AURA;
+use crate::theme::palette;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -145,8 +145,8 @@ fn marker(change: &Change) -> char {
 
 fn marker_style(change: &Change) -> Style {
     let fg = match change.kind {
-        Kind::Added => AURA.accent_alt,
-        Kind::Worsened => AURA.danger,
+        Kind::Added => palette().accent_alt,
+        Kind::Worsened => palette().danger,
     };
     Style::default().fg(fg).add_modifier(Modifier::BOLD)
 }
@@ -167,16 +167,20 @@ fn row_line_with_check(
     selected: bool,
     checked: Option<bool>,
 ) -> Line<'static> {
-    let bg = if selected { AURA.pill } else { AURA.card };
+    let bg = if selected {
+        palette().pill
+    } else {
+        palette().card
+    };
     let text_style = if selected {
         Style::default()
-            .fg(AURA.text)
+            .fg(palette().text)
             .bg(bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(AURA.text).bg(bg)
+        Style::default().fg(palette().text).bg(bg)
     };
-    let muted = Style::default().fg(AURA.muted).bg(bg);
+    let muted = Style::default().fg(palette().muted).bg(bg);
     let width_chars = usize::from(width);
 
     let check_text = match checked {
@@ -219,7 +223,7 @@ fn row_line_with_check(
             check_text,
             if checked {
                 Style::default()
-                    .fg(AURA.ok)
+                    .fg(palette().ok)
                     .bg(bg)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -235,8 +239,8 @@ fn row_line_with_check(
             suffix,
             Style::default()
                 .fg(match change.kind {
-                    Kind::Added => AURA.danger,
-                    Kind::Worsened => AURA.warn,
+                    Kind::Added => palette().danger,
+                    Kind::Worsened => palette().warn,
                 })
                 .bg(bg)
                 .add_modifier(Modifier::BOLD),
@@ -308,8 +312,8 @@ fn header_line(path: &str, count: usize, width: u16) -> Line<'static> {
     Line::from(Span::styled(
         truncate_chars(&format!("{path} ({count})"), width),
         Style::default()
-            .fg(AURA.muted)
-            .bg(AURA.card)
+            .fg(palette().muted)
+            .bg(palette().card)
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -398,18 +402,22 @@ fn render_impl(
     reviewed: Option<&BTreeSet<String>>,
 ) {
     let border = if focused {
-        AURA.border_focus
+        palette().border_focus
     } else {
-        AURA.border
+        palette().border
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(AURA.card))
+        .style(Style::default().bg(palette().card))
         .title(Span::styled(
             title_text(rev),
             Style::default()
-                .fg(if focused { AURA.accent } else { AURA.text })
+                .fg(if focused {
+                    palette().accent
+                } else {
+                    palette().text
+                })
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -427,7 +435,7 @@ fn render_impl(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             subtitle,
-            Style::default().fg(AURA.muted).bg(AURA.card),
+            Style::default().fg(palette().muted).bg(palette().card),
         ))),
         Rect {
             x: inner.x,
@@ -453,12 +461,12 @@ fn render_impl(
             .map(|text| {
                 Line::from(Span::styled(
                     truncate_chars(text, list_area.width),
-                    Style::default().fg(AURA.muted).bg(AURA.card),
+                    Style::default().fg(palette().muted).bg(palette().card),
                 ))
             })
             .collect();
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+            Paragraph::new(lines).style(Style::default().bg(palette().card)),
             list_area,
         );
         return;
@@ -493,7 +501,7 @@ fn render_impl(
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         list_area,
     );
 }
@@ -615,7 +623,7 @@ mod tests {
             for x in 0..40 {
                 let cell = &buffer[(x, y)];
                 row.push_str(cell.symbol());
-                if cell.bg == AURA.pill {
+                if cell.bg == palette().pill {
                     found_pill = true;
                 }
             }
@@ -849,7 +857,7 @@ mod tests {
             for x in 0..40 {
                 let cell = &buffer[(x, y)];
                 row.push_str(cell.symbol());
-                if cell.bg == AURA.pill {
+                if cell.bg == palette().pill {
                     found_pill = true;
                 }
             }

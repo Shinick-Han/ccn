@@ -14,7 +14,7 @@
 //! text can never move the cursor or corrupt the surrounding layout.
 
 use crate::diff::{hunks, DiffKind, DiffLine, Hunk};
-use crate::theme::AURA;
+use crate::theme::palette;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -101,9 +101,9 @@ fn kind_marker(kind: &DiffKind) -> char {
 /// Foreground colour for a row's marker and text.
 fn kind_color(kind: &DiffKind) -> Color {
     match kind {
-        DiffKind::Added => AURA.ok,
-        DiffKind::Removed => AURA.danger,
-        DiffKind::Context => AURA.muted,
+        DiffKind::Added => palette().ok,
+        DiffKind::Removed => palette().danger,
+        DiffKind::Context => palette().muted,
     }
 }
 
@@ -179,13 +179,13 @@ fn row_line_with(
     active_hunk: bool,
 ) -> Line<'static> {
     let bg = if selected {
-        AURA.pill
+        palette().pill
     } else if active_hunk {
         // A shade darker than the card so the hunk reads as a group without
         // competing with the selected-row pill.
-        AURA.canvas
+        palette().canvas
     } else {
-        AURA.card
+        palette().card
     };
     let fg = kind_color(&row.kind);
     let kind_style = if selected {
@@ -193,7 +193,7 @@ fn row_line_with(
     } else {
         Style::default().fg(fg).bg(bg)
     };
-    let muted = Style::default().fg(AURA.muted).bg(bg);
+    let muted = Style::default().fg(palette().muted).bg(bg);
     let width_chars = usize::from(width);
 
     // Two number columns, two separators, the marker and its trailing space.
@@ -216,12 +216,12 @@ fn row_line_with(
     let mut spans = vec![
         Span::styled(
             format!("{old:>num_width$}"),
-            Style::default().fg(AURA.muted).bg(bg),
+            Style::default().fg(palette().muted).bg(bg),
         ),
         Span::styled(" ", muted),
         Span::styled(
             format!("{new:>num_width$}"),
-            Style::default().fg(AURA.muted).bg(bg),
+            Style::default().fg(palette().muted).bg(bg),
         ),
         Span::styled(" ", muted),
         Span::styled(kind_marker(&row.kind).to_string(), kind_style),
@@ -276,18 +276,22 @@ pub(crate) fn render_with_hunks(
 ) {
     let active_hunk = resolve_hunk(rows, hunk);
     let border = if focused {
-        AURA.border_focus
+        palette().border_focus
     } else {
-        AURA.border
+        palette().border
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(AURA.card))
+        .style(Style::default().bg(palette().card))
         .title(Span::styled(
             title_text(title),
             Style::default()
-                .fg(if focused { AURA.accent } else { AURA.text })
+                .fg(if focused {
+                    palette().accent
+                } else {
+                    palette().text
+                })
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -305,7 +309,7 @@ pub(crate) fn render_with_hunks(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             subtitle,
-            Style::default().fg(AURA.muted).bg(AURA.card),
+            Style::default().fg(palette().muted).bg(palette().card),
         ))),
         Rect {
             x: inner.x,
@@ -331,12 +335,12 @@ pub(crate) fn render_with_hunks(
             .map(|text| {
                 Line::from(Span::styled(
                     truncate_chars(text, list_area.width),
-                    Style::default().fg(AURA.muted).bg(AURA.card),
+                    Style::default().fg(palette().muted).bg(palette().card),
                 ))
             })
             .collect();
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+            Paragraph::new(lines).style(Style::default().bg(palette().card)),
             list_area,
         );
         return;
@@ -369,7 +373,7 @@ pub(crate) fn render_with_hunks(
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         list_area,
     );
 }
@@ -515,11 +519,11 @@ fn side_summary_line(rows: &[DiffLine], active: Option<Hunk>) -> String {
 /// Background for a visual row, shared by both columns and the divider.
 fn pair_bg(selected: bool, in_hunk: bool) -> Color {
     if selected {
-        AURA.pill
+        palette().pill
     } else if in_hunk {
-        AURA.canvas
+        palette().canvas
     } else {
-        AURA.card
+        palette().card
     }
 }
 
@@ -554,7 +558,7 @@ fn side_cell(
     } else {
         Style::default().fg(fg).bg(bg)
     };
-    let muted = Style::default().fg(AURA.muted).bg(bg);
+    let muted = Style::default().fg(palette().muted).bg(bg);
     let number = side
         .number(row)
         .map(|number| number.to_string())
@@ -616,9 +620,9 @@ fn pair_line(
 ) -> Line<'static> {
     let mut spans = side_cell(left, Side::Old, left_num_width, left_width, bg, selected);
     let divider_style = if selected {
-        Style::default().fg(AURA.muted).bg(bg)
+        Style::default().fg(palette().muted).bg(bg)
     } else {
-        Style::default().fg(AURA.border).bg(bg)
+        Style::default().fg(palette().border).bg(bg)
     };
     spans.push(Span::styled(
         "\u{2502}".repeat(usize::from(divider_width)),
@@ -666,7 +670,7 @@ fn render_unified_fallback(
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         area,
     );
 }
@@ -678,12 +682,12 @@ fn render_empty_state(frame: &mut Frame, area: Rect) {
         .map(|text| {
             Line::from(Span::styled(
                 truncate_chars(text, area.width),
-                Style::default().fg(AURA.muted).bg(AURA.card),
+                Style::default().fg(palette().muted).bg(palette().card),
             ))
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         area,
     );
 }
@@ -712,18 +716,22 @@ pub(crate) fn render_side_by_side(
 ) {
     let active_hunk = resolve_hunk(rows, hunk);
     let border = if focused {
-        AURA.border_focus
+        palette().border_focus
     } else {
-        AURA.border
+        palette().border
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(AURA.card))
+        .style(Style::default().bg(palette().card))
         .title(Span::styled(
             title_text(title),
             Style::default()
-                .fg(if focused { AURA.accent } else { AURA.text })
+                .fg(if focused {
+                    palette().accent
+                } else {
+                    palette().text
+                })
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -738,7 +746,7 @@ pub(crate) fn render_side_by_side(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             subtitle,
-            Style::default().fg(AURA.muted).bg(AURA.card),
+            Style::default().fg(palette().muted).bg(palette().card),
         ))),
         Rect {
             x: inner.x,
@@ -809,7 +817,7 @@ pub(crate) fn render_side_by_side(
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         list_area,
     );
 }
@@ -958,7 +966,7 @@ mod tests {
         let mut found_pill = false;
         for y in 0..5 {
             for x in 0..40 {
-                if buffer[(x, y)].bg == AURA.pill {
+                if buffer[(x, y)].bg == palette().pill {
                     found_pill = true;
                 }
             }
@@ -1058,7 +1066,7 @@ mod tests {
         let mut found = false;
         for y in 0..8 {
             for x in 0..60 {
-                if buffer[(x, y)].bg == AURA.canvas {
+                if buffer[(x, y)].bg == palette().canvas {
                     found = true;
                 }
             }
@@ -1303,7 +1311,7 @@ mod tests {
         let mut found_pill = false;
         for y in 0..5 {
             for x in 0..40 {
-                if buffer[(x, y)].bg == AURA.pill {
+                if buffer[(x, y)].bg == palette().pill {
                     found_pill = true;
                 }
             }

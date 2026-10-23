@@ -7,7 +7,7 @@
 //! and these counts are only an explanation aid.
 
 use crate::explain::Explanation;
-use crate::theme::{bin_color, AURA};
+use crate::theme::{bin_color, palette};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -76,7 +76,7 @@ fn decision_row(
     if usize::from(width) < fixed + 3 {
         return Line::from(Span::styled(
             truncate_chars(&format!("{} {}", decision.label, decision.count), width),
-            Style::default().fg(AURA.text).bg(AURA.card),
+            Style::default().fg(palette().text).bg(palette().card),
         ));
     }
 
@@ -91,22 +91,27 @@ fn decision_row(
         Span::styled(
             head,
             Style::default()
-                .fg(AURA.accent_alt)
-                .bg(AURA.card)
+                .fg(palette().accent_alt)
+                .bg(palette().card)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "\u{2588}".repeat(bar_len),
-            Style::default().fg(bin_color(rank, total)).bg(AURA.card),
+            Style::default()
+                .fg(bin_color(rank, total))
+                .bg(palette().card),
         ),
         Span::styled(
             count,
             Style::default()
-                .fg(AURA.text)
-                .bg(AURA.card)
+                .fg(palette().text)
+                .bg(palette().card)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(hint, Style::default().fg(AURA.muted).bg(AURA.card)),
+        Span::styled(
+            hint,
+            Style::default().fg(palette().muted).bg(palette().card),
+        ),
     ])
 }
 
@@ -114,11 +119,11 @@ fn top_line(line: usize, label: &'static str, width: u16) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             truncate_chars(&format!("L{line}"), width),
-            Style::default().fg(AURA.muted).bg(AURA.card),
+            Style::default().fg(palette().muted).bg(palette().card),
         ),
         Span::styled(
             format!(" {label}"),
-            Style::default().fg(AURA.accent_alt).bg(AURA.card),
+            Style::default().fg(palette().accent_alt).bg(palette().card),
         ),
     ])
 }
@@ -127,9 +132,9 @@ fn top_line(line: usize, label: &'static str, width: u16) -> Line<'static> {
 #[allow(dead_code)]
 pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, focused: bool) {
     let border = if focused {
-        AURA.border_focus
+        palette().border_focus
     } else {
-        AURA.border
+        palette().border
     };
     let title = truncate_chars(
         &title_text(&explanation.function),
@@ -138,12 +143,16 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, f
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(AURA.card))
+        .style(Style::default().bg(palette().card))
         .title(Span::styled(
             title,
             Style::default()
-                .fg(if focused { AURA.accent } else { AURA.text })
-                .bg(AURA.card)
+                .fg(if focused {
+                    palette().accent
+                } else {
+                    palette().text
+                })
+                .bg(palette().card)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -157,9 +166,9 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, f
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             truncate_chars(&subtitle_text(explanation), inner.width),
-            Style::default().fg(AURA.muted).bg(AURA.card),
+            Style::default().fg(palette().muted).bg(palette().card),
         )))
-        .style(Style::default().bg(AURA.card)),
+        .style(Style::default().bg(palette().card)),
         Rect {
             x: inner.x,
             y: inner.y,
@@ -178,9 +187,9 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, f
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 truncate_chars("No decision points found", inner.width),
-                Style::default().fg(AURA.muted).bg(AURA.card),
+                Style::default().fg(palette().muted).bg(palette().card),
             )))
-            .style(Style::default().bg(AURA.card)),
+            .style(Style::default().bg(palette().card)),
             Rect {
                 x: inner.x,
                 y: body_y,
@@ -220,7 +229,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, f
         .map(|(rank, decision)| decision_row(decision, rank, total, max_count, inner.width))
         .collect();
     frame.render_widget(
-        Paragraph::new(rows).style(Style::default().bg(AURA.card)),
+        Paragraph::new(rows).style(Style::default().bg(palette().card)),
         Rect {
             x: inner.x,
             y: body_y,
@@ -238,11 +247,11 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, f
         Paragraph::new(Line::from(Span::styled(
             truncate_chars("Top decision lines", inner.width),
             Style::default()
-                .fg(AURA.muted)
-                .bg(AURA.card)
+                .fg(palette().muted)
+                .bg(palette().card)
                 .add_modifier(Modifier::BOLD),
         )))
-        .style(Style::default().bg(AURA.card)),
+        .style(Style::default().bg(palette().card)),
         Rect {
             x: inner.x,
             y: top_y,
@@ -269,7 +278,7 @@ pub(crate) fn render(frame: &mut Frame, area: Rect, explanation: &Explanation, f
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         Rect {
             x: inner.x,
             y: top_y.saturating_add(1),
@@ -446,7 +455,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let mut found = false;
         for x in 0..40 {
-            if buffer[(x, 0)].fg == AURA.border_focus {
+            if buffer[(x, 0)].fg == palette().border_focus {
                 found = true;
             }
         }

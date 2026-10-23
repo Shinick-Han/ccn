@@ -90,6 +90,14 @@ fn main() {
         std::env::set_var("CCN_KEYMAP", "advanced");
     }
 
+    // Colour is resolved once by `theme::palette`, so the flag and the
+    // repository default must be folded into the environment before the scan
+    // or any rendering. An existing non-empty NO_COLOR already disables
+    // colour; `color = "auto"` deliberately leaves the environment untouched.
+    if cli.no_color || config.color.as_deref() == Some("never") {
+        std::env::set_var("NO_COLOR", "1");
+    }
+
     let mut result = match ccn::loc::scan(&cli.scan_options()) {
         Ok(r) => r,
         Err(e) => {

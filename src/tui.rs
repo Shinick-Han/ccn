@@ -58,6 +58,8 @@ use crossterm::terminal::{
 };
 use crossterm::tty::IsTty;
 use ratatui::backend::CrosstermBackend;
+#[cfg(feature = "workbench")]
+use ratatui::layout::Alignment;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -69,12 +71,27 @@ use std::collections::BTreeSet;
 use crate::ccn::types::{CcnSummary, CcnTier, FunctionCcn};
 use crate::metrics::{penalty, Report};
 use crate::model::ScanResult;
-use crate::theme::{bin_color, grade_color, risk_color, AURA};
+use crate::theme::{bin_color, grade_color, palette, risk_color};
 
 /// Below this the dashboard shows a single "too small" line instead of trying
 /// to lay out panels it cannot fit.
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 8;
+
+/// Below this the split view shows a message instead of squeezing two panes
+/// (and the editor's PTY) into a space neither can use.
+#[cfg(feature = "workbench")]
+const SPLIT_MIN_WIDTH: u16 = 60;
+#[cfg(feature = "workbench")]
+const SPLIT_MIN_HEIGHT: u16 = 16;
+
+/// Whether the terminal is too small to lay out the split view. Pure so the
+/// guard can be tested without a terminal; `split_areas` itself already uses
+/// saturating arithmetic and stays safe at any size.
+#[cfg(feature = "workbench")]
+fn split_too_small(area: Rect) -> bool {
+    area.width < SPLIT_MIN_WIDTH || area.height < SPLIT_MIN_HEIGHT
+}
 
 /// What the user asked for when leaving the dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,10 +450,15 @@ pub fn run_unified(
             crate::vcs::Backend::P4 => "p4".to_string(),
         }
     });
+    // No session file yet means this is the first interactive run for this
+    // root. Computed once: exiting saves a session, so later App instances in
+    // the same process keep showing the hint until the run ends.
+    let first_run = !crate::session::exists(&result.root);
 
     loop {
         let (action, state) = {
             let mut app = App::new(result, report);
+            app.first_run = first_run;
             if let Some(state) = &dashboard_state {
                 app.restore_state(state);
             }
@@ -663,6 +685,42 @@ pub fn run_unified(
                             session.app.split = true;
                             let size = guard.terminal.size()?;
                             let area = Rect::new(0, 0, size.width, size.height);
+                            if split_too_small(area) {
+                                guard.terminal.draw(|frame| {
+                                    frame.render_widget(Clear, area);
+                                    frame.render_widget(
+                                        Paragraph::new(vec![
+                                            Line::from(Span::styled(
+                                                "terminal too small for split (need at least 60x16)",
+                                                Style::default().fg(crate::theme::palette().muted),
+                                            )),
+                                            Line::from(Span::styled(
+                                                "F10 returns to dashboard",
+                                                Style::default().fg(crate::theme::palette().muted),
+                                            )),
+                                        ])
+                                        .alignment(Alignment::Center),
+                                        area,
+                                    );
+                                })?;
+                                // Keep the editor session alive: only the draw
+                                // is skipped so growing the terminal resumes
+                                // the split with its buffers and tabs intact.
+                                if !event::poll(Duration::from_millis(16))? {
+                                    continue;
+                                }
+                                match event::read()? {
+                                    Event::Key(key)
+                                        if key.kind != KeyEventKind::Release
+                                            && key.code == KeyCode::F(10) =>
+                                    {
+                                        break;
+                                    }
+                                    Event::Resize(_, _) => {}
+                                    _ => {}
+                                }
+                                continue;
+                            }
                             let (left, divider, right) = split_areas(area, split_ratio);
                             if last_right != (right.width, right.height) {
                                 session.resize(right.width, right.height);
@@ -677,13 +735,13 @@ pub fn run_unified(
                                     handle.push('\n');
                                 }
                                 frame.render_widget(
-                                    Paragraph::new(handle).style(
-                                        Style::default().fg(if dragging {
-                                            AURA.accent
+                                    Paragraph::new(handle).style(Style::default().fg(
+                                        if dragging {
+                                            crate::theme::palette().accent
                                         } else {
-                                            AURA.border
-                                        }),
-                                    ),
+                                            crate::theme::palette().border
+                                        },
+                                    )),
                                     divider,
                                 );
                                 if fuzzy.is_open() {
@@ -1634,6 +1692,10 @@ pub struct App<'a> {
     notice: Option<String>,
     /// VCS label (`git main`, `p4 client`) shown in the header when known.
     vcs_identity: Option<String>,
+    /// Presentation-only: no session file existed when this run started. Set by
+    /// `run_unified`; never persisted, so the hint disappears after the first
+    /// run saves a session.
+    first_run: bool,
     quit: bool,
 }
 
@@ -1683,6 +1745,7 @@ impl<'a> App<'a> {
             pending_edit: None,
             notice: None,
             vcs_identity: None,
+            first_run: false,
             quit: false,
         };
         app.rebuild();
@@ -1989,7 +2052,7 @@ pub fn render(frame: &mut Frame, app: &mut App<'_>) {
     // The canvas goes down first: every later widget paints a card on top of
     // it, so a dark background is guaranteed even where nothing is drawn.
     frame.render_widget(
-        Block::default().style(Style::default().bg(AURA.canvas)),
+        Block::default().style(Style::default().bg(palette().canvas)),
         area,
     );
 
@@ -1997,7 +2060,7 @@ pub fn render(frame: &mut Frame, app: &mut App<'_>) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "terminal too small (need at least 40x8)",
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             )),
             area,
         );
@@ -2034,15 +2097,36 @@ fn render_footer(frame: &mut Frame, app: &App<'_>, area: Rect) {
             Paragraph::new(Line::from(Span::styled(
                 notice.as_str(),
                 Style::default()
-                    .fg(AURA.danger)
+                    .fg(palette().danger)
                     .add_modifier(Modifier::BOLD),
             ))),
             area,
         );
         return;
     }
-    let key = Style::default().fg(AURA.accent);
-    let chrome = Style::default().fg(AURA.muted);
+    let key = Style::default().fg(palette().accent);
+    let chrome = Style::default().fg(palette().muted);
+    if app.first_run {
+        let mut spans = vec![
+            Span::styled("first run · ", chrome),
+            Span::styled("?", key),
+            Span::styled(" help · ", chrome),
+            Span::styled("F5", key),
+            Span::styled(" palette · ", chrome),
+            Span::styled("e", key),
+            Span::styled(" opens the workbench", chrome),
+        ];
+        if let Some(filter) = app.active_filter() {
+            spans.push(Span::styled("  ", chrome));
+            spans.push(Span::styled(
+                format!(" /{filter} "),
+                Style::default().fg(palette().text).bg(palette().pill),
+            ));
+        }
+        let spans = truncate_spans(&spans, area.width as usize);
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let mut spans = vec![
         Span::styled("j/k", key),
         Span::styled(" move - ", chrome),
@@ -2061,7 +2145,7 @@ fn render_footer(frame: &mut Frame, app: &App<'_>, area: Rect) {
         spans.push(Span::styled("  ", chrome));
         spans.push(Span::styled(
             format!(" /{filter} "),
-            Style::default().fg(AURA.text).bg(AURA.pill),
+            Style::default().fg(palette().text).bg(palette().pill),
         ));
     }
     let spans = truncate_spans(&spans, area.width as usize);
@@ -2072,13 +2156,13 @@ fn render_footer(frame: &mut Frame, app: &App<'_>, area: Rect) {
 /// the title; the title text itself stays muted so it never competes with data.
 fn panel_block<'a>(focused: bool, title: Line<'a>) -> Block<'a> {
     let border = if focused {
-        AURA.border_focus
+        palette().border_focus
     } else {
-        AURA.border
+        palette().border
     };
     Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().bg(AURA.card))
+        .style(Style::default().bg(palette().card))
         .border_style(Style::default().fg(border))
         .title(title)
 }
@@ -2086,8 +2170,8 @@ fn panel_block<'a>(focused: bool, title: Line<'a>) -> Block<'a> {
 fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().bg(AURA.card))
-        .border_style(Style::default().fg(AURA.border));
+        .style(Style::default().bg(palette().card))
+        .border_style(Style::default().fg(palette().border));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -2095,8 +2179,8 @@ fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
     }
 
     let width = inner.width as usize;
-    let text = Style::default().fg(AURA.text);
-    let muted = Style::default().fg(AURA.muted);
+    let text = Style::default().fg(palette().text);
+    let muted = Style::default().fg(palette().muted);
 
     let mut left = vec![
         Span::styled("ccn", muted),
@@ -2107,7 +2191,7 @@ fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
         left.push(Span::styled("  ", muted));
         left.push(Span::styled(
             identity.as_str(),
-            Style::default().fg(AURA.accent_alt),
+            Style::default().fg(palette().accent_alt),
         ));
     }
     if let Some(filter) = app.active_filter() {
@@ -2121,7 +2205,9 @@ fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
             Span::styled("Health ", muted),
             Span::styled(
                 format!("{:.1}", health.score),
-                Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette().text)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" / 100  grade ", muted),
             Span::styled(
@@ -2159,7 +2245,7 @@ fn render_header(frame: &mut Frame, app: &App<'_>, area: Rect) {
     };
 
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(AURA.card)),
+        Paragraph::new(line).style(Style::default().bg(palette().card)),
         inner,
     );
 }
@@ -2186,7 +2272,7 @@ fn render_left(frame: &mut Frame, app: &App<'_>, area: Rect) {
 fn render_selected_file(frame: &mut Frame, app: &App<'_>, area: Rect) {
     let title = Line::from(Span::styled(
         " selected file ",
-        Style::default().fg(AURA.muted),
+        Style::default().fg(palette().muted),
     ));
     let block = panel_block(false, title);
     let inner = block.inner(area);
@@ -2199,9 +2285,9 @@ fn render_selected_file(frame: &mut Frame, app: &App<'_>, area: Rect) {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 "no file selected",
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             ))
-            .style(Style::default().bg(AURA.card)),
+            .style(Style::default().bg(palette().card)),
             inner,
         );
         return;
@@ -2215,18 +2301,20 @@ fn render_selected_file(frame: &mut Frame, app: &App<'_>, area: Rect) {
     let mut lines = vec![
         Line::from(Span::styled(
             row.path.as_str(),
-            Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette().text)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!(
                 "{} · {} LOC · {} fn · CCN max {} · sum {} · p90 {}",
                 row.lang, row.loc, row.functions, row.ccn_max, row.ccn_sum, row.p90
             ),
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         )),
         Line::from(Span::styled(
             format!("tier {tier} · risk {:.1} · >10 {}", row.risk, row.over_10),
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         )),
     ];
 
@@ -2242,12 +2330,12 @@ fn render_selected_file(frame: &mut Frame, app: &App<'_>, area: Rect) {
     if top.is_empty() {
         lines.push(Line::from(Span::styled(
             " no function detail",
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             " top functions",
-            Style::default().fg(AURA.accent_alt),
+            Style::default().fg(palette().accent_alt),
         )));
         for function in top.into_iter().take(3) {
             if lines.len() >= inner.height as usize {
@@ -2260,11 +2348,11 @@ fn render_selected_file(frame: &mut Frame, app: &App<'_>, area: Rect) {
                 ),
                 Span::styled(
                     truncate_right(&function.name, inner.width as usize - 12),
-                    Style::default().fg(AURA.text),
+                    Style::default().fg(palette().text),
                 ),
                 Span::styled(
                     format!(" L{}", function.line),
-                    Style::default().fg(AURA.muted),
+                    Style::default().fg(palette().muted),
                 ),
             ]));
         }
@@ -2278,13 +2366,17 @@ fn render_selected_file(frame: &mut Frame, app: &App<'_>, area: Rect) {
         if lines.len() < inner.height as usize {
             lines.push(Line::from(Span::styled(
                 format!("baseline {}: {} changes", baseline.rev, changes),
-                Style::default().fg(if changes > 0 { AURA.warn } else { AURA.muted }),
+                Style::default().fg(if changes > 0 {
+                    palette().warn
+                } else {
+                    palette().muted
+                }),
             )));
         }
     }
     lines.truncate(inner.height as usize);
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         inner,
     );
 }
@@ -2292,7 +2384,7 @@ fn render_selected_file(frame: &mut Frame, app: &App<'_>, area: Rect) {
 fn render_repo_pulse(frame: &mut Frame, app: &App<'_>, area: Rect) {
     let title = Line::from(Span::styled(
         " repo pulse ",
-        Style::default().fg(AURA.muted),
+        Style::default().fg(palette().muted),
     ));
     let block = panel_block(false, title);
     let inner = block.inner(area);
@@ -2309,7 +2401,7 @@ fn render_repo_pulse(frame: &mut Frame, app: &App<'_>, area: Rect) {
                 "{} exact · {} best · {} heuristic",
                 stats.files_exact, stats.files_best_effort, stats.files_heuristic
             ),
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         )),
         Line::from(Span::styled(
             match ccn {
@@ -2319,14 +2411,14 @@ fn render_repo_pulse(frame: &mut Frame, app: &App<'_>, area: Rect) {
                 ),
                 None => "no CCN pass".to_string(),
             },
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         )),
         Line::from(Span::styled(
             format!(
                 "excluded: {} generated · {} vendored",
                 stats.files_excluded_generated, stats.files_excluded_vendored
             ),
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         )),
     ];
 
@@ -2344,9 +2436,9 @@ fn render_repo_pulse(frame: &mut Frame, app: &App<'_>, area: Rect) {
     lines.push(Line::from(Span::styled(
         format!("read errors {read_errors} · oversize {oversize} · no grammar {no_grammar}"),
         Style::default().fg(if read_errors > 0 {
-            AURA.danger
+            palette().danger
         } else {
-            AURA.muted
+            palette().muted
         }),
     )));
     if let Some(baseline) = app.report.baseline.as_ref() {
@@ -2362,15 +2454,15 @@ fn render_repo_pulse(frame: &mut Frame, app: &App<'_>, area: Rect) {
                 }
             ),
             Style::default().fg(if baseline.complete {
-                AURA.muted
+                palette().muted
             } else {
-                AURA.warn
+                palette().warn
             }),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             "baseline: none (--baseline <rev>)",
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         )));
     }
     if let Some(health) = app.report.health.as_ref() {
@@ -2384,7 +2476,7 @@ fn render_repo_pulse(frame: &mut Frame, app: &App<'_>, area: Rect) {
     }
     lines.truncate(inner.height as usize);
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         inner,
     );
 }
@@ -2392,7 +2484,7 @@ fn render_repo_pulse(frame: &mut Frame, app: &App<'_>, area: Rect) {
 fn render_histogram(frame: &mut Frame, app: &App<'_>, area: Rect) {
     let title = Line::from(vec![Span::styled(
         format!(" {} [{}/2] ", app.left_tab.title(), app.left_tab.number()),
-        Style::default().fg(AURA.muted),
+        Style::default().fg(palette().muted),
     )]);
     let block = panel_block(false, title);
     let inner = block.inner(area);
@@ -2407,14 +2499,17 @@ fn render_histogram(frame: &mut Frame, app: &App<'_>, area: Rect) {
     };
     if histogram.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled("no data", Style::default().fg(AURA.muted)))
-                .style(Style::default().bg(AURA.card)),
+            Paragraph::new(Span::styled(
+                "no data",
+                Style::default().fg(palette().muted),
+            ))
+            .style(Style::default().bg(palette().card)),
             inner,
         );
         return;
     }
 
-    let muted = Style::default().fg(AURA.muted);
+    let muted = Style::default().fg(palette().muted);
     let width = inner.width as usize;
     let label_width = if app.left_tab == LeftTab::Loc { 11 } else { 6 };
     let max_share = histogram
@@ -2456,12 +2551,12 @@ fn render_histogram(frame: &mut Frame, app: &App<'_>, area: Rect) {
                 let line_cells = bar_cells(bin.share_weight, max_weight, lines_width);
                 spans.push(Span::styled(
                     "█".repeat(files),
-                    Style::default().fg(AURA.ramp[0]),
+                    Style::default().fg(palette().ramp[0]),
                 ));
                 spans.push(Span::styled("│", muted));
                 spans.push(Span::styled(
                     "█".repeat(line_cells),
-                    Style::default().fg(AURA.ramp[2]),
+                    Style::default().fg(palette().ramp[2]),
                 ));
             } else {
                 let cells = bar_cells(bin.share_count, max_share, bar_width);
@@ -2482,13 +2577,13 @@ fn render_histogram(frame: &mut Frame, app: &App<'_>, area: Rect) {
                     "└ McCabe limit 10 · 11–20 and up are debt",
                     width.saturating_sub(label_width),
                 ),
-                Style::default().fg(AURA.warn),
+                Style::default().fg(palette().warn),
             ),
         ]));
     }
 
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         inner,
     );
 }
@@ -2506,7 +2601,7 @@ fn bar_cells(share: f64, max: f64, width: usize) -> usize {
 fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect, focused: bool) {
     let arrow = if app.sort_desc { '↓' } else { '↑' };
     let title = Line::from(vec![
-        Span::styled("▌", Style::default().fg(AURA.accent)),
+        Span::styled("▌", Style::default().fg(palette().accent)),
         Span::styled(
             format!(
                 " Files ({})   sort: {} {} ",
@@ -2514,7 +2609,7 @@ fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect, focused: bool)
                 app.sort.label(),
                 arrow
             ),
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         ),
     ]);
     let block = panel_block(focused, title);
@@ -2530,8 +2625,8 @@ fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect, focused: bool)
             None => "no measured files with function-level CCN".to_string(),
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(message, Style::default().fg(AURA.muted)))
-                .style(Style::default().bg(AURA.card)),
+            Paragraph::new(Span::styled(message, Style::default().fg(palette().muted)))
+                .style(Style::default().bg(palette().card)),
             inner,
         );
         return;
@@ -2578,7 +2673,9 @@ fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect, focused: bool)
     };
     lines.push(Line::from(Span::styled(
         truncate_right(&header, width),
-        Style::default().fg(AURA.muted).add_modifier(Modifier::DIM),
+        Style::default()
+            .fg(palette().muted)
+            .add_modifier(Modifier::DIM),
     )));
 
     let end = (app.offset + rows_height).min(app.view.len());
@@ -2589,36 +2686,36 @@ fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect, focused: bool)
         let row = &app.files[index];
         let selected = position == app.selected;
         let base = if selected {
-            Style::default().fg(AURA.text).bg(AURA.pill)
+            Style::default().fg(palette().text).bg(palette().pill)
         } else {
-            Style::default().fg(AURA.text)
+            Style::default().fg(palette().text)
         };
 
         let marker = if selected { "▌ " } else { "  " };
         let tag = tier_tag(row.tier);
         let path = pad(&truncate_left(&row.path, path_width), path_width);
         let tag_color = if row.tier == CcnTier::Exact {
-            AURA.muted
+            palette().muted
         } else {
-            AURA.warn
+            palette().warn
         };
 
         let mut spans = vec![
             Span::styled(
                 marker,
                 if selected {
-                    base.fg(AURA.accent)
+                    base.fg(palette().accent)
                 } else {
-                    base.fg(AURA.muted)
+                    base.fg(palette().muted)
                 },
             ),
             Span::styled(format!("{tag} "), base.fg(tag_color)),
-            Span::styled(path, base.fg(AURA.text)),
+            Span::styled(path, base.fg(palette().text)),
         ];
         if with_stats {
             spans.push(Span::styled(
                 format!("{:>7}", thousands(row.loc as usize)),
-                base.fg(AURA.muted),
+                base.fg(palette().muted),
             ));
             spans.push(Span::styled(
                 format!("{:>8}", row.ccn_max),
@@ -2626,18 +2723,18 @@ fn render_right(frame: &mut Frame, app: &mut App<'_>, area: Rect, focused: bool)
             ));
             spans.push(Span::styled(
                 format!("{:>6}", row.over_10),
-                base.fg(AURA.muted),
+                base.fg(palette().muted),
             ));
             spans.push(Span::styled(
                 format!("{:>6}", (row.risk * 100.0).round() as u32),
-                base.fg(AURA.muted),
+                base.fg(palette().muted),
             ));
         }
         lines.push(Line::from(spans));
     }
 
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         inner,
     );
 }
@@ -2653,11 +2750,11 @@ fn render_detail(frame: &mut Frame, app: &App<'_>, area: Rect) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().bg(AURA.card))
-        .border_style(Style::default().fg(AURA.border_focus))
+        .style(Style::default().bg(palette().card))
+        .border_style(Style::default().fg(palette().border_focus))
         .title(Line::from(Span::styled(
             " FILE DETAIL · Esc closes ",
-            Style::default().fg(AURA.accent),
+            Style::default().fg(palette().accent),
         )));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2666,8 +2763,8 @@ fn render_detail(frame: &mut Frame, app: &App<'_>, area: Rect) {
     }
 
     let width = inner.width as usize;
-    let text = Style::default().fg(AURA.text);
-    let muted = Style::default().fg(AURA.muted);
+    let text = Style::default().fg(palette().text);
+    let muted = Style::default().fg(palette().muted);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         truncate_left(&row.path, width),
@@ -2731,12 +2828,14 @@ fn render_detail(frame: &mut Frame, app: &App<'_>, area: Rect) {
     if functions.is_empty() {
         lines.push(Line::from(Span::styled(
             "no functions measured",
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!("{:>4}  {:<30}{:>6}  {:>5}", "ccn", "name", "line", "nloc"),
-            Style::default().fg(AURA.muted).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(palette().muted)
+                .add_modifier(Modifier::DIM),
         )));
         for function in functions.iter().take(10) {
             lines.push(Line::from(vec![
@@ -2759,7 +2858,7 @@ fn render_detail(frame: &mut Frame, app: &App<'_>, area: Rect) {
 
     lines.truncate(inner.height as usize);
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         inner,
     );
 }
@@ -2779,11 +2878,11 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().bg(AURA.card))
-        .border_style(Style::default().fg(AURA.border_focus))
+        .style(Style::default().bg(palette().card))
+        .border_style(Style::default().fg(palette().border_focus))
         .title(Line::from(Span::styled(
             " keys · Esc closes ",
-            Style::default().fg(AURA.accent),
+            Style::default().fg(palette().accent),
         )));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2844,19 +2943,22 @@ fn render_help(frame: &mut Frame, area: Rect) {
         lines.push(Line::from(Span::styled(
             format!(" {title}"),
             Style::default()
-                .fg(AURA.accent_alt)
+                .fg(palette().accent_alt)
                 .add_modifier(Modifier::BOLD),
         )));
         for (keys, description) in entries.iter() {
             lines.push(Line::from(vec![
-                Span::styled(format!("   {:<14}", keys), Style::default().fg(AURA.accent)),
-                Span::styled(*description, Style::default().fg(AURA.text)),
+                Span::styled(
+                    format!("   {:<14}", keys),
+                    Style::default().fg(palette().accent),
+                ),
+                Span::styled(*description, Style::default().fg(palette().text)),
             ]));
         }
     }
     lines.truncate(inner.height as usize);
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         inner,
     );
 }
@@ -3287,6 +3389,98 @@ mod tests {
     }
 
     #[test]
+    fn renders_at_the_split_minimum_without_panicking() {
+        let (result, report) = fixture();
+        let mut app = App::new(&result, &report);
+        let text = draw(&mut app, 60, 20);
+        assert!(!text.trim().is_empty(), "60x20 produced no output");
+        assert!(
+            text.contains("repo"),
+            "normal layout should render at 60x20:\n{text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "workbench")]
+    fn split_guard_rejects_small_terminals() {
+        assert!(split_too_small(Rect::new(0, 0, 1, 1)));
+        assert!(split_too_small(Rect::new(
+            0,
+            0,
+            SPLIT_MIN_WIDTH - 1,
+            SPLIT_MIN_HEIGHT
+        )));
+        assert!(split_too_small(Rect::new(
+            0,
+            0,
+            SPLIT_MIN_WIDTH,
+            SPLIT_MIN_HEIGHT - 1
+        )));
+        assert!(!split_too_small(Rect::new(
+            0,
+            0,
+            SPLIT_MIN_WIDTH,
+            SPLIT_MIN_HEIGHT
+        )));
+        assert!(!split_too_small(Rect::new(0, 0, 200, 50)));
+    }
+
+    #[test]
+    #[cfg(feature = "workbench")]
+    fn split_areas_is_safe_at_tiny_sizes() {
+        for (width, height) in [(0u16, 0u16), (1, 1), (2, 5), (59, 15)] {
+            let size = Rect::new(0, 0, width, height);
+            let (left, divider, right) = split_areas(size, 38);
+            assert_eq!(divider.width, 1);
+            assert!(left.width >= 20, "left pane keeps its floor");
+            // The 20-column floor can exceed a sub-21-column terminal; ratatui
+            // clips those rects. Once the floor fits, the widths tile exactly.
+            if width >= 21 {
+                assert_eq!(
+                    left.width + divider.width + right.width,
+                    width,
+                    "tiny split lost columns at {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_run_footer_shows_the_onboarding_hint() {
+        let (result, report) = fixture();
+        let mut app = App::new(&result, &report);
+        assert!(!app.first_run, "the hint is opt-in");
+
+        app.first_run = true;
+        let text = draw(&mut app, 100, 30);
+        assert!(text.contains("first run"), "hint missing:\n{text}");
+        assert!(text.contains("F5"), "palette hint missing:\n{text}");
+        assert!(
+            text.contains("opens the workbench"),
+            "workbench hint missing:\n{text}"
+        );
+        assert!(
+            !text.contains("j/k move"),
+            "the normal footer should be replaced:\n{text}"
+        );
+
+        // A notice still wins so a warning is never hidden by onboarding.
+        app.notice = Some("unsaved buffers".to_string());
+        let text = draw(&mut app, 100, 30);
+        assert!(text.contains("unsaved buffers"), "{text}");
+        assert!(!text.contains("first run"), "{text}");
+    }
+
+    #[test]
+    fn first_run_hint_truncates_safely_on_a_narrow_terminal() {
+        let (result, report) = fixture();
+        let mut app = App::new(&result, &report);
+        app.first_run = true;
+        let text = draw(&mut app, MIN_WIDTH, MIN_HEIGHT);
+        assert!(!text.trim().is_empty(), "narrow hint produced no output");
+    }
+
+    #[test]
     fn tiny_terminal_does_not_panic() {
         let (result, report) = fixture();
         let mut app = App::new(&result, &report);
@@ -3449,7 +3643,7 @@ mod tests {
         for x in marker_x..width - 1 {
             assert_eq!(
                 buffer[(x, y)].bg,
-                AURA.pill,
+                palette().pill,
                 "cell ({x}, {y}) must use the pill background"
             );
         }

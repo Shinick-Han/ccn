@@ -186,6 +186,15 @@ The TUI (`--tui`) uses the same tokens: `#12121C` canvas, `#1A1B2A` cards, a
 mauve focused border, selected rows on `#2D2F46`, the grade badge in its
 semantic colour, the CCN bar ramp, and risk-coloured `max CCN` values.
 
+Colour is optional. Pass `--no-color`, set `color = "never"` in `.ccn.toml`, or
+export a non-empty `NO_COLOR` and the dashboard switches to the terminal's
+default foreground/background (borders and labels stay readable through their
+glyphs). An empty `NO_COLOR=` keeps colour enabled, per the de-facto standard.
+
+On the first interactive run for a repository (no saved session yet), the footer
+shows a one-line starter hint for `?` help, `F5` command palette and `e` to open
+the workbench. It disappears on later runs once the session is saved on exit.
+
 ## Trend, diff mode, ownership
 
 - **`--trend`** appends a small snapshot to `<repo>/.ccn/history.json` (max 200)

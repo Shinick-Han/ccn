@@ -5,7 +5,7 @@
 //! is plain ratatui.
 
 use crate::breadcrumb;
-use crate::theme::{grade_color, AURA};
+use crate::theme::{grade_color, is_monochrome, palette};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -95,7 +95,7 @@ pub fn render(frame: &mut Frame, app: &App, screen: &Screen) {
 /// backend, or the full terminal).
 pub fn render_area(frame: &mut Frame, app: &App, screen: &Screen, area: Rect) {
     frame.render_widget(
-        Block::default().style(Style::default().bg(AURA.canvas)),
+        Block::default().style(Style::default().bg(palette().canvas)),
         area,
     );
     let rects = layout(area);
@@ -116,11 +116,11 @@ fn tab_spans(app: &App) -> Vec<Span<'static>> {
         .map(|(index, title)| {
             let style = if Some(index) == active {
                 Style::default()
-                    .fg(AURA.canvas)
-                    .bg(AURA.accent)
+                    .fg(palette().canvas)
+                    .bg(palette().accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(AURA.muted)
+                Style::default().fg(palette().muted)
             };
             Span::styled(format!(" [{} {}] ", index + 1, title), style)
         })
@@ -133,7 +133,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             " ccn workbench",
             Style::default()
-                .fg(AURA.accent_alt)
+                .fg(palette().accent_alt)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
@@ -141,7 +141,9 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     if app.tabs.is_empty() {
         path_spans.push(Span::styled(
             app.display.as_str(),
-            Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette().text)
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         path_spans.extend(tab_spans(app));
@@ -150,24 +152,24 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     path_spans.push(Span::styled(
         app.rpc_label(),
         Style::default().fg(match app.rpc_status {
-            RpcStatus::Live => AURA.ok,
-            RpcStatus::Connecting => AURA.warn,
-            RpcStatus::Off => AURA.muted,
+            RpcStatus::Live => palette().ok,
+            RpcStatus::Connecting => palette().warn,
+            RpcStatus::Off => palette().muted,
         }),
     ));
     if app.unsaved() {
         path_spans.push(Span::styled(
             "  unsaved ",
             Style::default()
-                .fg(AURA.canvas)
-                .bg(AURA.warn)
+                .fg(palette().canvas)
+                .bg(palette().warn)
                 .add_modifier(Modifier::BOLD),
         ));
     }
     if app.rpc_status == RpcStatus::Off && !app.rpc_disabled {
         path_spans.push(Span::styled(
             "  (mtime fallback)",
-            Style::default().fg(AURA.muted),
+            Style::default().fg(palette().muted),
         ));
     }
     let path = Line::from(path_spans);
@@ -223,11 +225,11 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             },
             None => Line::from(Span::styled(
                 " no scan result yet",
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             )),
         }
     };
-    let summary = summary.style(Style::default().fg(AURA.muted));
+    let summary = summary.style(Style::default().fg(palette().muted));
 
     let (grade, grade_label) = app.grade();
     let mut status_spans = vec![Span::styled(
@@ -243,13 +245,17 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             app.focus.label(),
             app.scan_ms as f64
         ),
-        Style::default().fg(AURA.muted),
+        Style::default().fg(palette().muted),
     ));
     if let Some(delta) = app.delta_sum() {
         status_spans.push(Span::styled(
             format!("  Δ +{delta}"),
             Style::default()
-                .fg(if delta > 0 { AURA.warn } else { AURA.ok })
+                .fg(if delta > 0 {
+                    palette().warn
+                } else {
+                    palette().ok
+                })
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -267,45 +273,45 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(crumb) = breadcrumb {
         status_spans.push(Span::styled(
             format!("  {crumb}"),
-            Style::default().fg(AURA.text),
+            Style::default().fg(palette().text),
         ));
     }
     if let Some(note) = &app.rpc_note {
         status_spans.push(Span::styled(
             format!("  rpc: {note}"),
-            Style::default().fg(AURA.danger),
+            Style::default().fg(palette().danger),
         ));
     }
     if let Some(note) = &app.exited {
         status_spans.push(Span::styled(
             format!("  [editor exited: {note}]"),
-            Style::default().fg(AURA.danger),
+            Style::default().fg(palette().danger),
         ));
     }
     if let Some(err) = &app.scan_error {
         status_spans.push(Span::styled(
             format!("  scan error: {err}"),
-            Style::default().fg(AURA.danger),
+            Style::default().fg(palette().danger),
         ));
     }
 
     let content = Paragraph::new(vec![path, summary, Line::from(status_spans)])
-        .style(Style::default().bg(AURA.canvas));
+        .style(Style::default().bg(palette().canvas));
     frame.render_widget(content, area);
 }
 
 fn render_editor(frame: &mut Frame, app: &App, screen: &Screen, area: Rect) {
     let focused = app.focus == Focus::Editor;
     let border = if focused {
-        AURA.border_focus
+        palette().border_focus
     } else {
-        AURA.border
+        palette().border
     };
     let title = Line::from(vec![
-        Span::styled(" editor ", Style::default().fg(AURA.accent)),
+        Span::styled(" editor ", Style::default().fg(palette().accent)),
         Span::styled(
             format!("· {} ", app.editor_label),
-            Style::default().fg(AURA.text),
+            Style::default().fg(palette().text),
         ),
     ]);
     let hint = if app.exited.is_some() {
@@ -318,14 +324,20 @@ fn render_editor(frame: &mut Frame, app: &App, screen: &Screen, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(if is_monochrome(&palette()) {
+            Color::Reset
+        } else {
+            // Keep the editor's true-black background in colour mode; the
+            // terminal default is the only usable surface in monochrome.
+            Color::Black
+        }))
         .title(title)
         .title_bottom(Line::from(Span::styled(
             hint,
             Style::default().fg(if app.exited.is_some() {
-                AURA.danger
+                palette().danger
             } else {
-                AURA.muted
+                palette().muted
             }),
         )));
 
@@ -336,36 +348,36 @@ fn render_editor(frame: &mut Frame, app: &App, screen: &Screen, area: Rect) {
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
     let border = if focused {
-        AURA.border_focus
+        palette().border_focus
     } else {
-        AURA.border
+        palette().border
     };
     let live = app.live_mode();
     let title = if focused {
         Line::from(vec![
-            Span::styled(" functions ", Style::default().fg(AURA.accent)),
+            Span::styled(" functions ", Style::default().fg(palette().accent)),
             Span::styled(
                 if live {
                     "· live · F9 back "
                 } else {
                     "· F9 back "
                 },
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             ),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" functions ", Style::default().fg(AURA.accent)),
+            Span::styled(" functions ", Style::default().fg(palette().accent)),
             Span::styled(
                 if live { "· live " } else { "" },
-                Style::default().fg(AURA.ok),
+                Style::default().fg(palette().ok),
             ),
         ])
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(AURA.card))
+        .style(Style::default().bg(palette().card))
         .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -384,7 +396,9 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                     live.name,
                     view.as_ref().map_or(0, |v| v.loc)
                 ),
-                Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette().text)
+                    .add_modifier(Modifier::BOLD),
             ))];
             let count = if live.functions.len() == initial {
                 format!("{} functions live", live.functions.len())
@@ -399,20 +413,20 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                     " {count} · max {} · sum {} · {:.0} ms",
                     live.max, live.sum, live.read_ms
                 ),
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             )));
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" tier {} · grade {} · ", live.tier.as_str(), app.grade().0),
-                    Style::default().fg(AURA.muted),
+                    Style::default().fg(palette().muted),
                 ),
                 Span::styled(
                     format!("Δ +{}", live.positive_delta()),
                     Style::default()
                         .fg(if live.positive_delta() > 0 {
-                            AURA.warn
+                            palette().warn
                         } else {
-                            AURA.ok
+                            palette().ok
                         })
                         .add_modifier(Modifier::BOLD),
                 ),
@@ -423,14 +437,16 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     " saved buffer · +new ~worse -better"
                 },
-                Style::default().fg(AURA.pill),
+                Style::default().fg(palette().pill),
             )));
-            Paragraph::new(lines).style(Style::default().bg(AURA.card))
+            Paragraph::new(lines).style(Style::default().bg(palette().card))
         }
         (None, Some(v)) => {
             let mut lines = vec![Line::from(Span::styled(
                 format!(" {} · {} LOC", v.name, v.loc),
-                Style::default().fg(AURA.text).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette().text)
+                    .add_modifier(Modifier::BOLD),
             ))];
             lines.push(Line::from(Span::styled(
                 if v.count == 0 {
@@ -441,7 +457,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     format!(" {} functions · max {} · p90 {}", v.count, v.max, v.p90)
                 },
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             )));
             lines.push(Line::from(Span::styled(
                 format!(
@@ -449,7 +465,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                     v.tier.map_or("n/a", crate::ccn::types::CcnTier::as_str),
                     app.grade().0
                 ),
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             )));
             lines.push(Line::from(Span::styled(
                 match app.rpc_status {
@@ -458,18 +474,18 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                     RpcStatus::Off => " rpc off · mtime refresh",
                     RpcStatus::Live => " live snapshot pending",
                 },
-                Style::default().fg(AURA.pill),
+                Style::default().fg(palette().pill),
             )));
-            Paragraph::new(lines).style(Style::default().bg(AURA.card))
+            Paragraph::new(lines).style(Style::default().bg(palette().card))
         }
         (None, None) => Paragraph::new(vec![Line::from(Span::styled(
             match &app.scan_error {
                 Some(err) => format!(" scan failed: {err}"),
                 None => " no file data".to_string(),
             },
-            Style::default().fg(AURA.danger),
+            Style::default().fg(palette().danger),
         ))])
-        .style(Style::default().bg(AURA.card)),
+        .style(Style::default().bg(palette().card)),
     };
     frame.render_widget(summary, summary_area);
 
@@ -486,9 +502,9 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" {reason}"),
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             )))
-            .style(Style::default().bg(AURA.card)),
+            .style(Style::default().bg(palette().card)),
             list_area,
         );
         return;
@@ -501,7 +517,11 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for index in start..end {
         let selected = index == app.selected;
-        let bg = if selected { AURA.pill } else { AURA.card };
+        let bg = if selected {
+            palette().pill
+        } else {
+            palette().card
+        };
         let select = if selected { "▸" } else { " " };
         let (line_no, ccn, name, identity, delta) = if let Some(live) = live_rows {
             match live.functions.get(index) {
@@ -531,7 +551,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{select}{line_no:>4} "),
-                Style::default().fg(AURA.muted).bg(bg),
+                Style::default().fg(palette().muted).bg(bg),
             ),
             Span::styled(
                 format!("{ccn:>3} "),
@@ -550,7 +570,11 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 name,
                 Style::default()
-                    .fg(if selected { AURA.accent } else { AURA.text })
+                    .fg(if selected {
+                        palette().accent
+                    } else {
+                        palette().text
+                    })
                     .bg(bg)
                     .add_modifier(if selected {
                         Modifier::BOLD
@@ -561,12 +585,12 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         ]));
         lines.push(Line::from(Span::styled(
             format!("      {identity} "),
-            Style::default().fg(AURA.muted).bg(bg),
+            Style::default().fg(palette().muted).bg(bg),
         )));
     }
 
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         list_area,
     );
 }
@@ -586,10 +610,10 @@ fn delta_text(row: &LiveRow) -> String {
 
 fn delta_color(delta: &str) -> Color {
     match delta.chars().next() {
-        Some('+') => AURA.danger,
-        Some('~') => AURA.warn,
-        Some('-') => AURA.ok,
-        _ => AURA.muted,
+        Some('+') => palette().danger,
+        Some('~') => palette().warn,
+        Some('-') => palette().ok,
+        _ => palette().muted,
     }
 }
 
@@ -604,9 +628,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         keys.to_string()
     };
     let status_style = if app.status_is_error() {
-        Style::default().fg(AURA.danger)
+        Style::default().fg(palette().danger)
     } else {
-        Style::default().fg(AURA.ok)
+        Style::default().fg(palette().ok)
     };
     let mut status_spans = vec![
         Span::styled(" ", Style::default()),
@@ -615,24 +639,28 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(note) = &app.rpc_note {
         status_spans.push(Span::styled(
             format!("  · rpc: {note}"),
-            Style::default().fg(AURA.danger),
+            Style::default().fg(palette().danger),
         ));
     }
     let content = Paragraph::new(vec![
-        Line::from(Span::styled(keys, Style::default().fg(AURA.muted))),
+        Line::from(Span::styled(keys, Style::default().fg(palette().muted))),
         Line::from(status_spans),
     ])
-    .style(Style::default().bg(AURA.canvas));
+    .style(Style::default().bg(palette().canvas));
     frame.render_widget(content, area);
 }
 
 fn ccn_color(ccn: u32) -> Color {
+    let palette = palette();
+    if is_monochrome(&palette) {
+        return Color::Reset;
+    }
     match ccn {
-        0..=5 => AURA.ok,
+        0..=5 => palette.ok,
         6..=10 => Color::Rgb(137, 220, 235),
-        11..=20 => AURA.warn,
+        11..=20 => palette.warn,
         21..=50 => Color::Rgb(250, 179, 135),
-        _ => AURA.danger,
+        _ => palette.danger,
     }
 }
 

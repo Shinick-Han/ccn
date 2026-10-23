@@ -188,6 +188,10 @@ pub struct Cli {
     #[arg(long)]
     pub ci: bool,
 
+    /// Disable colors (also honors NO_COLOR).
+    #[arg(long)]
+    pub no_color: bool,
+
     /// Exit with code 1 if the share of functions above CCN 10 exceeds this
     /// percentage (e.g. `--fail-over 2.0`).
     #[arg(long, value_name = "PCT")]
@@ -327,6 +331,14 @@ mod tests {
     fn ci_flag_parses() {
         let cli = Cli::parse_from(["ccn", "--ci"]);
         assert!(cli.ci);
+    }
+
+    #[test]
+    fn no_color_flag_parses() {
+        let cli = Cli::parse_from(["ccn"]);
+        assert!(!cli.no_color, "colour is on by default");
+        let cli = Cli::parse_from(["ccn", "--no-color"]);
+        assert!(cli.no_color);
     }
 
     #[test]

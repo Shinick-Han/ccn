@@ -178,6 +178,14 @@ pub fn save(root: &str, session: &Session) -> io::Result<()> {
     }
 }
 
+/// Whether a saved session file exists for `root`.
+///
+/// Only a real file counts: a directory, an unresolvable cache location or a
+/// session that was never written all report `false`. Never panics.
+pub fn exists(root: &str) -> bool {
+    sidecar_path(root, "session").is_some_and(|path| path.is_file())
+}
+
 /// Explicit-path load, for tests and callers that already know the location.
 pub fn load_from(path: &Path) -> Session {
     let bytes = std::fs::read(path).or_else(|_| {
@@ -545,6 +553,36 @@ mod tests {
         assert_eq!(loaded.sort, DEFAULT_SORT);
         assert!(loaded.sort_desc);
         assert_eq!(loaded.left_tab, DEFAULT_TAB);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exists_is_false_until_a_session_is_saved() {
+        let _ = crate::cache::test_cache_dir();
+        let dir = temp_dir("exists");
+        let root = dir.to_string_lossy().into_owned();
+
+        assert!(!exists(&root), "no session yet");
+        assert!(!exists(&format!("{root}/missing-subdir")));
+
+        save(&root, &Session::default()).expect("save");
+        assert!(exists(&root), "saved session is present");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exists_requires_a_file_not_a_directory() {
+        let _ = crate::cache::test_cache_dir();
+        let dir = temp_dir("exists-dir");
+        let root = dir.to_string_lossy().into_owned();
+        let path = sidecar_path(&root, "session").expect("cache path");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::create_dir_all(&path).expect("create a directory in the file's place");
+        assert!(!exists(&root), "a directory is not a session file");
+        let _ = std::fs::remove_dir_all(&path);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

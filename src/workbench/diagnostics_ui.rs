@@ -5,7 +5,7 @@
 //! window from it, so the selection is always kept visible.
 
 use crate::diagnostics::{Area, Diagnostic, Diagnostics, Filter, Severity};
-use crate::theme::AURA;
+use crate::theme::palette;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -21,9 +21,9 @@ fn title_text(diagnostics: &Diagnostics) -> String {
 /// Severity marker, colour and letter.
 fn severity_marker(severity: Severity) -> (char, ratatui::style::Color) {
     match severity {
-        Severity::Error => ('E', AURA.danger),
-        Severity::Warn => ('W', AURA.warn),
-        Severity::Info => ('I', AURA.accent),
+        Severity::Error => ('E', palette().danger),
+        Severity::Warn => ('W', palette().warn),
+        Severity::Info => ('I', palette().accent),
     }
 }
 
@@ -101,16 +101,20 @@ fn truncate_chars(text: &str, width: u16) -> String {
 /// The marker keeps its severity colour at every width; the rest is truncated
 /// into whatever columns remain. The caller guarantees `width > 0`.
 fn row_line(item: &Diagnostic, width: u16, selected: bool) -> Line<'static> {
-    let bg = if selected { AURA.pill } else { AURA.card };
+    let bg = if selected {
+        palette().pill
+    } else {
+        palette().card
+    };
     let text_style = if selected {
         Style::default()
-            .fg(AURA.text)
+            .fg(palette().text)
             .bg(bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(AURA.text).bg(bg)
+        Style::default().fg(palette().text).bg(bg)
     };
-    let muted = Style::default().fg(AURA.muted).bg(bg);
+    let muted = Style::default().fg(palette().muted).bg(bg);
 
     let (letter, colour) = severity_marker(item.severity);
     let mark = format!("[{letter}] ");
@@ -174,7 +178,7 @@ fn finish_row(mut spans: Vec<Span<'static>>, width: u16, selected: bool) -> Line
         if used < width {
             spans.push(Span::styled(
                 " ".repeat(width - used),
-                Style::default().bg(AURA.pill),
+                Style::default().bg(palette().pill),
             ));
         }
     }
@@ -224,18 +228,22 @@ pub(crate) fn render_filtered(
     filter: Filter,
 ) {
     let border = if focused {
-        AURA.border_focus
+        palette().border_focus
     } else {
-        AURA.border
+        palette().border
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(AURA.card))
+        .style(Style::default().bg(palette().card))
         .title(Span::styled(
             title_text(diagnostics),
             Style::default()
-                .fg(if focused { AURA.accent } else { AURA.text })
+                .fg(if focused {
+                    palette().accent
+                } else {
+                    palette().text
+                })
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -250,7 +258,7 @@ pub(crate) fn render_filtered(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             subtitle,
-            Style::default().fg(AURA.muted).bg(AURA.card),
+            Style::default().fg(palette().muted).bg(palette().card),
         ))),
         Rect {
             x: inner.x,
@@ -291,7 +299,7 @@ pub(crate) fn render_filtered(
             .map(|(offset, item)| row_line(item, list_area.width, start + offset == selected))
             .collect();
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+            Paragraph::new(lines).style(Style::default().bg(palette().card)),
             list_area,
         );
         return;
@@ -302,12 +310,12 @@ pub(crate) fn render_filtered(
         .map(|text| {
             Line::from(Span::styled(
                 truncate_chars(text, list_area.width),
-                Style::default().fg(AURA.muted).bg(AURA.card),
+                Style::default().fg(palette().muted).bg(palette().card),
             ))
         })
         .collect();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         list_area,
     );
 }
@@ -462,7 +470,7 @@ mod tests {
         let mut found_pill = false;
         for y in 0..5 {
             for x in 0..44 {
-                if buffer[(x, y)].bg == AURA.pill {
+                if buffer[(x, y)].bg == palette().pill {
                     found_pill = true;
                 }
             }
@@ -535,7 +543,7 @@ mod tests {
         let mut found_pill = false;
         for y in 0..4 {
             for x in 0..44 {
-                if buffer[(x, y)].bg == AURA.pill {
+                if buffer[(x, y)].bg == palette().pill {
                     found_pill = true;
                 }
             }

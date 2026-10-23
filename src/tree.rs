@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::status::FileChange;
-use crate::theme::AURA;
+use crate::theme::palette;
 
 /// What a key press asked the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,20 +515,20 @@ impl Tree {
         let title = Line::from(vec![
             Span::styled(
                 if focused { "▌" } else { " " },
-                Style::default().fg(AURA.accent),
+                Style::default().fg(palette().accent),
             ),
             Span::styled(
                 format!(" Files ({}) ", self.total_files),
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             ),
         ]);
         let block = Block::default()
             .borders(Borders::ALL)
-            .style(Style::default().bg(AURA.card))
+            .style(Style::default().bg(palette().card))
             .border_style(Style::default().fg(if focused {
-                AURA.border_focus
+                palette().border_focus
             } else {
-                AURA.border
+                palette().border
             }))
             .title(title);
         let inner = block.inner(area);
@@ -539,8 +539,11 @@ impl Tree {
 
         if self.rows.is_empty() {
             frame.render_widget(
-                Paragraph::new(Span::styled("no files", Style::default().fg(AURA.muted)))
-                    .style(Style::default().bg(AURA.card)),
+                Paragraph::new(Span::styled(
+                    "no files",
+                    Style::default().fg(palette().muted),
+                ))
+                .style(Style::default().bg(palette().card)),
                 inner,
             );
             return;
@@ -568,7 +571,9 @@ impl Tree {
             let path = self.selected_path().unwrap_or_default();
             lines.push(Line::from(Span::styled(
                 truncate_right(path, width),
-                Style::default().fg(AURA.muted).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(palette().muted)
+                    .add_modifier(Modifier::DIM),
             )));
         }
 
@@ -608,14 +613,16 @@ impl Tree {
             let name = truncate_right(&row.name, name_width);
 
             let base = if selected {
-                Style::default().fg(AURA.text).bg(AURA.pill)
+                Style::default().fg(palette().text).bg(palette().pill)
             } else if row.is_dir {
-                Style::default().fg(AURA.muted).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(palette().muted)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(AURA.text)
+                Style::default().fg(palette().text)
             };
             let marker_style = match marker_color {
-                Some(color) if selected => Style::default().fg(color).bg(AURA.pill),
+                Some(color) if selected => Style::default().fg(color).bg(palette().pill),
                 Some(color) => Style::default().fg(color),
                 None => base,
             };
@@ -634,7 +641,7 @@ impl Tree {
         }
 
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+            Paragraph::new(lines).style(Style::default().bg(palette().card)),
             inner,
         );
     }
@@ -677,9 +684,9 @@ fn collect_rows(
 /// (a modification, rename or untracked file) amber.
 fn change_color(change: FileChange) -> Color {
     match change {
-        FileChange::Added => AURA.ok,
-        FileChange::Deleted | FileChange::Conflicted => AURA.danger,
-        FileChange::Modified | FileChange::Untracked | FileChange::Renamed => AURA.warn,
+        FileChange::Added => palette().ok,
+        FileChange::Deleted | FileChange::Conflicted => palette().danger,
+        FileChange::Modified | FileChange::Untracked | FileChange::Renamed => palette().warn,
     }
 }
 
@@ -906,7 +913,11 @@ mod tests {
             }
         }
         let y = selected_y.expect("selected directory row");
-        assert_eq!(buffer[(2, y)].bg, AURA.pill, "selected row needs the pill");
+        assert_eq!(
+            buffer[(2, y)].bg,
+            palette().pill,
+            "selected row needs the pill"
+        );
     }
 
     #[test]

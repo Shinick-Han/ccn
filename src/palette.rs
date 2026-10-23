@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::fuzzy::rank;
-use crate::theme::AURA;
+use crate::theme::palette;
 
 /// Maximum number of command rows drawn at once.
 pub const MAX_ROWS: usize = 12;
@@ -257,11 +257,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &Palette) {
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Style::default().bg(AURA.card))
-        .border_style(Style::default().fg(AURA.border_focus))
+        .style(Style::default().bg(palette().card))
+        .border_style(Style::default().fg(palette().border_focus))
         .title(Line::from(Span::styled(
             " COMMANDS - Esc closes ",
-            Style::default().fg(AURA.accent),
+            Style::default().fg(palette().accent),
         )));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -274,14 +274,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &Palette) {
     let prompt = format!("> {}", state.query);
     lines.push(Line::from(Span::styled(
         truncate(&prompt, width),
-        Style::default().fg(AURA.text),
+        Style::default().fg(palette().text),
     )));
 
     if state.matches.is_empty() {
         if lines.len() < inner.height as usize {
             lines.push(Line::from(Span::styled(
                 "  no matches",
-                Style::default().fg(AURA.muted),
+                Style::default().fg(palette().muted),
             )));
         }
     } else {
@@ -297,21 +297,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &Palette) {
                 lines.push(Line::from(Span::styled(
                     text,
                     Style::default()
-                        .fg(AURA.text)
-                        .bg(AURA.pill)
+                        .fg(palette().text)
+                        .bg(palette().pill)
                         .add_modifier(Modifier::BOLD),
                 )));
             } else {
                 lines.push(Line::from(Span::styled(
                     text,
-                    Style::default().fg(AURA.text),
+                    Style::default().fg(palette().text),
                 )));
             }
         }
     }
 
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(AURA.card)),
+        Paragraph::new(lines).style(Style::default().bg(palette().card)),
         inner,
     );
 }
