@@ -753,7 +753,10 @@ mod tests {
     #[test]
     fn uri_to_path_decodes_and_normalizes_windows_drives() {
         let path = uri_to_path("file:///C:/Program%20Files/a%2Bb.c").unwrap();
+        #[cfg(windows)]
         assert_eq!(path.to_string_lossy(), "C:/Program Files/a+b.c");
+        #[cfg(not(windows))]
+        assert_eq!(path.to_string_lossy(), "/C:/Program Files/a+b.c");
         assert_eq!(uri_to_path("untitled:Untitled-1"), None);
     }
 }
