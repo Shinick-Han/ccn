@@ -14,6 +14,7 @@ $ npx @shinick/ccn . --tui               # interactive dashboard
 $ npx @shinick/ccn . --view              # temp report + open in browser
 $ npx @shinick/ccn . --baseline origin/main --fail-on-new
 $ npx @shinick/ccn . --json
+$ npx @shinick/ccn brief . --baseline origin/main
 ```
 
 The exit code is the CLI's exit code, so it works as a CI gate:
