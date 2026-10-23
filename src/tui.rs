@@ -180,6 +180,17 @@ fn split_areas(size: Rect, ratio: u16) -> (Rect, Rect, Rect) {
     (left, divider, right)
 }
 
+/// Layout for the split loop. Alt+Z (fullscreen) gives the whole area to the
+/// workbench and leaves no tree/divider behind.
+#[cfg(feature = "workbench")]
+fn split_layout(size: Rect, ratio: u16, fullscreen: bool) -> (Rect, Rect, Rect) {
+    if fullscreen {
+        (Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0), size)
+    } else {
+        split_areas(size, ratio)
+    }
+}
+
 /// Pane focus toggle. Alt+W is the advertised key because many terminals
 /// collapse Ctrl+Shift+<letter> into Ctrl+<letter>; the latter would steal a
 /// Neovim binding. Ctrl+Shift+E and F8 stay as compatibility aliases.
@@ -678,6 +689,7 @@ pub fn run_unified(
                         let fuzzy_paths = tree_paths(result);
                         let mut focus = SplitFocus::Workbench;
                         let mut dragging = false;
+                        let mut editor_fullscreen = false;
                         let mut last_right = (0u16, 0u16);
                         guard.set_mouse(true)?;
                         loop {
@@ -721,29 +733,34 @@ pub fn run_unified(
                                 }
                                 continue;
                             }
-                            let (left, divider, right) = split_areas(area, split_ratio);
+                            let (left, divider, right) =
+                                split_layout(area, split_ratio, editor_fullscreen);
                             if last_right != (right.width, right.height) {
                                 session.resize(right.width, right.height);
                                 last_right = (right.width, right.height);
                             }
                             guard.terminal.draw(|frame| {
-                                tree.render(frame, left, focus == SplitFocus::Files);
-                                session.draw_in(frame, right);
-                                let mut handle = String::new();
-                                for _ in 0..divider.height {
-                                    handle.push('│');
-                                    handle.push('\n');
+                                if !editor_fullscreen {
+                                    tree.render(frame, left, focus == SplitFocus::Files);
                                 }
-                                frame.render_widget(
-                                    Paragraph::new(handle).style(Style::default().fg(
-                                        if dragging {
-                                            crate::theme::palette().accent
-                                        } else {
-                                            crate::theme::palette().border
-                                        },
-                                    )),
-                                    divider,
-                                );
+                                session.draw_in(frame, right);
+                                if !editor_fullscreen {
+                                    let mut handle = String::new();
+                                    for _ in 0..divider.height {
+                                        handle.push('│');
+                                        handle.push('\n');
+                                    }
+                                    frame.render_widget(
+                                        Paragraph::new(handle).style(Style::default().fg(
+                                            if dragging {
+                                                crate::theme::palette().accent
+                                            } else {
+                                                crate::theme::palette().border
+                                            },
+                                        )),
+                                        divider,
+                                    );
+                                }
                                 if fuzzy.is_open() {
                                     crate::fuzzy::render(frame, frame.area(), &fuzzy, &fuzzy_paths);
                                 }
@@ -1315,11 +1332,25 @@ pub fn run_unified(
                                         fuzzy.open(&fuzzy_paths);
                                         continue;
                                     }
+                                    if key.modifiers.contains(KeyModifiers::ALT)
+                                        && matches!(key.code, KeyCode::Char('z' | 'Z'))
+                                    {
+                                        editor_fullscreen = !editor_fullscreen;
+                                        session.set_sidebar(!editor_fullscreen);
+                                        focus = SplitFocus::Workbench;
+                                        continue;
+                                    }
                                     if is_pane_toggle(&key) {
-                                        focus = match focus {
-                                            SplitFocus::Files => SplitFocus::Workbench,
-                                            SplitFocus::Workbench => SplitFocus::Files,
-                                        };
+                                        if editor_fullscreen {
+                                            editor_fullscreen = false;
+                                            session.set_sidebar(true);
+                                            focus = SplitFocus::Workbench;
+                                        } else {
+                                            focus = match focus {
+                                                SplitFocus::Files => SplitFocus::Workbench,
+                                                SplitFocus::Workbench => SplitFocus::Files,
+                                            };
+                                        }
                                         continue;
                                     }
                                     match focus {
@@ -1355,6 +1386,12 @@ pub fn run_unified(
                                             }
                                         },
                                         SplitFocus::Workbench => {
+                                            if editor_fullscreen
+                                                && matches!(key.code, KeyCode::F(8) | KeyCode::F(9))
+                                            {
+                                                editor_fullscreen = false;
+                                                session.set_sidebar(true);
+                                            }
                                             if key.code == KeyCode::F(8) {
                                                 focus = SplitFocus::Files;
                                                 continue;
@@ -2910,6 +2947,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 ("F6", "baseline review (then d for diff)"),
                 ("F7", "diagnostics"),
                 ("Alt+W", "files / editor panes"),
+                ("Alt+Z", "editor fullscreen"),
                 ("Alt+O", "search functions in this file"),
                 ("Alt+F", "search workspace text"),
                 ("F10", "back to the dashboard"),
@@ -3508,6 +3546,21 @@ mod tests {
 
         assert_eq!(split_ratio_from_x(0, 140), 20);
         assert_eq!(split_ratio_from_x(140, 140), 70);
+    }
+
+    #[test]
+    #[cfg(feature = "workbench")]
+    fn fullscreen_layout_hands_the_whole_terminal_to_the_editor() {
+        let size = Rect::new(0, 0, 140, 40);
+        let (left, divider, right) = split_layout(size, 38, true);
+        assert_eq!(left.width, 0);
+        assert_eq!(divider.width, 0);
+        assert_eq!(right, size);
+
+        let (left, divider, right) = split_layout(size, 38, false);
+        assert!(left.width >= 20);
+        assert_eq!(divider.width, 1);
+        assert_eq!(left.width + divider.width + right.width, size.width);
     }
 
     #[test]

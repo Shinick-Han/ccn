@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.24.0 (2026-10-23)
+
+Editor fullscreen.
+
+- `Alt+Z` in the split view hides the file tree and the function sidebar and
+  gives the whole terminal to the embedded editor. Pressing it again restores
+  the split. F8/F9/Alt+W also restore the split when pressed in fullscreen.
+- The editor PTY and open tabs are resized, never restarted, when toggling.
+- 726 lib + 1 main + 2 fixture + 17 CLI tests; clippy/fmt clean; hidden-sidebar
+  rendering and fullscreen layout have unit coverage.
+
 ## 0.23.0 (2026-10-23)
 
 Accessibility and first-run polish.

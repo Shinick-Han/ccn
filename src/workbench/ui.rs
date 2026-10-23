@@ -25,12 +25,26 @@ pub struct LayoutRects {
 }
 
 pub fn layout(area: Rect) -> LayoutRects {
+    layout_with_sidebar(area, true)
+}
+
+/// Layout the workbench with an optional function sidebar. When the sidebar is
+/// hidden the editor gets the full body width, which is the Alt+Z view.
+pub fn layout_with_sidebar(area: Rect, show_sidebar: bool) -> LayoutRects {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(4),
         Constraint::Length(2),
     ])
     .areas(area);
+    if !show_sidebar {
+        return LayoutRects {
+            header,
+            editor: body,
+            sidebar: Rect::new(0, 0, 0, 0),
+            footer,
+        };
+    }
     let sidebar_width = sidebar_width(area.width);
     let [editor, sidebar] =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(sidebar_width)]).areas(body);
@@ -98,11 +112,13 @@ pub fn render_area(frame: &mut Frame, app: &App, screen: &Screen, area: Rect) {
         Block::default().style(Style::default().bg(palette().canvas)),
         area,
     );
-    let rects = layout(area);
+    let rects = layout_with_sidebar(area, app.sidebar);
 
     render_header(frame, app, rects.header);
     render_editor(frame, app, screen, rects.editor);
-    render_sidebar(frame, app, rects.sidebar);
+    if app.sidebar {
+        render_sidebar(frame, app, rects.sidebar);
+    }
     render_footer(frame, app, rects.footer);
 }
 
@@ -618,14 +634,19 @@ fn delta_color(delta: &str) -> Color {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let keys = match app.focus {
-        Focus::Editor => " F10 dashboard - Alt+W panes - Alt+O symbols - F5 commands - F6 review - F7 diagnostics ",
-        Focus::Sidebar => " j/k move - Enter jump - F9 editor - F5 commands - F10 dashboard ",
+    let keys = if !app.sidebar {
+        " Alt+Z restore split - F5 commands - F6 review - F7 diagnostics - F10 dashboard "
+            .to_string()
+    } else {
+        match app.focus {
+            Focus::Editor => " F10 dashboard - Alt+Z fullscreen - Alt+W panes - Alt+O symbols - F5 commands - F6 review - F7 diagnostics ".to_string(),
+            Focus::Sidebar => " j/k move - Enter jump - F9 editor - F5 commands - F10 dashboard ".to_string(),
+        }
     };
-    let keys = if app.split {
+    let keys = if app.split && app.sidebar {
         format!(" Alt+W panes |{keys}")
     } else {
-        keys.to_string()
+        keys
     };
     let status_style = if app.status_is_error() {
         Style::default().fg(palette().danger)
@@ -693,7 +714,7 @@ mod tests {
             "int one(int x) { if (x) { return 1; } return 0; }\nint two(int y) {\n    if (y) { return 2; }\n    return 0;\n}\n",
         )
         .expect("write sample");
-        let app = App::new(file.clone(), "sample.c".to_string(), "nvim".to_string());
+        let mut app = App::new(file.clone(), "sample.c".to_string(), "nvim".to_string());
 
         let mut parser = vt100::Parser::new(24, 60, 0);
         parser.process(b"NVIM-EDITOR-CONTENT");
@@ -710,7 +731,30 @@ mod tests {
         assert!(rendered.contains("F10 dashboard"), "{rendered}");
         assert!(rendered.contains("one(int)"), "{rendered}");
 
+        app.sidebar = false;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &app, parser.screen()))
+            .expect("draw");
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("NVIM-EDITOR-CONTENT"), "{rendered}");
+        assert!(!rendered.contains("Enter jump"), "{rendered}");
+        assert!(rendered.contains("Alt+Z restore split"), "{rendered}");
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidebar_can_be_hidden_for_the_editor_only_view() {
+        let area = Rect::new(0, 0, 120, 30);
+        let full = layout_with_sidebar(area, false);
+        assert_eq!(full.editor.width, area.width);
+        assert_eq!(full.sidebar.width, 0);
+        assert_eq!(full.editor.height, full.footer.y - full.editor.y);
+
+        let split = layout_with_sidebar(area, true);
+        assert!(split.sidebar.width > 0);
+        assert!(split.editor.width < area.width);
     }
 
     fn list() -> Rect {

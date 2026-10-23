@@ -41,7 +41,9 @@ implementation; the public entry point is `ccn workbench` (single file) and
   `g/G`, `Enter`/Space toggles a directory, `e`/`Enter` opens a file). `F8`
   switches tree/editor focus; `[`/`]` or dragging the divider changes the
   split ratio (20-70%, minimum pane widths). Tree rows show Git/P4 change
-  markers; `c` toggles changed-files-only.
+  markers; `c` toggles changed-files-only. `Alt+Z` hides the tree and function
+  sidebar, giving the editor the full terminal; press it again (or F8/F9/Alt+W)
+  to restore the split. Alt+Z does not restart the editor session.
 - `Alt+E` opens the Explain CCN view for the selected function: a heuristic
   decision breakdown (if/for/while/case/catch/&&/||/?) with the top decision
   lines. The tree-sitter CCN remains authoritative.

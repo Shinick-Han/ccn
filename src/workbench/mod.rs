@@ -241,6 +241,8 @@ pub(crate) struct App {
     pub rpc_disabled: bool,
     /// True when rendered as the right pane of the dashboard split.
     pub split: bool,
+    /// Show the function sidebar. Alt+Z hides it for an editor-only view.
+    pub sidebar: bool,
     /// Ordered open files; the active tab mirrors `target`/`display`.
     pub tabs: Tabs,
     /// Set while an async `:bdelete` request is in flight.
@@ -275,6 +277,7 @@ impl App {
             child_alive: Arc::new(AtomicBool::new(true)),
             rpc_disabled: false,
             split: false,
+            sidebar: true,
             tabs: Tabs::new(),
             pending_close: None,
             pending_switch: None,
@@ -1094,6 +1097,15 @@ impl WorkbenchSession {
         handle_key(&mut self.app, &mut self.child, key)
     }
 
+    /// Show or hide the function sidebar. Hiding it always returns focus to
+    /// the editor so a hidden sidebar cannot keep keyboard focus.
+    pub(crate) fn set_sidebar(&mut self, visible: bool) {
+        self.app.sidebar = visible;
+        if !visible {
+            self.app.focus = Focus::Editor;
+        }
+    }
+
     /// Tabs currently open, in order.
     #[allow(dead_code)] // Public surface for the split UI / orchestrator.
     pub(crate) fn tabs(&self) -> &Tabs {
@@ -1178,7 +1190,7 @@ impl WorkbenchSession {
     }
 
     pub(crate) fn click_workbench(&mut self, column: u16, row: u16, area: Rect) {
-        let rects = ui::layout(area);
+        let rects = ui::layout_with_sidebar(area, self.app.sidebar);
         let point = Position::new(column, row);
         if rects.sidebar.contains(point) {
             let (_, list_area) = ui::sidebar_regions(rects.sidebar);
